@@ -61,9 +61,18 @@ use crate::revalidating;
 ///   written) would be served back as a settled fact under a key that says it
 ///   is fresh. An effect's result becomes a replay input by being RECORDED
 ///   deliberately, which is a different act from a cache remembering it.
+///
+///   **The exclusion is defeatable from outside**, and by the one construct
+///   §7 adds: an error boundary turns that `Failed` into a `Ready`, so a memo
+///   above one is offered a fallback with the exclusion already spent. That is
+///   why [`Guarded`](crate::Guarded) - the stage-level boundary - answers
+///   `memo_key -> None`, and why the composition rule it states matters even
+///   though breaking it now costs only speed.
 /// * An input the stage refuses to key (`memo_key` says `None`) is neither
 ///   looked up nor recorded. See that method's doc for why refusing beats
-///   inventing a key.
+///   inventing a key, and `Guarded` for the third and least obvious reason a
+///   stage refuses: not that its input cannot be addressed, but that its
+///   ANSWER may not be the one the input implies.
 ///
 /// This type is `libpipeline`'s and not `libpipelinedata`'s because it is
 /// machinery: a crate that only implements a stage should not link it

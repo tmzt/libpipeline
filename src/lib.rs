@@ -57,8 +57,8 @@
 //! still owed its real answer.
 //!
 //! The fourth of that family is no longer stated: a boundary belongs outside
-//! the MEMO, which [`Guarded::memo_key`] closes structurally by refusing to key
-//! at all.
+//! the MEMO, which [`Guarded`]'s `memo_key` closes structurally by refusing to
+//! key at all.
 
 #![forbid(unsafe_code)]
 

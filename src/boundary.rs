@@ -8,7 +8,7 @@
 //!
 //! What this layer adds is the one thing `libeffects` could not say, because it
 //! has no key vocabulary and must not learn one: **a boundary refuses to be
-//! memoized**. [`Guarded::memo_key`] answers `None`, which is where the seam
+//! memoized**. [`Guarded`]'s `memo_key` answers `None`, which is where the seam
 //! `libeffects::Boundary`'s doc could only state becomes structural.
 
 use std::sync::{Mutex, PoisonError};
@@ -63,8 +63,8 @@ use libpipelinedata::{BoundStage, EffectPoll, MemoKey, Stage, StageId};
 /// "wrap the memo in the tracking, not the tracking in the memo"
 /// (`memo.rs:43-52`).
 ///
-/// **[`memo_key`](Guarded::memo_key) answering `None` is what makes it
-/// structural on this side.** `Memo` neither looks up nor records for an input
+/// **Answering `memo_key` with `None` is what makes that seam structural on
+/// this side.** `Memo` neither looks up nor records for an input
 /// it has no key for (`memo.rs:119-133`), so the forbidden order stops being
 /// able to poison anything: a cache placed above a boundary is a cache with
 /// nothing to say. The rule is still worth composing correctly - the prescribed
@@ -75,7 +75,7 @@ use libpipelinedata::{BoundStage, EffectPoll, MemoKey, Stage, StageId};
 /// [`Stage::memo_key`], after [`Chain`](crate::Chain) - a composite whose
 /// derived key needs §9's fold - and `highbay_elements`' unattributable
 /// registry, where a pass no contributor claims has no honest content value
-/// (`crates/highbay_elements/src/pipeline.rs:401-407` **[read]**). Three
+/// (`crates/highbay_elements/src/pipeline.rs:401-407` **\[read\]**). Three
 /// unrelated reasons to refuse, one answer: "Refusing to key is the safe
 /// answer; faking one is not."
 ///
