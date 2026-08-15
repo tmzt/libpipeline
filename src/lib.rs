@@ -13,6 +13,9 @@
 //!   run so they follow conditionals; and invalidation over those edges, where
 //!   a changed input marks its dependents stale transitively and wakes whoever
 //!   subscribed.
+//! * [`Backdated`] - §3's early cutoff above the leaf: a node whose output
+//!   addresses to what it addressed to last time retracts itself as a reason
+//!   for its consumers to re-run.
 //! * [`Schedule`] - what a driver polls next given the stale set: the stale
 //!   nodes no stale node reads, since the pull revalidates the rest.
 //! * [`run_to_completion_watched`] - the offline driver, reporting `Pending`
@@ -31,14 +34,20 @@
 //! cannot be named in a `use`, but a rule that holds transitively cannot be
 //! evaded by routing an edge through a sibling.
 //!
-//! **What is not here yet.** Backdating (§3's "early cutoff") exists only at
-//! the leaf: [`TrackedInput::set`] refuses to invalidate on a write of an equal
-//! value, but a DERIVED node that recomputes to something equal still wakes its
-//! consumers, because nothing here compares a stage's output to its last one.
-//! §3 wants both halves - "constructive keys give the *lookup*, backdating
-//! gives the *cutoff*, and a live IDE needs both" - and the missing half needs
-//! somewhere to keep the last output and an equality it can trust, which is
-//! §9's step 2 (content keys) rather than more machinery here.
+//! **What is not here yet.** [`Backdated`] cuts off where a node's output
+//! REPEATS, which needs the node to have run. A node whose consumers could be
+//! spared before it runs at all - salsa's deep verify, where an unchanged
+//! dependency set is enough - is not here, and neither is any policy for which
+//! nodes are worth addressing on every poll: `Backdated` is opt-in per node
+//! because the address costs a traversal of the output, and a chain that
+//! backdates at every level pays for it at every level.
+//!
+//! **The seams that are stated rather than enforced.** Two rules hold by
+//! composition and cannot be checked from inside the type that needs them, so
+//! each is stated in a doc and pinned by a known-bad twin: a cache belongs
+//! INSIDE the tracking (`Memo`'s doc), and a stage's tracked reads must go
+//! through [`TrackedInput::get`] rather than `peek` or the ledger sees nothing
+//! to defer to.
 
 #![forbid(unsafe_code)]
 
@@ -53,5 +62,5 @@ pub use chain::{Chain, ChainError};
 pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
 pub use memo::Memo;
 pub use schedule::{Cycle, Schedule};
-pub use track::{Ledger, NodeId, Tracked, TrackedInput, revalidating};
+pub use track::{Backdated, Ledger, NodeId, Tracked, TrackedInput, revalidating};
 pub use watch::{WakePath, WakeReport, poll_watched, run_to_completion_watched};

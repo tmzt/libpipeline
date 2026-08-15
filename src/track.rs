@@ -22,12 +22,12 @@
 //! on an expression type, because none is in scope.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
 
-use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
+use libpipelinedata::{ContentHash, ContentKey, EffectPoll, MemoKey, Stage, StageId};
 
 /// Distinguishes one [`Ledger`] from another, so a [`NodeId`] minted by one is
 /// refused by the other rather than silently addressing a different node.
@@ -145,11 +145,34 @@ struct Inner {
     /// Per node: how many times it has been declared changed. See
     /// [`Ledger::revision`].
     revisions: Vec<u64>,
-    /// Who has been marked stale and not yet revalidated.
-    stale: BTreeSet<u32>,
+    /// Who has been marked stale and not yet revalidated, and WHY.
+    ///
+    /// A node is stale exactly when it has an entry here, and the entry is
+    /// never empty. The reasons are what makes staleness RETRACTABLE, which is
+    /// the whole of [`Ledger::unchanged`]: a bare set could record that a node
+    /// must re-run and could not answer "does it still have to, now that this
+    /// dependency turned out not to have moved?" - and clearing on "none of my
+    /// reads is stale" is not that answer, since a changed INPUT is never
+    /// itself stale.
+    stale: BTreeMap<u32, BTreeSet<Reason>>,
     /// Whom to tell that something went stale. Not drained by waking - see
     /// [`Ledger::subscribe`].
     subscribers: Vec<Waker>,
+}
+
+/// Why a node is stale (see [`Inner::stale`]).
+///
+/// Two kinds, because only one of them can be taken back.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Reason {
+    /// A change reached this node through the named dependency. Retractable:
+    /// if that dependency recomputes to the same value it stops being a reason
+    /// ([`Ledger::unchanged`]).
+    Read(u32),
+    /// The node itself owes a value - it answered `Pending`, or a caller marked
+    /// it directly ([`Ledger::mark_stale`]). Nothing a dependency does retracts
+    /// this; only running the node clears it.
+    Owed,
 }
 
 impl Ledger {
@@ -248,7 +271,9 @@ impl Ledger {
         let index = u32::try_from(self.check(node)).expect("checked above");
         let entered_stale = {
             let mut inner = self.lock();
-            let was_stale = inner.stale.remove(&index);
+            // Every reason at once, retractable or not: the node is about to
+            // produce a value, which is what all of them were waiting for.
+            let was_stale = inner.stale.remove(&index).is_some();
             inner.running.push((index, BTreeSet::new()));
             was_stale
         };
@@ -294,6 +319,12 @@ impl Ledger {
     /// again. Visiting each node once is what bounds the walk - the same
     /// property, taken from the right place.
     ///
+    /// **Each node is marked with the dependency the change reached it
+    /// through**, and a node reached along two edges is marked twice. That is
+    /// not bookkeeping for its own sake: it is what [`unchanged`](Self::unchanged)
+    /// retracts, one edge at a time. The dedupe above is therefore on the
+    /// EXPANSION only - a node already visited still records the new reason.
+    ///
     /// **Subscribers are woken only if something was marked.** A change nobody
     /// read wakes nothing, which is §3's conditional clause seen from the other
     /// end: "a branch not taken this run contributes no edge, so a change
@@ -304,16 +335,32 @@ impl Ledger {
         inner.revisions[index as usize] += 1;
 
         let mut visited = BTreeSet::new();
-        let mut queue: VecDeque<u32> = inner.readers[index as usize].iter().copied().collect();
+        // `(node, the dependency the change reached it through)` - the reason,
+        // carried along the walk so it can be retracted one edge at a time.
+        let mut queue: VecDeque<(u32, u32)> = inner.readers[index as usize]
+            .iter()
+            .map(|reader| (*reader, index))
+            .collect();
         let mut marked = 0;
-        while let Some(next) = queue.pop_front() {
+        while let Some((next, through)) = queue.pop_front() {
+            // The reason is recorded on every arrival, including at a node
+            // already visited: a node reached through two dependencies is stale
+            // for two reasons and needs both retracted. Only the EXPANSION is
+            // deduped, which is what bounds the walk.
+            let reasons = inner.stale.entry(next).or_default();
+            let was_stale = !reasons.is_empty();
+            reasons.insert(Reason::Read(through));
+            if !was_stale {
+                marked += 1;
+            }
             if !visited.insert(next) {
                 continue;
             }
-            if inner.stale.insert(next) {
-                marked += 1;
-            }
-            queue.extend(inner.readers[next as usize].iter().copied());
+            queue.extend(
+                inner.readers[next as usize]
+                    .iter()
+                    .map(|reader| (*reader, next)),
+            );
         }
 
         if !visited.is_empty() {
@@ -324,6 +371,63 @@ impl Ledger {
             }
         }
         marked
+    }
+
+    /// Declare that `node` has just recomputed to the value it already had, so
+    /// its readers may stop counting it as a reason to be stale - §3's
+    /// **backdating**, one level above the leaf.
+    ///
+    /// Returns how many nodes stopped being stale.
+    ///
+    /// **This is the half [`TrackedInput::set`] could not reach.** The leaf
+    /// cutoff is exact and costs one comparison, and it does nothing for a
+    /// DERIVED node: a stage whose output ignores part of its input - a
+    /// formatter fed a re-indented file, a lowering fed a renamed local - would
+    /// recompute the same answer and still make every consumer re-run.
+    /// §3: "without cutoff every keystroke invalidates the whole pipeline".
+    ///
+    /// **The retraction is per edge, and that is why staleness carries
+    /// reasons.** A reader stops being stale only when EVERY dependency whose
+    /// change reached it has been retracted; a reader waiting on two changed
+    /// paths is still waiting after one of them cuts off. When a reader does go
+    /// fresh the retraction continues past it - it was itself a reason for ITS
+    /// readers, and it has now produced nothing new for them either.
+    ///
+    /// **A node that owes a value of its own is not retracted.** A `Pending`
+    /// poll marks its node through [`mark_stale`](Self::mark_stale), and no
+    /// dependency's equality answers for a value that was never produced.
+    ///
+    /// **The wake cannot be taken back, and should not be.** Discovering the
+    /// equality required running `node`, which required something to have woken
+    /// the driver that polled it. What backdating saves is the WORK above that
+    /// node, which is where the pipeline's cost is: one stage re-ran and its
+    /// consumers did not.
+    ///
+    /// It is deliberately the caller's to declare rather than something the
+    /// ledger detects, for the reason it cannot: the ledger holds `NodeId`s and
+    /// never sees a value. [`Backdated`] is the wrapper that does see one.
+    pub fn unchanged(&self, node: NodeId) -> usize {
+        let index = u32::try_from(self.check(node)).expect("checked above");
+        let mut inner = self.lock();
+
+        let mut cleared = 0;
+        let mut queue: VecDeque<u32> = VecDeque::from([index]);
+        while let Some(next) = queue.pop_front() {
+            for reader in inner.readers[next as usize].clone() {
+                let Some(reasons) = inner.stale.get_mut(&reader) else {
+                    continue;
+                };
+                reasons.remove(&Reason::Read(next));
+                if reasons.is_empty() {
+                    inner.stale.remove(&reader);
+                    cleared += 1;
+                    // This reader produced nothing new either, so it is no
+                    // longer a reason for the nodes that read IT.
+                    queue.push_back(reader);
+                }
+            }
+        }
+        cleared
     }
 
     /// How many times `node` has been declared changed, starting at 0.
@@ -357,13 +461,13 @@ impl Ledger {
     /// Whether `node` has been marked stale and not yet revalidated.
     pub fn is_stale(&self, node: NodeId) -> bool {
         let index = u32::try_from(self.check(node)).expect("checked above");
-        self.lock().stale.contains(&index)
+        self.lock().stale.contains_key(&index)
     }
 
     /// Everything currently stale, in mint order.
     pub fn stale_nodes(&self) -> Vec<NodeId> {
         let inner = self.lock();
-        self.ids(inner.stale.iter().copied())
+        self.ids(inner.stale.keys().copied())
     }
 
     /// Mark `node` alone stale, without walking to its readers.
@@ -371,9 +475,12 @@ impl Ledger {
     /// For a node that must be revalidated for a reason the ledger cannot
     /// observe - [`Tracked`] uses it to keep a `Pending` poll stale, since a
     /// poll that did not produce a value has not revalidated anything.
+    ///
+    /// The mark is the node's OWN, not a dependency's, so no amount of
+    /// backdating below it takes it back. See [`unchanged`](Self::unchanged).
     pub fn mark_stale(&self, node: NodeId) {
         let index = u32::try_from(self.check(node)).expect("checked above");
-        self.lock().stale.insert(index);
+        self.lock().stale.entry(index).or_default().insert(Reason::Owed);
     }
 
     /// Clear `node`'s staleness. [`run`](Self::run) does this on entry; this is
@@ -550,6 +657,115 @@ impl<S: Stage> Stage for Tracked<S> {
             // scheduler that took the clear at face value would drop it from
             // the work it has left.
             self.ledger.mark_stale(self.node);
+        }
+        polled
+    }
+}
+
+/// A [`Tracked`] node whose consumers are spared when its output does not move
+/// - §3's **early cutoff**, above the leaf.
+///
+/// **What it adds to `Tracked`, and only that.** It IS a `Tracked` inside, so
+/// the reads, the scope, the `Pending` re-mark and the delegated id and memo key
+/// are the same ones; the addition is one comparison after a `Ready` poll. If
+/// the output addresses to what it addressed to last time, the node calls
+/// [`Ledger::unchanged`] and its consumers stop being stale.
+///
+/// **Why `ContentHash` and not `PartialEq`.** §3's equality for this purpose is
+/// the content address (§9's step 2), and it is what a memo already trusts
+/// "INSTEAD of comparing the value"
+/// ([`ContentAddressHasher`](libpipelinedata::ContentAddressHasher)'s doc). It also
+/// answers the storage half of the problem cheaply: what has to be kept between
+/// polls is 128 bits, not the last output, so a node whose output is a whole
+/// lowered tree does not double its footprint to get a cutoff. The cost is the
+/// one that doc states - a collision here is a wrong answer, not a slow cache -
+/// which is why the hasher is the seam it is and why this takes the address
+/// rather than a `Hash`.
+///
+/// **The first poll is never a cutoff.** With nothing recorded there is no
+/// equality to appeal to, and a node that has never run has consumers that have
+/// never had its value.
+///
+/// **A `Pending` poll records nothing and retracts nothing.** There is no
+/// output to address, and the node is stale on its OWN account after one -
+/// which [`Ledger::unchanged`] does not touch.
+///
+/// **What this does not do is un-wake the driver**; see
+/// [`Ledger::unchanged`]. The saving is the work above this node.
+pub struct Backdated<S> {
+    tracked: Tracked<S>,
+    /// The address of the last `Ready` output. Safe interior mutability, for
+    /// the reason the ledger's own lock is one: a poll holds `&self`.
+    last: Mutex<Option<ContentKey>>,
+}
+
+impl<S> Backdated<S> {
+    /// Wrap `stage` as a node of `ledger` that cuts off when its output repeats.
+    pub fn new(ledger: &Arc<Ledger>, label: &'static str, stage: S) -> Self {
+        Self {
+            tracked: Tracked::new(ledger, label, stage),
+            last: Mutex::new(None),
+        }
+    }
+
+    /// This stage's node.
+    pub fn node(&self) -> NodeId {
+        self.tracked.node()
+    }
+
+    /// The stage behind the tracking.
+    pub fn stage(&self) -> &S {
+        self.tracked.stage()
+    }
+
+    /// The ledger this node belongs to.
+    pub fn ledger(&self) -> &Arc<Ledger> {
+        self.tracked.ledger()
+    }
+
+    /// The address of the last `Ready` output, if there has been one.
+    pub fn last_address(&self) -> Option<ContentKey> {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<S: Stage> Stage for Backdated<S>
+where
+    S::Output: ContentHash,
+{
+    type Input = S::Input;
+    type Output = S::Output;
+    type Error = S::Error;
+
+    fn id(&self) -> StageId {
+        self.tracked.id()
+    }
+
+    fn memo_key(&self, input: &Self::Input) -> Option<MemoKey> {
+        self.tracked.memo_key(input)
+    }
+
+    fn poll_stage(
+        &self,
+        input: &Self::Input,
+        cx: &mut Context<'_>,
+    ) -> EffectPoll<Self::Output, Self::Error> {
+        let polled = self.tracked.poll_stage(input, cx);
+        if let EffectPoll::Ready(value) = &polled {
+            // After the scope has closed, deliberately: `unchanged` walks this
+            // node's READERS, and doing it from inside the node's own run would
+            // retract a reason from a consumer that is at that moment part-way
+            // through the poll which pulled us.
+            let address = ContentKey::of(value);
+            let repeated = self
+                .last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .replace(address)
+                == Some(address);
+            if repeated {
+                self.tracked.ledger().unchanged(self.tracked.node());
+            }
         }
         polled
     }

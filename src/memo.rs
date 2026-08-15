@@ -33,8 +33,9 @@ use crate::revalidating;
 /// * **`NoMemo` stays a legitimate implementation** - the property its own doc
 ///   names, "a pipeline whose ANSWERS change when the cache is disabled has a
 ///   bug the cache was hiding". Without this the tracked case failed exactly
-///   that check; `the_memo_is_an_optimization_over_tracked_state.rs` is the
-///   check, run over a graph that reads tracked state.
+///   that check; `invalidation_marks_dependents.rs`'s
+///   `the_memo_over_tracked_state_changes_speed_and_not_answers` is that
+///   control run over a graph which reads tracked state.
 /// * **A pipeline with no tracking in it is untouched.** With no run scope open
 ///   `revalidating` is false, so the pure-lowering chains of §4 pay one thread-
 ///   local read per lookup and behave as they did.
