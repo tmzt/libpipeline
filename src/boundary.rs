@@ -11,11 +11,13 @@
 //! memoized**. [`Guarded`]'s `memo_key` answers `None`, which is where the seam
 //! `libeffects::Boundary`'s doc could only state becomes structural.
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Context;
 
 use libeffects::{Boundary, Effect, Recover};
 use libpipelinedata::{BoundStage, EffectPoll, MemoKey, Stage, StageId};
+
+use crate::{DriveError, PendingWork, run_to_completion};
 
 /// A stage with an error boundary around it - §7's scope, at stage level.
 ///
@@ -117,22 +119,27 @@ pub struct Guarded<S, H> {
     id: StageId,
     stage: S,
     handler: H,
-    /// Safe interior mutability (`CLAUDE.md`): a poll holds `&self`, exactly as
-    /// the ledger's own lock and `libeffects::Boundary`'s counter do.
-    substitutions: Mutex<usize>,
+    substitutions: Arc<Substitutions>,
 }
 
 impl<S, H> Guarded<S, H> {
-    /// Guard `stage` with `handler`.
+    /// Guard `stage` with `handler`, counting its substitutions alone.
     ///
     /// Runs nothing: a boundary is a description of what a scope does about
     /// failure, in the sense [`Dormant`](libeffects::Dormant) means it.
     pub fn new(id: StageId, stage: S, handler: H) -> Self {
+        Self::tallied(id, stage, handler, &Substitutions::new())
+    }
+
+    /// Guard `stage` with `handler`, counting its substitutions into a tally
+    /// this boundary SHARES - see [`Substitutions`] for why a build wants one
+    /// number over a graph rather than one per scope.
+    pub fn tallied(id: StageId, stage: S, handler: H, substitutions: &Arc<Substitutions>) -> Self {
         Self {
             id,
             stage,
             handler,
-            substitutions: Mutex::new(0),
+            substitutions: Arc::clone(substitutions),
         }
     }
 
@@ -146,8 +153,16 @@ impl<S, H> Guarded<S, H> {
         &self.handler
     }
 
-    /// How many polls of this boundary have answered `Ready` with a SUBSTITUTED
-    /// value rather than the stage's own.
+    /// The tally this boundary counts into - shared, if it was built with
+    /// [`tallied`](Guarded::tallied).
+    pub fn tally(&self) -> &Arc<Substitutions> {
+        &self.substitutions
+    }
+
+    /// How many polls have answered `Ready` with a SUBSTITUTED value rather
+    /// than the stage's own - **this boundary's**, for one built by
+    /// [`new`](Guarded::new), or the shared total for one built by
+    /// [`tallied`](Guarded::tallied).
     ///
     /// Monotone and never reset, so a caller asking "did this pass substitute"
     /// takes a difference across the pass rather than trusting a last-write-wins
@@ -159,13 +174,103 @@ impl<S, H> Guarded<S, H> {
     /// names three readers; the one this crate owns is §5's offline driver,
     /// where `run_to_completion` returns `Ok(value)` for a graph that
     /// substituted every one of its answers - right for a frame, wrong for a
-    /// build.
+    /// build. [`run_to_completion_counted`] is that reader.
     pub fn substitutions(&self) -> usize {
-        *self
-            .substitutions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.substitutions.count()
     }
+}
+
+/// How many answers were substituted, counted across every boundary that shares
+/// one of these - §7's "built" versus "built on fallbacks".
+///
+/// **Why a shared type rather than one counter per boundary.** The question a
+/// build asks is about the GRAPH ("did anything I am about to ship stand on a
+/// fallback?"), and the outermost boundary's own count cannot answer it: a
+/// boundary counts what IT substituted, and a scope further in that recovered
+/// and handed a value up leaves the outer one with nothing to report. Handing
+/// several boundaries one tally makes the number the build's, which is the
+/// scope the question has.
+///
+/// **Monotone, never reset**, for [`Guarded::substitutions`]'s reason: a caller
+/// takes a difference across the pass it cares about, which composes when two
+/// passes share a graph and a last-write-wins flag does not.
+///
+/// **It counts substituting POLLS, not substituted nodes.** A graph polled
+/// twice by the offline driver's pump loop counts a persistent fallback twice,
+/// and two consumers of one shared boundary count it once each. The question it
+/// answers exactly is the yes/no one - `count() == 0` means nothing was
+/// substituted - and the magnitude is a poll count, not a census of the graph.
+/// Nothing here can do better: the engine holds no node identity for a stage
+/// (`PIPELINE_PLAN.md`:579-583), which is the same reason
+/// [`Schedule`](crate::Schedule) deals in ids and not work.
+#[derive(Debug, Default)]
+pub struct Substitutions {
+    /// Safe interior mutability (`CLAUDE.md`): a poll holds `&self` all the way
+    /// down, exactly as the ledger's own lock and `libeffects::Boundary`'s
+    /// counter do.
+    count: Mutex<usize>,
+}
+
+impl Substitutions {
+    /// A fresh tally at zero.
+    ///
+    /// `Arc`-wrapped because the boundaries that share one outlive any single
+    /// poll of any of them - the same reason [`Ledger::new`](crate::Ledger::new)
+    /// hands one back.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// How many substitutions have been counted here.
+    pub fn count(&self) -> usize {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, polls: usize) {
+        *self.count.lock().unwrap_or_else(PoisonError::into_inner) += polls;
+    }
+}
+
+/// [`run_to_completion`], reporting how many of the answers it drove through
+/// were SUBSTITUTED.
+///
+/// **The finding this closes**, in `PIPELINE_PLAN.md` §7's words: "a build that
+/// silently ships fallbacks is the failure mode this section exists to
+/// prevent". `run_to_completion` returns `Ok(value)` for a graph whose every
+/// answer was a fallback, which is right for a frame - the pane draws the
+/// stand-in and the wake brings the real thing - and wrong for a build, which
+/// has nowhere to put a value that will be correct later. The count is what
+/// separates the two, and until this function existed nothing said the CLI
+/// should ask.
+///
+/// **It is the same drive, not a second driver**, and that is literal: it calls
+/// [`run_to_completion`] and returns exactly what that returns. §5's rule is
+/// that a stage cannot tell which driver polls it, so an observation must ride
+/// ALONGSIDE the result rather than change its type - the shape
+/// [`run_to_completion_watched`](crate::run_to_completion_watched) already
+/// takes for the wake report. Nothing is asked of the stage; the tally is the
+/// caller's, because only a boundary can substitute and which boundaries belong
+/// to this build is a fact about the caller's composition, not about `S`.
+///
+/// **The frame driver needs no counterpart.** A frame loop holds the tally and
+/// takes a difference across the frame it just drew - which is the same
+/// measurement, spelled where a frame loop can spell it.
+///
+/// The returned count is this drive's alone: a tally reused across passes
+/// reports per pass.
+pub fn run_to_completion_counted<S, W>(
+    stage: &S,
+    input: &S::Input,
+    work: &W,
+    substitutions: &Substitutions,
+) -> (Result<S::Output, DriveError<S::Error>>, usize)
+where
+    S: Stage,
+    W: PendingWork + ?Sized,
+{
+    let before = substitutions.count();
+    let driven = run_to_completion(stage, input, work);
+    (driven, substitutions.count() - before)
 }
 
 impl<S, H> Stage for Guarded<S, H>
@@ -209,10 +314,7 @@ where
         // path to keep in sync (`libeffects::Recover::recover`).
         let boundary = Boundary::new(BoundStage::new(&self.stage, input), Borrowed(&self.handler));
         let polled = boundary.poll_effect(cx);
-        *self
-            .substitutions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += boundary.substitutions();
+        self.substitutions.add(boundary.substitutions());
         polled
     }
 }

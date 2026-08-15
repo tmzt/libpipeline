@@ -25,6 +25,9 @@
 //!   nodes no stale node reads, since the pull revalidates the rest.
 //! * [`run_to_completion_watched`] - the offline driver, reporting `Pending`
 //!   polls that left no wake path. Same answers, one more observation.
+//! * [`run_to_completion_counted`] - the same drive again, reporting how many
+//!   of its answers a boundary SUBSTITUTED, which is what separates a build
+//!   from a build that silently shipped fallbacks.
 //!
 //! **The engine never learns an IR, and the proof is the manifests.**
 //! Everything here is generic over `S: Stage`; nothing matches on a concrete
@@ -70,7 +73,7 @@ mod schedule;
 mod track;
 mod watch;
 
-pub use boundary::Guarded;
+pub use boundary::{Guarded, Substitutions, run_to_completion_counted};
 pub use chain::{Chain, ChainError};
 pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
 pub use memo::Memo;
