@@ -6,6 +6,9 @@
 //!   not a second kind of thing a driver must know how to walk.
 //! * [`run_to_completion`] and [`FrameDriver`] - §5's two drivers over the same
 //!   graph, the same contract and the same keys.
+//! * [`Ledger`], [`Tracked`], [`TrackedInput`] - §3's read-observation ledger:
+//!   edges recorded by observing reads rather than declared, re-logged on every
+//!   run so they follow conditionals.
 //!
 //! **The engine never learns an IR, and the proof is the manifest.** Everything
 //! here is generic over `S: Stage`; nothing matches on a concrete expression
@@ -20,20 +23,22 @@
 //! `libtsx` IS transitively present here and only the direct-edge check
 //! distinguishes "linked through the data crate" from "known to the engine".
 //!
-//! **What is not here yet.** §6 also assigns this crate dependency tracking -
-//! the read-observation ledger of §3, where edges are recorded by observing
-//! reads rather than declared - and invalidation and scheduling built on it.
-//! Step 1 stops at the memo and the drivers. Until the ledger exists, staleness
-//! reaches a driver only because a stage registered the waker it was handed,
-//! which is enough for a graph whose effects know their own consumers and not
-//! enough for the live IDE §3 describes.
+//! **What is not here yet.** §6 assigns this crate three things beyond the
+//! memo: the read-observation ledger, invalidation, and scheduling. The ledger
+//! is here ([`track`](self::Ledger)); invalidation and scheduling are not. Until
+//! they are, an observed read is a recorded edge and nothing more - staleness
+//! still reaches a driver only because a stage registered the waker it was
+//! handed, which is enough for a graph whose effects know their own consumers
+//! and not enough for the live IDE §3 describes.
 
 #![forbid(unsafe_code)]
 
 mod chain;
 mod driver;
 mod memo;
+mod track;
 
 pub use chain::{Chain, ChainError};
 pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
 pub use memo::Memo;
+pub use track::{Ledger, NodeId, Tracked, TrackedInput};
