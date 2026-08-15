@@ -36,9 +36,14 @@ struct Emitted(String);
 
 // -------------------------------------------------------------------- store
 
-/// A memo store for the tests. Not a backend: §9's step 3 owns the real one
-/// (hecs, keyed by content hash). This exists to have something on the other
-/// side of the seam that actually remembers.
+/// A memo store for the tests, and deliberately still its own implementation.
+///
+/// Step 3 has since landed the real ones - `libpipelinedata`'s `MemoMap` and
+/// the hecs-backed `EcsMemoStore`, keyed by content hash - so this could now
+/// be swapped for `MemoMap`. It is not, on purpose: an INDEPENDENT
+/// implementation on the other side of the seam is the only thing here that
+/// shows `MemoStore` is implementable by someone who did not write it, which
+/// is what a seam is for. `MemoMap` cannot prove that about itself.
 struct MapStore<V> {
     rows: Mutex<HashMap<MemoKey, V>>,
 }
