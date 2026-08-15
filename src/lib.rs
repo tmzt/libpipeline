@@ -11,6 +11,8 @@
 //!   run so they follow conditionals; and invalidation over those edges, where
 //!   a changed input marks its dependents stale transitively and wakes whoever
 //!   subscribed.
+//! * [`Schedule`] - what a driver polls next given the stale set: the stale
+//!   nodes no stale node reads, since the pull revalidates the rest.
 //!
 //! **The engine never learns an IR, and the proof is the manifest.** Everything
 //! here is generic over `S: Stage`; nothing matches on a concrete expression
@@ -37,9 +39,11 @@
 mod chain;
 mod driver;
 mod memo;
+mod schedule;
 mod track;
 
 pub use chain::{Chain, ChainError};
 pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
 pub use memo::Memo;
+pub use schedule::{Cycle, Schedule};
 pub use track::{Ledger, NodeId, Tracked, TrackedInput};
