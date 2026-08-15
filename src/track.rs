@@ -169,9 +169,9 @@ enum Reason {
     /// if that dependency recomputes to the same value it stops being a reason
     /// ([`Ledger::unchanged`]).
     Read(u32),
-    /// The node itself owes a value - it answered `Pending`, or a caller marked
-    /// it directly ([`Ledger::mark_stale`]). Nothing a dependency does retracts
-    /// this; only running the node clears it.
+    /// The node itself owes a value - it answered `Pending` or `Failed`, or a
+    /// caller marked it directly ([`Ledger::mark_stale`]). Nothing a dependency
+    /// does retracts this; only running the node to a value clears it.
     Owed,
 }
 
@@ -473,8 +473,9 @@ impl Ledger {
     /// Mark `node` alone stale, without walking to its readers.
     ///
     /// For a node that must be revalidated for a reason the ledger cannot
-    /// observe - [`Tracked`] uses it to keep a `Pending` poll stale, since a
-    /// poll that did not produce a value has not revalidated anything.
+    /// observe - [`Tracked`] uses it to keep a `Pending` OR `Failed` poll
+    /// stale, since a poll that did not produce a value has not revalidated
+    /// anything, whichever way it declined to.
     ///
     /// The mark is the node's OWN, not a dependency's, so no amount of
     /// backdating below it takes it back. See [`unchanged`](Self::unchanged).
@@ -650,12 +651,23 @@ impl<S: Stage> Stage for Tracked<S> {
         let polled = self
             .ledger
             .run(self.node, || self.stage.poll_stage(input, cx));
-        if polled.is_pending() {
+        if !matches!(polled, EffectPoll::Ready(_)) {
             // The scope cleared this node's staleness on the way in, which is
             // right for a poll that produced a value and wrong for one that did
             // not: a `Pending` stage has not revalidated anything, and a
             // scheduler that took the clear at face value would drop it from
             // the work it has left.
+            //
+            // **`Failed` is the same case and used to be missed.** A failure
+            // produces no value either, and the state was unreachable until §7:
+            // a failure ended the drive, so what the ledger thought about the
+            // failed node afterwards did not matter. An error boundary is what
+            // lets the drive continue past one - and then a node that has never
+            // produced a value was reported valid by
+            // [`is_stale`](Ledger::is_stale), dropped from
+            // [`schedule`](Ledger::schedule), and never polled again by anything
+            // that asks the ledger what to poll.
+            // `a_fallback_is_not_a_revalidation.rs` is that measurement.
             self.ledger.mark_stale(self.node);
         }
         polled
