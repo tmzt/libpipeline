@@ -226,6 +226,37 @@ impl PendingWork for LandsOnFirstPump {
     }
 }
 
+/// Frames AFTER a park, and the reason it is written this way: **it polls only
+/// because a wake said stale.**
+///
+/// Every poll here is guarded by `take_stale`, so if the waker were torn out
+/// this returns `None` no matter how many frames it is given. Asserting that a
+/// wake arrived and then re-polling anyway would have proved nothing: the test
+/// would be re-polling on a hunch and reading the wake as decoration. This
+/// helper's first draft did exactly that - it opened with an unguarded poll -
+/// and `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`
+/// caught it, which is the whole reason that control test is here.
+///
+/// `None` means "still pending, nobody woke us". That is a legitimate outcome
+/// for a real frame - it keeps its stand-in - and a failure for a test that
+/// expected a value.
+fn resume_when_woken<S: Stage>(
+    driver: &FrameDriver,
+    stage: &S,
+    input: &S::Input,
+    max_frames: usize,
+) -> Option<S::Output> {
+    for _ in 0..max_frames {
+        if !driver.take_stale() {
+            return None;
+        }
+        if let Some(value) = driver.poll_frame(stage, input).ready() {
+            return Some(value);
+        }
+    }
+    None
+}
+
 // --------------------------------------------------------------------- gate
 
 #[test]
@@ -287,15 +318,101 @@ fn both_drivers_give_the_same_answer_for_the_same_graph() {
     let live_upstream = Arc::new(Upstream::default());
     let live_graph = graph(Arc::clone(&live_upstream));
     let driver = FrameDriver::new();
+
+    // Frame 1 parks. Between frames the upstream lands and wakes; every later
+    // frame happens only because of that wake - see resume_when_woken.
     assert!(driver.poll_frame(&live_graph, &input).is_pending());
     live_upstream.land("built");
-    assert!(driver.take_stale());
-    let live = driver
-        .poll_frame(&live_graph, &input)
-        .ready()
+    let live = resume_when_woken(&driver, &live_graph, &input, 4)
         .expect("the woken frame reaches a value");
 
     assert_eq!(offline, live);
+}
+
+/// The same stage as [`Emit`], minus the one line that registers the waker.
+///
+/// It exists to measure, rather than reason about, what `resume_when_woken`
+/// depends on: with this in the graph the value LANDS and the frame loop still
+/// never sees it. That turns "the wake is load-bearing" from a claim about the test
+/// into an observation of it.
+struct ForgetfulEmit {
+    upstream: Arc<Upstream>,
+}
+
+impl Stage for ForgetfulEmit {
+    type Input = Lowered;
+    type Output = Emitted;
+    type Error = &'static str;
+
+    fn id(&self) -> StageId {
+        StageId::new("test.emit_without_registering", 1)
+    }
+
+    fn memo_key(&self, _input: &Lowered) -> Option<MemoKey> {
+        None
+    }
+
+    fn poll_stage(
+        &self,
+        input: &Lowered,
+        _cx: &mut Context<'_>,
+    ) -> EffectPoll<Emitted, &'static str> {
+        let Some(landed) = *self.upstream.value.lock().unwrap() else {
+            return EffectPoll::Pending;
+        };
+        EffectPoll::Ready(Emitted(format!("{landed}::{}", input.0.join("/"))))
+    }
+}
+
+#[test]
+fn a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late() {
+    // Stage::poll_stage's doc makes registering an obligation. This is what
+    // breaking it costs, and it is the control that gives the wake in
+    // `both_drivers_give_the_same_answer_for_the_same_graph` its meaning: the
+    // upstream lands, the value is there for the asking, and the frame loop
+    // never asks because nothing told it to.
+    let upstream = Arc::new(Upstream::default());
+    let graph = Chain::new(
+        StageId::new("test.forgetful", 1),
+        Memo::new(Lower::new(), MapStore::new()),
+        ForgetfulEmit {
+            upstream: Arc::clone(&upstream),
+        },
+    );
+    let driver = FrameDriver::new();
+    let input = Source("props.title");
+
+    assert!(driver.poll_frame(&graph, &input).is_pending());
+    upstream.land("built");
+    assert_eq!(
+        resume_when_woken(&driver, &graph, &input, 100),
+        None,
+        "the value landed and the frame loop never learned of it",
+    );
+
+    // The offline driver is unaffected, because it re-polls without being
+    // asked - which is exactly why a missing registration is invisible to a CLI
+    // run and fatal in the IDE. Worth knowing before a real stage forgets.
+    let out = run_to_completion(
+        &graph,
+        &input,
+        &LandsOnFirstPump {
+            upstream,
+            landed: Mutex::new(false),
+        },
+    );
+    assert_eq!(out, Ok(Emitted("built::props/title".to_string())));
+}
+
+#[test]
+fn the_frame_loop_cannot_advance_without_a_wake() {
+    // The control for resume_when_woken: nothing lands, so nothing wakes, so no
+    // number of frames produces a value.
+    let graph = graph(Arc::new(Upstream::default()));
+    let driver = FrameDriver::new();
+    let input = Source("props.title");
+    assert!(driver.poll_frame(&graph, &input).is_pending());
+    assert_eq!(resume_when_woken(&driver, &graph, &input, 100), None);
 }
 
 #[test]
