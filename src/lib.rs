@@ -6,6 +6,11 @@
 //!   has ruled out on account of an ambient one.
 //! * [`Chain`] - two stages composed, which is itself a `Stage`, so a graph is
 //!   not a second kind of thing a driver must know how to walk.
+//! * [`Guarded`] - §7's error boundary at stage level, delegating to
+//!   `libeffects`' `Boundary` for the mechanism and adding the one thing that
+//!   crate has no vocabulary for: a boundary refuses to be memoized, because a
+//!   substituted fallback cached under a key that never moves is a permanent
+//!   fallback indistinguishable from a correct answer.
 //! * [`run_to_completion`] and [`FrameDriver`] - §5's two drivers over the same
 //!   graph, the same contract and the same keys.
 //! * [`Ledger`], [`Tracked`], [`TrackedInput`] - §3's read-observation ledger:
@@ -42,15 +47,22 @@
 //! because the address costs a traversal of the output, and a chain that
 //! backdates at every level pays for it at every level.
 //!
-//! **The seams that are stated rather than enforced.** Two rules hold by
+//! **The seams that are stated rather than enforced.** Three rules hold by
 //! composition and cannot be checked from inside the type that needs them, so
 //! each is stated in a doc and pinned by a known-bad twin: a cache belongs
-//! INSIDE the tracking (`Memo`'s doc), and a stage's tracked reads must go
-//! through [`TrackedInput::get`] rather than `peek` or the ledger sees nothing
-//! to defer to.
+//! INSIDE the tracking (`Memo`'s doc); a stage's tracked reads must go through
+//! [`TrackedInput::get`] rather than `peek` or the ledger sees nothing to defer
+//! to; and a boundary belongs OUTSIDE the tracking ([`Guarded`]'s doc), because
+//! a substituted `Ready` tells the ledger the node is up to date when it is
+//! still owed its real answer.
+//!
+//! The fourth of that family is no longer stated: a boundary belongs outside
+//! the MEMO, which [`Guarded::memo_key`] closes structurally by refusing to key
+//! at all.
 
 #![forbid(unsafe_code)]
 
+mod boundary;
 mod chain;
 mod driver;
 mod memo;
@@ -58,6 +70,7 @@ mod schedule;
 mod track;
 mod watch;
 
+pub use boundary::Guarded;
 pub use chain::{Chain, ChainError};
 pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
 pub use memo::Memo;
