@@ -8,7 +8,9 @@
 //!   graph, the same contract and the same keys.
 //! * [`Ledger`], [`Tracked`], [`TrackedInput`] - §3's read-observation ledger:
 //!   edges recorded by observing reads rather than declared, re-logged on every
-//!   run so they follow conditionals.
+//!   run so they follow conditionals; and invalidation over those edges, where
+//!   a changed input marks its dependents stale transitively and wakes whoever
+//!   subscribed.
 //!
 //! **The engine never learns an IR, and the proof is the manifest.** Everything
 //! here is generic over `S: Stage`; nothing matches on a concrete expression
@@ -24,12 +26,11 @@
 //! distinguishes "linked through the data crate" from "known to the engine".
 //!
 //! **What is not here yet.** §6 assigns this crate three things beyond the
-//! memo: the read-observation ledger, invalidation, and scheduling. The ledger
-//! is here ([`track`](self::Ledger)); invalidation and scheduling are not. Until
-//! they are, an observed read is a recorded edge and nothing more - staleness
-//! still reaches a driver only because a stage registered the waker it was
-//! handed, which is enough for a graph whose effects know their own consumers
-//! and not enough for the live IDE §3 describes.
+//! memo: the read-observation ledger, invalidation, and scheduling. The first
+//! two are here; scheduling - deciding what a driver polls next given the stale
+//! set - is not. Until it is, a driver re-polls its root and the pull does the
+//! ordering, which is correct and does redundant work on a graph wide enough
+//! for a stale node to be reachable by two paths.
 
 #![forbid(unsafe_code)]
 

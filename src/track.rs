@@ -14,16 +14,17 @@
 //! * [`Tracked`] - a [`Stage`] wrapper that opens a run scope around a poll, so
 //!   "while a stage runs" has a beginning and an end the ledger can see.
 //! * [`TrackedInput`] - a value whose reads are observable. Reading one inside
-//!   a run scope is what logs an edge.
+//!   a run scope is what logs an edge, and changing one marks every node that
+//!   read it - transitively - stale.
 //!
 //! **The engine still names no IR** (`PIPELINE_PLAN.md`:558-568). A node is an
 //! opaque [`NodeId`] and a tracked value is an opaque `T`; nothing here matches
 //! on an expression type, because none is in scope.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::Context;
+use std::task::{Context, Waker};
 
 use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
 
@@ -93,6 +94,14 @@ struct Inner {
     /// walks this one, so it is not a convenience - it is what makes marking
     /// dependents cheap rather than a scan of every node's read set.
     readers: Vec<BTreeSet<u32>>,
+    /// Per node: how many times it has been declared changed. See
+    /// [`Ledger::revision`].
+    revisions: Vec<u64>,
+    /// Who has been marked stale and not yet revalidated.
+    stale: BTreeSet<u32>,
+    /// Whom to tell that something went stale. Not drained by waking - see
+    /// [`Ledger::subscribe`].
+    subscribers: Vec<Waker>,
 }
 
 impl Ledger {
@@ -115,6 +124,7 @@ impl Ledger {
         inner.labels.push(label);
         inner.reads.push(BTreeSet::new());
         inner.readers.push(BTreeSet::new());
+        inner.revisions.push(0);
         NodeId {
             ledger: self.id,
             index,
@@ -160,6 +170,13 @@ impl Ledger {
 
     /// Run `f` as `node`, observing every read it makes.
     ///
+    /// **Entering the scope clears the node's staleness**, before `f` runs and
+    /// not after. That is [`WakeFlag::take_stale`](libeffects::WakeFlag)'s
+    /// discipline for the same reason: a change that lands DURING the run must
+    /// leave the node stale, and clearing afterwards would swallow it. A run
+    /// that ends up answering `Pending` has not produced the new value and is
+    /// marked again by [`Tracked`], which is where the answer is visible.
+    ///
     /// **What is committed, and when.** Reads land in a scratch set for the
     /// duration and replace the node's recorded set when the scope closes -
     /// "the set is re-logged on every run" (§3). Two deliberate exceptions:
@@ -175,7 +192,11 @@ impl Ledger {
     ///   a set with edges MISSING, which is the unsafe direction.
     pub fn run<R>(&self, node: NodeId, f: impl FnOnce() -> R) -> R {
         let index = u32::try_from(self.check(node)).expect("checked above");
-        self.lock().running.push((index, BTreeSet::new()));
+        {
+            let mut inner = self.lock();
+            inner.stale.remove(&index);
+            inner.running.push((index, BTreeSet::new()));
+        }
         let scope = Scope {
             ledger: self,
             index,
@@ -198,6 +219,128 @@ impl Ledger {
         let index = self.check(node);
         let inner = self.lock();
         self.ids(inner.readers[index].iter().copied())
+    }
+
+    /// Declare that `node`'s value has changed: bump its revision, mark every
+    /// node that read it stale - transitively - and tell the subscribers.
+    ///
+    /// Returns how many nodes were marked.
+    ///
+    /// **The changed node is not itself marked.** Staleness means "revalidate
+    /// this by running it"; an input has nothing to run, and a derived node
+    /// whose own value someone declares changed has just produced it. Marking
+    /// the source would put a node in the stale set that no poll can clear.
+    ///
+    /// **The walk is over the reverse index and it is complete**, not stopped
+    /// by nodes that were already stale. Stopping there would be an easy
+    /// dedupe and a wrong one: a node can be stale while a node that reads it
+    /// has since been revalidated, and the second change has to reach that far
+    /// again. Visiting each node once is what bounds the walk - the same
+    /// property, taken from the right place.
+    ///
+    /// **Subscribers are woken only if something was marked.** A change nobody
+    /// read wakes nothing, which is §3's conditional clause seen from the other
+    /// end: "a branch not taken this run contributes no edge, so a change
+    /// behind it wakes nothing".
+    pub fn changed(&self, node: NodeId) -> usize {
+        let index = u32::try_from(self.check(node)).expect("checked above");
+        let mut inner = self.lock();
+        inner.revisions[index as usize] += 1;
+
+        let mut visited = BTreeSet::new();
+        let mut queue: VecDeque<u32> = inner.readers[index as usize].iter().copied().collect();
+        let mut marked = 0;
+        while let Some(next) = queue.pop_front() {
+            if !visited.insert(next) {
+                continue;
+            }
+            if inner.stale.insert(next) {
+                marked += 1;
+            }
+            queue.extend(inner.readers[next as usize].iter().copied());
+        }
+
+        if !visited.is_empty() {
+            let wakers = inner.subscribers.clone();
+            drop(inner);
+            for waker in wakers {
+                waker.wake();
+            }
+        }
+        marked
+    }
+
+    /// How many times `node` has been declared changed, starting at 0.
+    ///
+    /// **This is what connects tracking to the memo**, and it exists because
+    /// the two would otherwise disagree. A memo is keyed by `(stage id, input
+    /// content keys)` and [`Stage::memo_key`] builds it from the stage's INPUT
+    /// argument - so a stage that also reads tracked state has an input the key
+    /// cannot see, and the memo will serve a value the ledger knows is stale.
+    /// `ContentKey`'s own doc states the rule that closes this: "an ambient
+    /// input either becomes a real input with a content key, or it moves the
+    /// version. There is no third option that leaves the cache correct." A
+    /// revision folded into the key is the first branch, available now, without
+    /// waiting for §9's step 2 to give values content hashes.
+    ///
+    /// It is the stage's to fold in, not the engine's to inject, for the reason
+    /// `MemoKey`'s doc gives: the stage builds the key because only the stage
+    /// knows its arguments and their order.
+    pub fn revision(&self, node: NodeId) -> u64 {
+        let index = self.check(node);
+        self.lock().revisions[index]
+    }
+
+    /// Whether `node` has been marked stale and not yet revalidated.
+    pub fn is_stale(&self, node: NodeId) -> bool {
+        let index = u32::try_from(self.check(node)).expect("checked above");
+        self.lock().stale.contains(&index)
+    }
+
+    /// Everything currently stale, in mint order.
+    pub fn stale_nodes(&self) -> Vec<NodeId> {
+        let inner = self.lock();
+        self.ids(inner.stale.iter().copied())
+    }
+
+    /// Mark `node` alone stale, without walking to its readers.
+    ///
+    /// For a node that must be revalidated for a reason the ledger cannot
+    /// observe - [`Tracked`] uses it to keep a `Pending` poll stale, since a
+    /// poll that did not produce a value has not revalidated anything.
+    pub fn mark_stale(&self, node: NodeId) {
+        let index = u32::try_from(self.check(node)).expect("checked above");
+        self.lock().stale.insert(index);
+    }
+
+    /// Clear `node`'s staleness. [`run`](Self::run) does this on entry; this is
+    /// for a caller revalidating a node some other way.
+    pub fn clear_stale(&self, node: NodeId) {
+        let index = u32::try_from(self.check(node)).expect("checked above");
+        self.lock().stale.remove(&index);
+    }
+
+    /// Be told when something goes stale.
+    ///
+    /// **This is the layer's payoff.** A driver that subscribes is woken
+    /// because a read was OBSERVED, not because the stage remembered to stash
+    /// the waker it was handed - which is the defect class step 1 measured
+    /// (`two_drivers_one_graph.rs`'s
+    /// `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
+    /// A stage that reads a [`TrackedInput`] cannot forget, because it never
+    /// had to remember.
+    ///
+    /// **Subscription is not one-shot** and waking does not drain it: §3's wake
+    /// means "stale, poll again", not "the thing you waited for has arrived".
+    /// A frame loop subscribes once and stays subscribed - and may re-subscribe
+    /// every frame without accumulating, because a waker that would wake the
+    /// same target as one already held is not added twice.
+    pub fn subscribe(&self, waker: Waker) {
+        let mut inner = self.lock();
+        if inner.subscribers.iter().any(|held| held.will_wake(&waker)) {
+            return;
+        }
+        inner.subscribers.push(waker);
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -328,8 +471,18 @@ impl<S: Stage> Stage for Tracked<S> {
         cx: &mut Context<'_>,
     ) -> EffectPoll<Self::Output, Self::Error> {
         self.ledger.observe_read(self.node);
-        self.ledger
-            .run(self.node, || self.stage.poll_stage(input, cx))
+        let polled = self
+            .ledger
+            .run(self.node, || self.stage.poll_stage(input, cx));
+        if polled.is_pending() {
+            // The scope cleared this node's staleness on the way in, which is
+            // right for a poll that produced a value and wrong for one that did
+            // not: a `Pending` stage has not revalidated anything, and a
+            // scheduler that took the clear at face value would drop it from
+            // the work it has left.
+            self.ledger.mark_stale(self.node);
+        }
+        polled
     }
 }
 
@@ -394,5 +547,37 @@ impl<T: Clone> TrackedInput<T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+}
+
+impl<T: Clone + PartialEq> TrackedInput<T> {
+    /// Store `value`, marking every node that read this one stale -
+    /// transitively - and waking the ledger's subscribers.
+    ///
+    /// Returns whether the value moved.
+    ///
+    /// **A write of an equal value is not a change, and marks nothing.** This
+    /// is §3's backdating ("early cutoff" in the build-systems literature) at
+    /// the leaf, where it is exact and costs one comparison: "without cutoff
+    /// every keystroke invalidates the whole pipeline". Taking it here does not
+    /// pre-empt the harder half - a DERIVED value that recomputes to something
+    /// equal still propagates, because nothing at this layer compares outputs -
+    /// but it removes the case a live IDE hits constantly, an editor writing
+    /// back a value the user did not actually change.
+    ///
+    /// `T: PartialEq` is therefore load-bearing rather than a convenience. A
+    /// type that cannot be compared cannot have this cutoff, and the honest
+    /// spelling for one would be a separate constructor, not a silent
+    /// invalidation on every write.
+    pub fn set(&self, value: T) -> bool {
+        {
+            let mut held = self.value.lock().unwrap_or_else(PoisonError::into_inner);
+            if *held == value {
+                return false;
+            }
+            *held = value;
+        }
+        self.ledger.changed(self.node);
+        true
     }
 }
