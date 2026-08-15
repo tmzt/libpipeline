@@ -1,7 +1,9 @@
 //! The pipeline engine and its two drivers (`PIPELINE_PLAN.md` §5, §6).
 //!
-//! * [`Memo`] - the memo layer. The lookup precedes the work, and only `Ready`
-//!   is recorded.
+//! * [`Memo`] - the memo layer. The lookup precedes the work, only `Ready` is
+//!   recorded, and the store is not consulted at all while [`revalidating`] -
+//!   so a key built from a stage's arguments cannot serve a value the ledger
+//!   has ruled out on account of an ambient one.
 //! * [`Chain`] - two stages composed, which is itself a `Stage`, so a graph is
 //!   not a second kind of thing a driver must know how to walk.
 //! * [`run_to_completion`] and [`FrameDriver`] - §5's two drivers over the same
@@ -51,5 +53,5 @@ pub use chain::{Chain, ChainError};
 pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
 pub use memo::Memo;
 pub use schedule::{Cycle, Schedule};
-pub use track::{Ledger, NodeId, Tracked, TrackedInput};
+pub use track::{Ledger, NodeId, Tracked, TrackedInput, revalidating};
 pub use watch::{WakePath, WakeReport, poll_watched, run_to_completion_watched};

@@ -21,6 +21,7 @@
 //! opaque [`NodeId`] and a tracked value is an opaque `T`; nothing here matches
 //! on an expression type, because none is in scope.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -31,6 +32,53 @@ use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
 /// Distinguishes one [`Ledger`] from another, so a [`NodeId`] minted by one is
 /// refused by the other rather than silently addressing a different node.
 static LEDGERS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Per open run scope on this thread, innermost last: whether the node was
+    /// STALE when its scope opened. See [`revalidating`].
+    ///
+    /// **Per thread rather than per ledger, because the consumer has no
+    /// ledger.** A cache layer sits INSIDE a stage's poll and is handed nothing
+    /// but the input and a [`Context`]; a run scope is exactly the dynamic
+    /// extent of that poll, so the scope stack is the only channel that reaches
+    /// it without the author wiring one - and a wiring the author must remember
+    /// is the thing being fixed, not a fix. It follows the ledger's stated
+    /// shape (one ledger per drive, one drive per loop) and is strictly
+    /// narrower than the ledger's own running stack: two threads polling
+    /// through one ledger already interleave their scopes there, and their
+    /// revalidation flags do not.
+    static REVALIDATING: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether the innermost open run scope is REVALIDATING: its node was stale
+/// when [`Ledger::run`] opened the scope, so this poll exists to replace a
+/// value the ledger has already ruled out.
+///
+/// **This is what stops a cache from contradicting the ledger** - the defect
+/// pinned by `invalidation_marks_dependents.rs`'s
+/// `a_memo_over_a_tracked_read_cannot_serve_what_the_ledger_ruled_stale`.
+/// [`Stage::memo_key`] is built from the stage's INPUT argument, so a stage
+/// that also reads tracked state has an ambient input the key cannot see, and a
+/// cache keyed on that alone will serve a value the ledger knows is stale.
+/// [`Memo`](crate::Memo) consults this and does not answer from its store while
+/// it is true; any other cache layer must do the same, which is why this is
+/// public rather than private to that type.
+///
+/// **Why observation rather than declaration.** The other available fix is for
+/// the stage to fold [`Ledger::revision`] of everything it reads into its own
+/// key. That works and is exact, and it is a DECLARED dependency list - the one
+/// thing §3 says this design explicitly does not have, and it fails the way
+/// declarations fail: silently, when someone forgets. The ambient inputs are
+/// already observed; the correction belongs on the same channel as the
+/// observation.
+///
+/// **False when no scope is open**, which is the honest answer: with no run
+/// scope there is no tracked node, nothing was ever marked stale on its behalf,
+/// and a cache has nothing to defer to. That is what keeps a pipeline with no
+/// tracking in it behaving exactly as before.
+pub fn revalidating() -> bool {
+    REVALIDATING.with(|stack| stack.borrow().last().copied().unwrap_or(false))
+}
 
 /// A node in the dependency graph: a tracked input, or a stage that reads them.
 ///
@@ -190,13 +238,21 @@ impl Ledger {
     ///   a value that is never recomputed. The cheap error is the one taken.
     /// * **A scope unwound by a panic commits nothing.** A partial read set is
     ///   a set with edges MISSING, which is the unsafe direction.
+    ///
+    /// **The staleness the entry clears is not merely discarded - it is carried
+    /// for the duration of the scope**, where [`revalidating`] answers it. The
+    /// clear alone would leave a cache inside `f` unable to tell a poll that
+    /// exists to REPLACE a ruled-out value from a poll of a node nothing has
+    /// touched, and those want opposite answers from a store.
     pub fn run<R>(&self, node: NodeId, f: impl FnOnce() -> R) -> R {
         let index = u32::try_from(self.check(node)).expect("checked above");
-        {
+        let entered_stale = {
             let mut inner = self.lock();
-            inner.stale.remove(&index);
+            let was_stale = inner.stale.remove(&index);
             inner.running.push((index, BTreeSet::new()));
-        }
+            was_stale
+        };
+        REVALIDATING.with(|stack| stack.borrow_mut().push(entered_stale));
         let scope = Scope {
             ledger: self,
             index,
@@ -272,20 +328,27 @@ impl Ledger {
 
     /// How many times `node` has been declared changed, starting at 0.
     ///
-    /// **This is what connects tracking to the memo**, and it exists because
-    /// the two would otherwise disagree. A memo is keyed by `(stage id, input
-    /// content keys)` and [`Stage::memo_key`] builds it from the stage's INPUT
-    /// argument - so a stage that also reads tracked state has an input the key
-    /// cannot see, and the memo will serve a value the ledger knows is stale.
-    /// `ContentKey`'s own doc states the rule that closes this: "an ambient
-    /// input either becomes a real input with a content key, or it moves the
-    /// version. There is no third option that leaves the cache correct." A
-    /// revision folded into the key is the first branch, available now, without
-    /// waiting for §9's step 2 to give values content hashes.
+    /// **A stage may fold this into its own key, and no longer has to.**
+    /// `ContentKey`'s doc states the rule an ambient input must satisfy: "an
+    /// ambient input either becomes a real input with a content key, or it
+    /// moves the version. There is no third option that leaves the cache
+    /// correct." A revision folded into [`Stage::memo_key`] is the first
+    /// branch, spelled by the stage. It is exact, it lets a hit be served
+    /// straight from the store, and it is a DECLARATION - so it is also
+    /// forgettable, and forgetting it is silent.
     ///
-    /// It is the stage's to fold in, not the engine's to inject, for the reason
-    /// `MemoKey`'s doc gives: the stage builds the key because only the stage
-    /// knows its arguments and their order.
+    /// The second branch is the one the engine now takes on every stage's
+    /// behalf, because it needs nothing declared: staleness IS the version, and
+    /// [`revalidating`] carries it into the poll where a cache can defer to it.
+    /// So this is a sharpening a stage may buy - one that turns an extra run
+    /// into a hit under a moved key - rather than the thing that stands between
+    /// the cache and a wrong answer.
+    ///
+    /// Note the direction of the difference. Folding the revision distinguishes
+    /// "this input moved" from "some input I read moved"; the ledger's stale bit
+    /// is per NODE, so a node stale for any reason re-runs. The engine's rule is
+    /// the conservative one, which is the same direction [`run`](Self::run)
+    /// takes with a read set it cannot classify.
     pub fn revision(&self, node: NodeId) -> u64 {
         let index = self.check(node);
         self.lock().revisions[index]
@@ -379,6 +442,12 @@ struct Scope<'a> {
 
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
+        // Popped first and unconditionally: every path out of this function
+        // below is a `return`, and a revalidation flag left on the stack would
+        // outlive its poll and be read by the NEXT one.
+        REVALIDATING.with(|stack| {
+            stack.borrow_mut().pop();
+        });
         let mut inner = self.ledger.lock();
         let Some((index, scratch)) = inner.running.pop() else {
             return;

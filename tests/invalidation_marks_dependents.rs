@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
-use libpipeline::{FrameDriver, Ledger, Memo, NodeId, Tracked, TrackedInput};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, Stage, StageId};
+use libpipeline::{FrameDriver, Ledger, Memo, NodeId, Tracked, TrackedInput, revalidating};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, NoMemo, Stage, StageId};
 
 // ---------------------------------------------------------------- stand-ins
 
@@ -155,20 +155,48 @@ impl Stage for Parks {
     }
 }
 
-/// A memoized stage that reads tracked state, with the fold that makes its key
-/// honest switchable - see `a_memo_over_a_tracked_read_needs_the_revision_in_its_key`.
+/// A memoized stage that reads tracked state, with both spellings of "account
+/// for the ambient input" switchable: whether the read is OBSERVED (so the
+/// ledger can rule the node stale) and whether the stage DECLARES it by folding
+/// the revision into its own key.
 struct Composes {
     ledger: Arc<Ledger>,
     from: Arc<TrackedInput<String>>,
+    /// When false the read goes through `peek` and logs no edge - the same
+    /// known-bad input `Reads` carries, one word different.
+    observes: bool,
     folds_revision: bool,
     runs: Mutex<usize>,
+    /// What `revalidating()` said on each run, in order. The mechanism itself,
+    /// read from inside the poll it governs.
+    saw_revalidating: Mutex<Vec<bool>>,
 }
 
 impl Composes {
     const ID: StageId = StageId::new("test.composes", 1);
 
+    fn new(
+        ledger: &Arc<Ledger>,
+        from: &Arc<TrackedInput<String>>,
+        observes: bool,
+        folds_revision: bool,
+    ) -> Self {
+        Self {
+            ledger: Arc::clone(ledger),
+            from: Arc::clone(from),
+            observes,
+            folds_revision,
+            runs: Mutex::new(0),
+            saw_revalidating: Mutex::new(Vec::new()),
+        }
+    }
+
     fn runs(&self) -> usize {
         *self.runs.lock().unwrap()
+    }
+
+    fn saw_revalidating(&self) -> Vec<bool> {
+        self.saw_revalidating.lock().unwrap().clone()
     }
 }
 
@@ -196,7 +224,13 @@ impl Stage for Composes {
 
     fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<String, &'static str> {
         *self.runs.lock().unwrap() += 1;
-        EffectPoll::Ready(format!("{}{}", input.0, self.from.get()))
+        self.saw_revalidating.lock().unwrap().push(revalidating());
+        let read = if self.observes {
+            self.from.get()
+        } else {
+            self.from.peek()
+        };
+        EffectPoll::Ready(format!("{}{read}", input.0))
     }
 }
 
@@ -450,16 +484,18 @@ fn a_wake_subscription_is_not_one_shot_and_does_not_accumulate() {
 }
 
 #[test]
-fn a_memo_over_a_tracked_read_needs_the_revision_in_its_key() {
-    // The finding this test exists to pin: TRACKING SEES A DEPENDENCY THE MEMO
-    // KEY DOES NOT. `Stage::memo_key` is built from the stage's INPUT argument,
-    // so a stage that also reads tracked state has an ambient input the key
-    // cannot see - and the memo will happily serve a value the ledger has
-    // already marked stale. ContentKey's doc states the rule ("an ambient input
-    // either becomes a real input with a content key, or it moves the version.
-    // There is no third option that leaves the cache correct"); the ledger's
-    // revision is what makes the first branch available before §9's step 2
-    // gives values content hashes.
+fn a_memo_over_a_tracked_read_cannot_serve_what_the_ledger_ruled_stale() {
+    // The finding this test was written to pin: TRACKING SEES A DEPENDENCY THE
+    // MEMO KEY DOES NOT. `Stage::memo_key` is built from the stage's INPUT
+    // argument, so a stage that also reads tracked state has an ambient input
+    // the key cannot see - and the memo would happily serve a value the ledger
+    // had already marked stale.
+    //
+    // It is now the ENGINE's business rather than the stage's. `Memo` does not
+    // consult its store while `revalidating()` - while the poll is running
+    // inside the scope of a node the ledger ruled out - so `folds_revision`
+    // buys speed under a moved key and no longer stands between the cache and a
+    // wrong answer. Both settings answer the same, which is the claim.
     for folds_revision in [true, false] {
         let ledger = Ledger::new();
         let from = Arc::new(TrackedInput::new(&ledger, "from", "A".to_string()));
@@ -467,12 +503,7 @@ fn a_memo_over_a_tracked_read_needs_the_revision_in_its_key() {
             &ledger,
             "composes",
             Memo::new(
-                Composes {
-                    ledger: Arc::clone(&ledger),
-                    from: Arc::clone(&from),
-                    folds_revision,
-                    runs: Mutex::new(0),
-                },
+                Composes::new(&ledger, &from, true, folds_revision),
                 MapStore::new(),
             ),
         );
@@ -482,20 +513,164 @@ fn a_memo_over_a_tracked_read_needs_the_revision_in_its_key() {
         from.set("B".to_string());
         assert!(ledger.is_stale(stage.node()), "the ledger saw the read");
 
-        let second = poll(&stage, &input);
-        if folds_revision {
-            assert_eq!(second, EffectPoll::Ready("hiB".to_string()));
-            assert_eq!(stage.stage().stage().runs(), 2);
-        } else {
-            assert_eq!(
-                second,
-                EffectPoll::Ready("hiA".to_string()),
-                "the memo served a value the ledger knew was stale - this is \
-                 the defect, measured rather than described",
-            );
-            assert_eq!(stage.stage().stage().runs(), 1);
-        }
+        assert_eq!(
+            poll(&stage, &input),
+            EffectPoll::Ready("hiB".to_string()),
+            "the store held `hiA` under a key that had not moved; the ledger's \
+             mark outranks it",
+        );
+        assert_eq!(stage.stage().stage().runs(), 2);
+        assert_eq!(
+            stage.stage().stage().saw_revalidating(),
+            [false, true],
+            "and the mechanism is the scope's own flag, not a coincidence of \
+             the key: fresh on the first run, revalidating on the second",
+        );
+
+        // The third poll re-establishes that this is still a cache. Nothing is
+        // stale now, so the store answers and the stage does not run - and it
+        // answers with what the second run recorded, not the entry the ledger
+        // ruled out.
+        assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiB".to_string()));
+        assert_eq!(stage.stage().stage().runs(), 2, "the third poll was a hit");
     }
+}
+
+#[test]
+fn a_memo_over_an_unobserved_read_is_the_case_only_a_declared_key_saves() {
+    // The known-bad twin, and the boundary of the rule above: the gate is the
+    // LEDGER's mark, so it can only fire where the ledger was told. This stage
+    // reads through `peek`, exactly as `Reads` does in this file's first twin -
+    // no edge, nothing marked, `revalidating()` false on every run - and the
+    // store answers with the value from before the change.
+    let ledger = Ledger::new();
+    let from = Arc::new(TrackedInput::new(&ledger, "from", "A".to_string()));
+    let stage = Tracked::new(
+        &ledger,
+        "composes",
+        Memo::new(Composes::new(&ledger, &from, false, false), MapStore::new()),
+    );
+    let input = Text("hi".to_string());
+
+    assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiA".to_string()));
+    from.set("B".to_string());
+    assert!(!ledger.is_stale(stage.node()), "no edge, so nothing was marked");
+    assert_eq!(
+        poll(&stage, &input),
+        EffectPoll::Ready("hiA".to_string()),
+        "the memo served a value that had moved - and no layer here was ever \
+         told it had",
+    );
+    assert_eq!(stage.stage().stage().saw_revalidating(), [false]);
+
+    // The same stage that declares the ambient input in its key survives it.
+    // This is `ContentKey`'s first branch, and where it earns its keep: it is
+    // the only one of the two that works when tracking cannot see the read.
+    let ledger = Ledger::new();
+    let from = Arc::new(TrackedInput::new(&ledger, "from", "A".to_string()));
+    let declared = Tracked::new(
+        &ledger,
+        "composes",
+        Memo::new(Composes::new(&ledger, &from, false, true), MapStore::new()),
+    );
+    assert_eq!(poll(&declared, &input), EffectPoll::Ready("hiA".to_string()));
+    from.set("B".to_string());
+    assert_eq!(
+        poll(&declared, &input),
+        EffectPoll::Ready("hiB".to_string()),
+        "the revision moved the key, so the lookup missed on its own",
+    );
+}
+
+#[test]
+fn a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach() {
+    // The other known-bad twin: the same two layers, composed the other way
+    // round. `Memo::new(Tracked::new(..), store)` puts the lookup OUTSIDE the
+    // node's scope, so it happens before any scope opens, `revalidating()` is
+    // false, and the hit means the tracked stage is never polled at all. The
+    // ledger's mark is right there and unread.
+    //
+    // `Memo` cannot detect this - it is generic over a stage and can no more
+    // inspect its inner one than a driver can - so the rule is the composition
+    // order, stated in `Memo`'s doc and measured here.
+    let ledger = Ledger::new();
+    let from = Arc::new(TrackedInput::new(&ledger, "from", "A".to_string()));
+    let stage = Memo::new(
+        Tracked::new(
+            &ledger,
+            "composes",
+            Composes::new(&ledger, &from, true, false),
+        ),
+        MapStore::new(),
+    );
+    let input = Text("hi".to_string());
+
+    assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiA".to_string()));
+    from.set("B".to_string());
+    assert!(
+        ledger.is_stale(stage.stage().node()),
+        "the read WAS observed and the node IS stale",
+    );
+    assert_eq!(
+        poll(&stage, &input),
+        EffectPoll::Ready("hiA".to_string()),
+        "and the outer store answered anyway - the contradiction the correct \
+         order removes",
+    );
+    assert_eq!(stage.stage().stage().runs(), 1);
+}
+
+#[test]
+fn the_memo_over_tracked_state_changes_speed_and_not_answers() {
+    // `NoMemo` is the control case its own doc describes: "a pipeline whose
+    // ANSWERS change when the cache is disabled has a bug the cache was
+    // hiding". Over UNTRACKED stages that check already passed
+    // (`two_drivers_one_graph.rs`'s `the_memo_changes_speed_and_not_answers`);
+    // over a stage that reads tracked state it did not, and that failure is
+    // what the revalidation gate exists to remove.
+    //
+    // The run counts are the other half and are not decoration: a gate that
+    // simply stopped the store from ever answering would pass the equality
+    // above and fail here.
+    let (cached_answers, cached_runs) = drive_over_tracked_state(MapStore::new());
+    let (uncached_answers, uncached_runs) = drive_over_tracked_state(NoMemo);
+
+    assert_eq!(
+        cached_answers,
+        ["hiA", "hiB", "hiB", "hiA"],
+        "the answers follow the tracked value, cache or no cache",
+    );
+    assert_eq!(cached_answers, uncached_answers);
+    assert!(
+        cached_runs < uncached_runs,
+        "and the cache still hits where nothing moved: {cached_runs} runs \
+         against {uncached_runs}",
+    );
+}
+
+/// Poll one memoized, tracked stage through a sequence of writes - one of which
+/// changes nothing - and report the answers and how many times it ran.
+fn drive_over_tracked_state<St: MemoStore<String>>(store: St) -> (Vec<String>, usize) {
+    let ledger = Ledger::new();
+    let from = Arc::new(TrackedInput::new(&ledger, "from", "A".to_string()));
+    let stage = Tracked::new(
+        &ledger,
+        "composes",
+        Memo::new(Composes::new(&ledger, &from, true, false), store),
+    );
+    let input = Text("hi".to_string());
+
+    let answers = ["A", "B", "B", "A"]
+        .into_iter()
+        .map(|value| {
+            from.set(value.to_string());
+            match poll(&stage, &input) {
+                EffectPoll::Ready(value) => value,
+                other => panic!("a pure stage answered {other:?}"),
+            }
+        })
+        .collect();
+    (answers, stage.stage().stage().runs())
 }
 
 #[test]
@@ -510,12 +685,7 @@ fn a_memo_hit_does_not_cost_the_node_its_edges() {
         &ledger,
         "composes",
         Memo::new(
-            Composes {
-                ledger: Arc::clone(&ledger),
-                from: Arc::clone(&from),
-                folds_revision: false,
-                runs: Mutex::new(0),
-            },
+            Composes::new(&ledger, &from, true, false),
             MapStore::new(),
         ),
     );
