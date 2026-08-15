@@ -1,0 +1,3 @@
+# Build output when this unit is built standalone (inside the Highbay
+# workspace the shared /target at the root is used instead).
+/target
