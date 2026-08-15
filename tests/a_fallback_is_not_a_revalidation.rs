@@ -316,7 +316,91 @@ fn a_boundary_inside_the_tracking_keeps_its_fallback_after_the_failure_clears() 
 }
 
 // ---------------------------------------------------------------------------
-// Gate 3: the debt is the node's own, and backdating cannot retract it.
+// Gate 3: what backdating does with a fallback - the amplification.
+// ---------------------------------------------------------------------------
+
+/// Open a scope for `reader` and poll `root` inside it, so the read is
+/// attributed and `reader` becomes a consumer of the polled node.
+///
+/// A consumer written as a stage would need to hold the node it reads, and
+/// `Stage` has no forwarding impl for `Arc<S>` (see the note in
+/// `a_stage_boundary_catches_what_its_stage_raises.rs`). The ledger's own
+/// public surface does the same job here: `run` is what a `Tracked` poll opens,
+/// and `observe_read` is what a poll inside it logs.
+fn read_as<S: Stage>(ledger: &Ledger, reader: libpipeline::NodeId, root: &S, input: &S::Input) {
+    ledger.run(reader, || {
+        driven(root, input);
+    });
+}
+
+#[test]
+fn a_repeated_fallback_inside_backdating_retracts_what_its_consumers_owe() {
+    // THE AMPLIFICATION, and it is the SAME forbidden composition: a boundary
+    // inside the node. `Backdated` addresses each `Ready` output and, when the
+    // address repeats, tells the ledger this node produced nothing new - so a
+    // fallback that repeats retracts the staleness of everything reading it.
+    // The consumers are then told "nothing moved" about a node that has never
+    // produced its real answer at all.
+    let ledger = Ledger::new();
+    let src = Arc::new(TrackedInput::new(&ledger, "src", "a".to_string()));
+    let node = libpipeline::Backdated::new(
+        &ledger,
+        "n",
+        Guarded::new(
+            GUARD,
+            Flaky::new(WhileEmpty::Failing, &src),
+            Fallback::new("fallback".to_string()),
+        ),
+    );
+    let consumer = ledger.node("c");
+    let input = Text("src".into());
+
+    // The consumer reads the node once, which is what makes it a consumer.
+    read_as(&ledger, consumer, &node, &input);
+    assert_eq!(ledger.readers_of(node.node()), vec![consumer]);
+
+    // Something upstream moves, so both are stale.
+    assert!(src.set("b".to_string()));
+    assert!(ledger.is_stale(node.node()) && ledger.is_stale(consumer));
+
+    // The node re-runs and substitutes the same fallback as last time.
+    assert_eq!(driven(&node, &input), EffectPoll::Ready("fallback".into()));
+    assert!(
+        !ledger.is_stale(consumer),
+        "the fallback repeated, so backdating retracted the consumer's reason \
+         to re-run - about a node whose real answer has never been computed",
+    );
+}
+
+#[test]
+fn a_repeated_failure_outside_backdating_retracts_nothing() {
+    // The prescribed order, same parts. The node answers `Failed`, so there is
+    // no output to address, nothing repeats, and nobody is told anything was
+    // unchanged - and the node itself still owes a value.
+    let ledger = Ledger::new();
+    let src = Arc::new(TrackedInput::new(&ledger, "src", "a".to_string()));
+    let node = libpipeline::Backdated::new(&ledger, "n", Flaky::new(WhileEmpty::Failing, &src));
+    let watched = node.node();
+    let guarded = Guarded::new(GUARD, node, Fallback::new("fallback".to_string()));
+    let consumer = ledger.node("c");
+    let input = Text("src".into());
+
+    read_as(&ledger, consumer, &guarded, &input);
+    assert_eq!(ledger.readers_of(watched), vec![consumer]);
+
+    assert!(src.set("b".to_string()));
+    assert!(ledger.is_stale(watched) && ledger.is_stale(consumer));
+
+    assert_eq!(driven(&guarded, &input), EffectPoll::Ready("fallback".into()));
+    assert!(
+        ledger.is_stale(consumer),
+        "no address was recorded for a failure, so nothing was retracted",
+    );
+    assert!(ledger.is_stale(watched), "and the node still owes its value");
+}
+
+// ---------------------------------------------------------------------------
+// Gate 4: the debt is the node's own, and backdating cannot retract it.
 // ---------------------------------------------------------------------------
 
 #[test]

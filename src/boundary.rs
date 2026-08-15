@@ -100,6 +100,16 @@ use crate::{DriveError, PendingWork, run_to_completion};
 /// twin `a_boundary_inside_the_tracking_keeps_its_fallback_after_the_failure_clears`
 /// measures the difference rather than asserting it.
 ///
+/// **And it does not stop at the node.** [`Backdated`](crate::Backdated)
+/// addresses each `Ready` output and, when the address repeats, tells the
+/// ledger this node produced nothing new - so a fallback that repeats retracts
+/// the staleness of everything READING it, and the consumers are told nothing
+/// moved about a node whose real answer has never been computed. Same
+/// composition, one step further out;
+/// `a_repeated_fallback_inside_backdating_retracts_what_its_consumers_owe`
+/// measures it, and its prescribed-order twin shows a `Failed` node addressing
+/// nothing and retracting nothing.
+///
 /// `memo_key -> None` cannot close this half: the node id belongs to
 /// [`Tracked`](crate::Tracked), and a boundary that reached for one would be
 /// deciding which ledger it belongs to - which is the wrapper's job, and the
