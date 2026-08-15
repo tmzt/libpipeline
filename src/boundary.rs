@@ -50,7 +50,7 @@ use crate::{DriveError, PendingWork, run_to_completion};
 /// [`Memo`](crate::Memo) already refuses to record `Failed`, for
 /// `OBJECTS_PLAN_PI.md:707`'s reason - "effects are never replayed by an
 /// implicit cache", so a transient failure is not served back as a settled fact
-/// (`memo.rs:54-63`). A boundary turns exactly that `Failed` into a `Ready`.
+/// (`memo.rs:57-63`). A boundary turns exactly that `Failed` into a `Ready`.
 /// Cache it and the key says "input X, value V" while V is the fallback; the
 /// input never moved, so the key never moves, and **the real value is never
 /// computed again** - a permanent fallback that is indistinguishable, from the
@@ -67,7 +67,7 @@ use crate::{DriveError, PendingWork, run_to_completion};
 ///
 /// **Answering `memo_key` with `None` is what makes that seam structural on
 /// this side.** `Memo` neither looks up nor records for an input
-/// it has no key for (`memo.rs:119-133`), so the forbidden order stops being
+/// it has no key for (`memo.rs:128-142`), so the forbidden order stops being
 /// able to poison anything: a cache placed above a boundary is a cache with
 /// nothing to say. The rule is still worth composing correctly - the prescribed
 /// order also memoizes the REAL answers, which the forbidden one cannot - but
