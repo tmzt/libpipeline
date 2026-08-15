@@ -13,7 +13,7 @@
 //! (`store.rs:44-49`: "a pipeline whose ANSWERS change when the cache is
 //! disabled has a bug the cache was hiding").
 //!
-//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:563-568).
+//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

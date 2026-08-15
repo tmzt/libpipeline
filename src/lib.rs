@@ -16,25 +16,27 @@
 //! * [`run_to_completion_watched`] - the offline driver, reporting `Pending`
 //!   polls that left no wake path. Same answers, one more observation.
 //!
-//! **The engine never learns an IR, and the proof is the manifest.** Everything
-//! here is generic over `S: Stage`; nothing matches on a concrete expression
-//! type, because there is no concrete expression type in scope to match on
-//! (`PIPELINE_PLAN.md`:558-568). `tests/engine_stays_generic.rs` reads
-//! `Cargo.toml` and fails if `libtsx` or a Highbay crate ever appears there,
-//! and Rust makes that check sufficient rather than merely suggestive: a crate
-//! reachable only transitively cannot be named in a `use`, so an engine that
-//! wanted to match on a real IR would have to add the edge in the open. That
-//! matters for a reason already visible in the plan - §6b:698-706 has
-//! `libpipelinedata` depending on `libtsx` from step 6 onward, so from then on
-//! `libtsx` IS transitively present here and only the direct-edge check
-//! distinguishes "linked through the data crate" from "known to the engine".
+//! **The engine never learns an IR, and the proof is the manifests.**
+//! Everything here is generic over `S: Stage`; nothing matches on a concrete
+//! expression type, because there is no concrete expression type in scope to
+//! match on (`PIPELINE_PLAN.md`:579-583). `tests/engine_stays_generic.rs` walks
+//! the stack's manifests - this crate's and, through its path dependencies,
+//! every crate under it - and fails if `libtsx` or a Highbay crate appears
+//! anywhere in the tree (§6:591-604). That check is TRANSITIVE as of
+//! `52b6562`, which moved `PipelineExpr` into `highbay_data` and so left
+//! nothing in the stack depending on `libtsx` at any step; the earlier
+//! direct-edge check was sufficient, since a crate reachable only transitively
+//! cannot be named in a `use`, but a rule that holds transitively cannot be
+//! evaded by routing an edge through a sibling.
 //!
-//! **What is not here yet.** §6 assigns this crate three things beyond the
-//! memo: the read-observation ledger, invalidation, and scheduling. The first
-//! two are here; scheduling - deciding what a driver polls next given the stale
-//! set - is not. Until it is, a driver re-polls its root and the pull does the
-//! ordering, which is correct and does redundant work on a graph wide enough
-//! for a stale node to be reachable by two paths.
+//! **What is not here yet.** Backdating (§3's "early cutoff") exists only at
+//! the leaf: [`TrackedInput::set`] refuses to invalidate on a write of an equal
+//! value, but a DERIVED node that recomputes to something equal still wakes its
+//! consumers, because nothing here compares a stage's output to its last one.
+//! §3 wants both halves - "constructive keys give the *lookup*, backdating
+//! gives the *cutoff*, and a live IDE needs both" - and the missing half needs
+//! somewhere to keep the last output and an equality it can trust, which is
+//! §9's step 2 (content keys) rather than more machinery here.
 
 #![forbid(unsafe_code)]
 

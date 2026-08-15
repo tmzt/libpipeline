@@ -8,7 +8,7 @@
 //! on a consequence of it - what the graph does with the edges is the next
 //! gate's subject, and mixing the two would leave neither pinned.
 //!
-//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:563-568). `Text` and
+//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589). `Text` and
 //! `Shout` are invented for this file; the engine has no expression type to
 //! offer and this test suite is where that is proved rather than asserted.
 //!

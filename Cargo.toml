@@ -4,12 +4,13 @@
 # drivers live here.
 #
 # THE DEPENDENCY LIST BELOW IS A PROOF, NOT A CONVENIENCE. Per
-# PIPELINE_PLAN.md:563-568 the engine may never learn an IR: no `libtsx`, no
-# Highbay crate, in dependencies or dev-dependencies, ever. Rust makes that
-# check sufficient rather than merely indicative — a crate reachable only
-# transitively cannot be named in a `use`, so an engine that wanted to match on
-# a real IR would have to add the edge here, in the open.
-# `tests/engine_stays_generic.rs` reads this file and fails if one appears.
+# PIPELINE_PLAN.md:579-589 the engine may never learn an IR: no `libtsx`, no
+# Highbay crate, in dependencies or dev-dependencies, ever.
+# `tests/engine_stays_generic.rs` reads this file — and, following its path
+# dependencies, every manifest under it — and fails if one appears ANYWHERE in
+# the tree (§6:591-604). The check is transitive because nothing in the stack
+# depends on `libtsx` at any step, so the stronger rule is true for free: a rule
+# that holds transitively cannot be evaded by routing an edge through a sibling.
 [package]
 name = "libpipeline"
 version = "0.1.0"

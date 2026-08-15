@@ -17,7 +17,7 @@
 //!   a run scope is what logs an edge, and changing one marks every node that
 //!   read it - transitively - stale.
 //!
-//! **The engine still names no IR** (`PIPELINE_PLAN.md`:558-568). A node is an
+//! **The engine still names no IR** (`PIPELINE_PLAN.md`:579-583). A node is an
 //! opaque [`NodeId`] and a tracked value is an opaque `T`; nothing here matches
 //! on an expression type, because none is in scope.
 

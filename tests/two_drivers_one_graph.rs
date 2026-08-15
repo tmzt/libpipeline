@@ -7,7 +7,7 @@
 //! by the real-time one, where a `Pending` stage parks, is woken, and re-polls
 //! to `Ready`. If those two disagree about the answer, the claim is false.
 //!
-//! **Every type the graph carries is a stand-in** (`PIPELINE_PLAN.md`:563-568).
+//! **Every type the graph carries is a stand-in** (`PIPELINE_PLAN.md`:584-589).
 //! `Source`, `Lowered` and `Emitted` are invented for this file. That is the
 //! standing requirement, not a convenience: if the engine's tests could not be
 //! written without a real IR, the engine would have learned something it must

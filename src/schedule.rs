@@ -27,7 +27,7 @@ use crate::{Ledger, NodeId};
 /// **Ids, not work.** A `Schedule` says which NODES; mapping a node to the
 /// typed stage that polls it is the caller's, because the engine is generic
 /// over every expression type and the stages of one graph do not share an
-/// `Input` or `Output` (`PIPELINE_PLAN.md`:558-568). A registry of type-erased
+/// `Input` or `Output` (`PIPELINE_PLAN.md`:579-583). A registry of type-erased
 /// closures could live here, but it would be the caller's map with the types
 /// thrown away rather than something the engine knows.
 #[derive(Clone, PartialEq, Eq, Debug)]

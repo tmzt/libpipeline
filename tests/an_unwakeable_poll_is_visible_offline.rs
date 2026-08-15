@@ -18,7 +18,7 @@
 //!    rather than swallowed - a diagnostic that could stall a working graph
 //!    would be worse than the defect it looks for.
 //!
-//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:563-568).
+//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
 
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};

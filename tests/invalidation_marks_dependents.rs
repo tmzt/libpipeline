@@ -16,7 +16,7 @@
 //! [`TrackedInput::peek`](libpipeline::TrackedInput::peek) instead of `get`:
 //! same value, same answer, no edge, and the frame loop is never told.
 //!
-//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:563-568).
+//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
