@@ -258,8 +258,10 @@ modes - same graph, same keys:
 * **`DriveError`** - what `run` answers with; `Stalled` is a real end state.
 * **`ChainError`** - result VOCABULARY, not machinery: the runner's error
   type for a multi-stage pipeline is nested `ChainError`, and a caller
-  matching on which stage failed needs the name. (`Chain` itself - the type
-  that builds such graphs - is internal.)
+  matching on which stage failed needs the name. The type that COMPOSES
+  such a pipeline is internal; see "Internals". A public error type whose
+  producer is private is the normal shape here - you match on what came
+  back without being able to build the thing that produced it.
 * **`WakePath` / `WakeReport`** - the watched drive's findings.
 
 `WakePath` is the one item on that list no public signature names, and it is
@@ -284,13 +286,16 @@ precisely so a consumer can DECLARE a step - an id, a version, an input, an
 output, a memo key - without linking the engine that runs it. It is the
 port; this crate is the implementation behind it.
 
-Everything on the composition side - the tracked layer, the memo layer, the
-chain, the ledger, the drivers - belongs to whoever LINKS the engine, and
-reaches a consumer's stage only by that assembler registering it. A consumer
-that names `Tracked::new(&ledger, label, Memo::new(stage, store))` is not
-merely reaching past the builder; it is working at a layer it has no
-business at, and under the correct split it cannot spell those types at all,
-since it does not depend on this crate. Three consequences:
+Everything on the composition side - tracking, memoization, chaining,
+dependency bookkeeping and driving - belongs to whoever LINKS the engine,
+and reaches a consumer's stage only by that assembler registering it. Those
+layers are named and described under "Internals" below; they are named
+THERE and not here on purpose, because a consumer reading this section
+should not come away with a construction it could copy. Under the correct
+split a consumer cannot spell them at all - it does not depend on this
+crate - so hand-composing that graph is not merely reaching past the
+builder, it is working at a layer the consumer has no business at. Three
+consequences:
 
 * A consumer-level test that hand-composes the stage graph is testing the
   wrong LAYER, whether or not it passes.
@@ -318,6 +323,14 @@ that module when the module is reshaped, and so that reaching an internal
 stays local and visible rather than having a sanctioned home.
 
 ## Internals (assembled by the builder, never exported)
+
+**Nothing in this section is reachable by a consumer, and nothing in it
+appears in a public-API example.** The names below exist so that this
+crate's own maintainers and its tests can talk about the machinery; a
+reader looking for what to CALL wants "Public API" above. That separation
+is the point of the section: an internal named in a consumer-facing
+passage reads as something to use, and one reader already took it that
+way.
 
 All of the below is `pub(crate)`. `boundary.rs`, `schedule.rs`, `track.rs`,
 `chain.rs` and `memo.rs` each carry
