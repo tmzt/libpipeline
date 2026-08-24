@@ -903,6 +903,26 @@ as intent: the tracked layer becomes a record of WHAT A RUN READ at the input
 boundary and WHAT CAME OUT at the output boundary, rather than a who-read-whom
 graph maintained inside.
 
+**And the strongest argument for it is that the wake topology already IS
+the dependency structure.** Tim, 2026-08-24: *"the stages are connected by
+wakers."* That is not only intent - the code composes this way today.
+`Chain::poll_stage` (`src/chain.rs`) hands BOTH halves the same `Context`,
+so one waker serves the whole chain, and a `Pending` anywhere makes the
+chain `Pending`. A wake therefore re-polls from the top.
+
+Re-polling everything sounds wasteful and is not, because MEMOIZATION IS
+WHAT MAKES THE SHARED WAKER A WAKE GRAPH: on the re-poll every stage
+before the pending one hits its memo and returns at once, so waking "all
+of them" costs only the stage that was actually waiting. Which is the
+point - **a dependency graph is not needed to work out who to wake,
+because everyone is woken and the memo decides who had work to do.**
+
+So the ledger's `readers` index, its transitive marking and its per-edge
+retraction are maintaining, at cost, a structure the wake path expresses
+for free. That is an argument from the code's present shape rather than
+from the design's preference, and it stands beside the fan-out argument
+above: a chain records no node-to-node edge, and it does not need one.
+
 **What it displaces.** `src/track.rs` is 2,831 lines. The parts that answer
 questions only a graph can ask are the reverse index (`Inner::readers`, a set
 of readers per node), the transitive marking that walks it (the `VecDeque`
@@ -981,14 +1001,45 @@ the graph, the existing `FrameDriver`, and `last: Mutex<Option<V>>` (safe
 interior mutability, as everywhere in this crate; `run` keeps `&self`
 because a poll holds `&self` all the way down). `run(version, input)`:
 
-1. If `last` holds exactly `version`: return `Ok(Run::Unchanged)`. The
-   readable is not dereferenced, no memo key is computed, no stage is
-   polled.
+1. If `last` holds exactly `version` AND NO WAKE IS PENDING: return
+   `Ok(Run::Unchanged)`. The readable is not dereferenced, no memo key is
+   computed, no stage is polled.
 2. Otherwise poll once through the frame driver (today's
    `FrameDriver::poll_frame`, `src/driver.rs`) and map the answer:
    `Ready(v)` becomes `Ok(Run::Computed(v))` and records the version;
    `Pending` becomes `Ok(Run::Delayed)`; `Failed(e)` becomes `Err(e)`.
    Nothing else records the version.
+
+**The wake half of that condition is not optional, and omitting it is a
+silent defect.** Two different things mean "something happened", and only
+one of them moves the version:
+
+* the INPUT VERSION moved - the source changed;
+* a WAKE arrived - a value some stage was waiting on has landed.
+
+A landed effect does not move the input version. The source did not
+change; an awaited value simply arrived. So a gate that checked the
+version alone would take a pipeline sitting on `Delayed`, receive the
+wake, re-poll, short-circuit on the unchanged version, and answer
+`Unchanged` - forever. The delayed value is never delivered, and nothing
+reports it: the caller sees a legitimate-looking `Unchanged` and holds a
+value that is permanently one step stale. That is precisely the failure
+this crate exists to prevent, arriving through the gate meant to prevent
+it.
+
+The mechanism already exists. `FrameDriver::take_stale` (`src/driver.rs`)
+answers "has a wake arrived since this was last asked" and clears on read;
+the gate consumes it rather than leaving it a separate question the caller
+must remember to ask. Today's frame-drive callers ask both by hand - the
+README's own loop reads `if pipeline.take_stale() || version != drawn_for`
+- so the gate is absorbing a condition that is already load-bearing in
+practice, not inventing one.
+
+Ordering matters: `take_stale` clears when read, so the gate must consume
+it on every run, not only when the version matches. A run that polls for a
+version change and leaves an unread wake behind would answer `Unchanged`
+on the NEXT run despite the wake, which is the same defect one step
+displaced.
 
 The error arm is a re-wrap and not a construction: with the position stamped
 at registration, the graph's own error type IS the flat `Failed`, so the door
@@ -1395,8 +1446,15 @@ In `src/builder.rs`: add `Run<Output>` (exported from `src/lib.rs`); give
 `Pipeline` the `V: Copy + Eq` parameter and the `last: Mutex<Option<V>>`
 field; implement `run(&self, version, &input) -> Result<Run<Output>,
 Failed<Error>>` as gate + `poll_frame` + mapping, recording the version only
-on `Ready`. Delete `run`, `run_pure`, `run_watched`, `poll_frame` (the door,
-not the internals they call); keep `take_stale` and `waker`. Drop the
+on `Ready`. **The gate consumes `take_stale` on EVERY run** and answers
+`Unchanged` only when the version matches AND no wake was pending - see
+"The version gate and the one door" for why the version alone is a silent
+defect. This step owes a test for it: a pipeline left on `Delayed`, woken
+out of band with the version unchanged, must answer `Computed` and not
+`Unchanged`. It fails the moment the wake half is dropped, which is the
+only way to know the half is doing anything. Delete `run`, `run_pure`,
+`run_watched`, `poll_frame` (the door, not the internals they call); keep
+`take_stale` and `waker`. Drop the
 `DriveError`/`PendingWork`/`NoPendingWork`/`WakePath`/`WakeReport`
 re-exports from `src/lib.rs`. Port the public tests:
 `tests/builder_is_the_only_door.rs` re-spells its tests through the one
