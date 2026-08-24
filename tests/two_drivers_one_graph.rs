@@ -1,17 +1,17 @@
-//! Gate 1 of `PIPELINE_PLAN.md` §9 step 1: **the same two-stage graph runs
-//! under both drivers.**
+//! Gate: **the same two-stage graph runs under both drivers.**
 //!
-//! §5's claim is "same stages, same keys, different driver". The graph below is
+//! The two-driver rule (`DESIGN.md`, "Two drivers, one graph") claims "same
+//! stages, same keys, different driver". The graph below is
 //! built once, from stages that know nothing about who polls them, and is
 //! driven twice: to completion by the offline driver, and one frame at a time
 //! by the real-time one, where a `Pending` stage parks, is woken, and re-polls
 //! to `Ready`. If those two disagree about the answer, the claim is false.
 //!
-//! **Every type the graph carries is a stand-in** (`PIPELINE_PLAN.md`:584-589).
-//! `Source`, `Lowered` and `Emitted` are invented for this file. That is the
-//! standing requirement, not a convenience: if the engine's tests could not be
-//! written without a real IR, the engine would have learned something it must
-//! not know.
+//! **Every type the graph carries is a stand-in** (`DESIGN.md`, "The engine
+//! stays generic"). `Source`, `Lowered` and `Emitted` are invented for this
+//! file. That is the standing requirement, not a convenience: if the engine's
+//! tests could not be written without a consumer's real types, the engine
+//! would have learned something it must not know.
 //!
 //! # Everything here goes through the builder, and that is a second gate
 //!
@@ -83,9 +83,9 @@ impl Runs {
 
 /// A memo store for the tests, and deliberately still its own implementation.
 ///
-/// Step 3 has since landed the real ones - `libpipelinedata`'s `MemoMap` and
-/// the hecs-backed `EcsMemoStore`, keyed by content hash - so this could now
-/// be swapped for `MemoMap`. It is not, on purpose: an INDEPENDENT
+/// `libpipelinedata` ships real ones - `MemoMap`, and an optional ECS-backed
+/// store, keyed by content hash - so this could now be swapped for `MemoMap`.
+/// It is not, on purpose: an INDEPENDENT
 /// implementation on the other side of the seam is the only thing here that
 /// shows `MemoStore` is implementable by someone who did not write it, which
 /// is what a seam is for. `MemoMap` cannot prove that about itself.
@@ -118,7 +118,7 @@ impl<V: Clone> MemoStore<V> for MapStore<V> {
 // ------------------------------------------------------------------- stage 1
 
 /// A pure stage: `Ready` on the first poll, keyed, never `Pending` - the shape
-/// every row of §4's table has except rows 10 and 11.
+/// most stages have; only effectful ones ever park.
 struct Lower {
     id: StageId,
     runs: Runs,
@@ -143,8 +143,8 @@ impl Stage for Lower {
     }
 
     fn memo_key(&self, input: &Source) -> Option<MemoKey> {
-        // A stand-in for step 2's content hash: a real one hashes the value's
-        // fields through a streaming hasher. What matters to this file is only
+        // A stand-in for the real content hash (`ContentKey::of`, which streams
+        // the value's fields through a hasher). What matters to this file is only
         // that equal inputs give equal keys and the key costs no run.
         Some(MemoKey::new(self.id, [content_key_of(input.0)]))
     }
@@ -165,8 +165,8 @@ impl Stage for Lower {
 // ------------------------------------------------------------------- stage 2
 
 /// The thing stage 2 is waiting on: an input that has not landed yet, holding
-/// the wakers of everyone who asked for it early. §4's rows 10 and 11 in
-/// miniature.
+/// the wakers of everyone who asked for it early. The effectful,
+/// pending-then-ready shape in miniature.
 #[derive(Default)]
 struct Upstream {
     value: Mutex<Option<&'static str>>,
@@ -223,7 +223,7 @@ impl Stage for Emit {
     }
 }
 
-/// Stand-in for step 2's content hash - FNV over the bytes. Not a content
+/// Stand-in for the streaming content hash - FNV over the bytes. Not a content
 /// address and not claiming to be one; the property this file needs is that
 /// equal inputs key equally.
 fn content_key_of(text: &str) -> ContentKey {
@@ -354,15 +354,15 @@ fn the_offline_driver_runs_the_graph_to_completion() {
     let graph = graph(Arc::clone(&upstream));
     let work = LandsOnFirstPump::new(upstream);
 
-    let out = graph.run(&Source("props.title"), &work);
-    assert_eq!(out, Ok(Emitted("built::props/title".to_string())));
+    let out = graph.run(&Source("doc.title"), &work);
+    assert_eq!(out, Ok(Emitted("built::doc/title".to_string())));
 }
 
 #[test]
 fn the_real_time_driver_parks_wakes_and_re_polls_to_ready() {
     let upstream = Arc::new(Upstream::default());
     let graph = graph(Arc::clone(&upstream));
-    let input = Source("props.title");
+    let input = Source("doc.title");
 
     // Frame 1: the upstream has not landed. The frame does not block; it would
     // draw a stand-in and return.
@@ -379,15 +379,15 @@ fn the_real_time_driver_parks_wakes_and_re_polls_to_ready() {
     // Frame 2: the same graph, re-polled, now answers.
     assert_eq!(
         graph.poll_frame(&input),
-        EffectPoll::Ready(Emitted("built::props/title".to_string())),
+        EffectPoll::Ready(Emitted("built::doc/title".to_string())),
     );
 }
 
 #[test]
 fn both_drivers_give_the_same_answer_for_the_same_graph() {
-    // PIPELINE_PLAN.md §5's claim, stated as an equality. The two graphs are
+    // The two-driver rule, stated as an equality. The two graphs are
     // built by the same function from the same input; only the driver differs.
-    let input = Source("app.screen.title");
+    let input = Source("doc.section.title");
 
     let offline_upstream = Arc::new(Upstream::default());
     let offline = graph(Arc::clone(&offline_upstream))
@@ -463,7 +463,7 @@ fn a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late() {
             upstream: forgetful,
         })
         .build();
-    let input = Source("props.title");
+    let input = Source("doc.title");
 
     assert!(graph.poll_frame(&input).is_pending());
     upstream.land("built");
@@ -477,7 +477,7 @@ fn a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late() {
     // asked - which is exactly why a missing registration is invisible to a CLI
     // run and fatal in the IDE. Worth knowing before a real stage forgets.
     let out = graph.run(&input, &LandsOnFirstPump::new(upstream));
-    assert_eq!(out, Ok(Emitted("built::props/title".to_string())));
+    assert_eq!(out, Ok(Emitted("built::doc/title".to_string())));
 }
 
 #[test]
@@ -485,7 +485,7 @@ fn the_frame_loop_cannot_advance_without_a_wake() {
     // The control for resume_when_woken: nothing lands, so nothing wakes, so no
     // number of frames produces a value.
     let graph = graph(Arc::new(Upstream::default()));
-    let input = Source("props.title");
+    let input = Source("doc.title");
     assert!(graph.poll_frame(&input).is_pending());
     assert_eq!(resume_when_woken(&graph, &input, 100), None);
 }
@@ -497,7 +497,7 @@ fn a_stalled_graph_ends_rather_than_spinning() {
     // the ordinary "keep the stand-in" case, which is exactly why the two
     // drivers differ here and nowhere else.
     let graph = graph(Arc::new(Upstream::default()));
-    let out = graph.run_pure(&Source("props.title"));
+    let out = graph.run_pure(&Source("doc.title"));
     assert_eq!(out, Err(DriveError::Stalled));
 }
 
@@ -519,7 +519,7 @@ fn the_memo_serves_the_second_poll_without_re_running_the_stage() {
     // drive over the same input is served by the lookup that precedes the work.
     let runs = Runs::default();
     let stage = lowering(runs.clone(), true);
-    let input = Source("props.title");
+    let input = Source("doc.title");
 
     let first = stage.run_pure(&input);
     let second = stage.run_pure(&input);
@@ -534,22 +534,22 @@ fn the_memo_serves_the_second_poll_without_re_running_the_stage() {
 
 #[test]
 fn one_memo_serves_both_drivers_and_the_stage_runs_once() {
-    // The two drives of section 5 over ONE registered stage, which
+    // The two drives over ONE registered stage, which
     // `both_drivers_give_the_same_answer_for_the_same_graph` does not cover: it
     // builds a graph per driver, so each has its own store and neither hits on
     // the other's work. Here the offline drive fills the store and the frame
-    // drive is served by it - "a CLI run against an unchanged tree is all cache
-    // hits, because the memo keys are the same ones the IDE used" (section 5),
-    // measured rather than asserted about.
+    // drive is served by it - a batch run against an unchanged tree is all
+    // cache hits, because the memo keys are the same ones the interactive host
+    // used - measured rather than asserted about.
     //
-    // **This is the public-API expression of what `src/track.rs`'s
-    // `the_ledger_scope_changes_speed_and_not_answers` measured** (DESIGN.md,
-    // finding 1's note). That test wrapped the same shape in a `Ledger` scope
+    // **This is the public-API expression of what the retired ledger test
+    // measured** (DESIGN.md, "The ledger test, measured").
+    // That test wrapped the same shape in a `Ledger` scope
     // over a stage that read no tracked state, and mutation testing showed the
     // scope was inert in it: the known-bad `Memo::new(Tracked::new(..), ..)`
     // order passed it, and so did deleting the tracking outright. What it
     // actually held is below, and the builder can say all of it.
-    let input = Source("props.title");
+    let input = Source("doc.title");
     let runs = Runs::default();
     let stage = lowering(runs.clone(), true);
 
@@ -588,7 +588,7 @@ fn one_memo_serves_both_drivers_and_the_stage_runs_once() {
 fn the_memo_changes_speed_and_not_answers() {
     // `uncached` is the control case (DESIGN.md): if the answers move when the
     // cache is removed, the cache was part of the semantics.
-    let input = Source("props.title");
+    let input = Source("doc.title");
     let cached_runs = Runs::default();
     let uncached_runs = Runs::default();
     let cached = lowering(cached_runs.clone(), true);
@@ -603,7 +603,7 @@ fn the_memo_changes_speed_and_not_answers() {
 
 #[test]
 fn a_failure_is_never_cached() {
-    // §3's rule: effects are never replayed by an implicit cache. A transient
+    // The standing rule: effects are never replayed by an implicit cache. A transient
     // failure served back from a memo would be exactly that.
     let runs = Runs::default();
     let stage = lowering(runs.clone(), true);
@@ -636,7 +636,7 @@ fn the_effectful_stage_runs_once_across_a_park_and_a_wake() {
         lower_runs.clone(),
         emit_runs.clone(),
     );
-    let input = Source("props.title");
+    let input = Source("doc.title");
 
     assert!(graph.poll_frame(&input).is_pending());
     upstream.land("built");

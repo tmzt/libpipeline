@@ -1,4 +1,4 @@
-//! Memoization (`PIPELINE_PLAN.md` §3).
+//! Memoization: the lookup precedes the work.
 
 // **Dead in the shipped library, alive in the test build - and that is the
 // flip's honest arithmetic rather than an oversight.**
@@ -21,7 +21,8 @@ use crate::track::revalidating;
 
 /// A stage with a memo in front of it.
 ///
-/// **The lookup precedes the work** (`PIPELINE_PLAN.md` §3): the key is
+/// **The lookup precedes the work** (`DESIGN.md`, "The lookup precedes the
+/// work"): the key is
 /// computable from the input alone, so the cache is consulted before the stage
 /// is polled rather than to validate what it produced. That is what makes a
 /// four-level lowering chain cheap - an unchanged source hits at the first
@@ -40,9 +41,9 @@ use crate::track::revalidating;
 ///
 /// * **Nothing has to be declared, so nothing can be forgotten.** There is no
 ///   `Memo` that opts out; the check is not a constructor argument, a builder
-///   flag or a trait bound the author supplies. §3 records edges by observing
-///   reads rather than accepting a declared list, and this is the same rule
-///   applied to the correction.
+///   flag or a trait bound the author supplies. The ledger records edges by
+///   observing reads rather than accepting a declared list, and this is the
+///   same rule applied to the correction.
 /// * **`NoMemo` stays a legitimate implementation** - the property its own doc
 ///   names, "a pipeline whose ANSWERS change when the cache is disabled has a
 ///   bug the cache was hiding". Without this the tracked case failed exactly
@@ -50,8 +51,8 @@ use crate::track::revalidating;
 ///   `the_memo_over_tracked_state_changes_speed_and_not_answers` is that
 ///   control run over a graph which reads tracked state.
 /// * **A pipeline with no tracking in it is untouched.** With no run scope open
-///   `revalidating` is false, so the pure-lowering chains of §4 pay one thread-
-///   local read per lookup and behave as they did.
+///   `revalidating` is false, so a pure lowering chain pays one thread-local
+///   read per lookup and behaves as it did.
 ///
 /// **Wrap the memo in the tracking, not the tracking in the memo.**
 /// `Tracked::new(&ledger, "x", Memo::new(stage, store))` puts the lookup inside
@@ -67,16 +68,15 @@ use crate::track::revalidating;
 /// **Only `Ready` is recorded, and the exclusions are the interesting part.**
 ///
 /// * `Pending` is not a value; there is nothing to remember.
-/// * `Failed` is deliberately not cached. `OBJECTS_PLAN_PI.md:707`'s rule -
-///   "memoize only pure constructors with equal input versions; effects are
-///   never replayed by an implicit cache" - is exactly what caching a failure
-///   would break: a transient failure (a network that was down, a file not yet
+/// * `Failed` is deliberately not cached. The standing rule - memoize only
+///   pure constructors with equal input versions; effects are never replayed
+///   by an implicit cache - is exactly what caching a failure would break: a transient failure (a network that was down, a file not yet
 ///   written) would be served back as a settled fact under a key that says it
 ///   is fresh. An effect's result becomes a replay input by being RECORDED
 ///   deliberately, which is a different act from a cache remembering it.
 ///
 ///   **The exclusion is defeatable from outside**, and by the one construct
-///   §7 adds: an error boundary turns that `Failed` into a `Ready`, so a memo
+///   the boundary layer adds: an error boundary turns that `Failed` into a `Ready`, so a memo
 ///   above one is offered a fallback with the exclusion already spent. That is
 ///   why [`Guarded`](crate::boundary::Guarded) - the stage-level boundary - answers
 ///   `memo_key -> None`, and why the composition rule it states matters even
@@ -89,7 +89,7 @@ use crate::track::revalidating;
 ///
 /// This type is `libpipeline`'s and not `libpipelinedata`'s because it is
 /// machinery: a crate that only implements a stage should not link it
-/// (`PIPELINE_PLAN.md`:517-531).
+/// (`DESIGN.md`, "Where a consumer works").
 pub(crate) struct Memo<S, St> {
     stage: S,
     store: St,

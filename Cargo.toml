@@ -1,21 +1,21 @@
-# The ENGINE of the pipeline stack (PIPELINE_PLAN.md §6): memoization,
-# invalidation and scheduling, GENERIC over the expression types — it enforces
-# `libpipelinedata`'s traits as seams, never a copy of its own, and §5's two
-# drivers live here.
+# The ENGINE of the pipeline stack: memoization, invalidation, scheduling and
+# the two drivers, GENERIC over every payload type - it enforces
+# `libpipelinedata`'s traits as seams, never a copy of its own.
 #
-# THE DEPENDENCY LIST BELOW IS A PROOF, NOT A CONVENIENCE. Per
-# PIPELINE_PLAN.md:579-589 the engine may never learn an IR: no `libtsx`, no
-# Highbay crate, in dependencies or dev-dependencies, ever.
-# `tests/engine_stays_generic.rs` reads this file — and, following its path
-# dependencies, every manifest under it — and fails if one appears ANYWHERE in
-# the tree (§6:591-604). The check is transitive because nothing in the stack
-# depends on `libtsx` at any step, so the stronger rule is true for free: a rule
-# that holds transitively cannot be evaded by routing an edge through a sibling.
+# THE DEPENDENCY LIST BELOW IS A PROOF, NOT A CONVENIENCE. The engine may
+# never learn a consumer's types: no IR crate, no app crate, in dependencies
+# or dev-dependencies, ever (DESIGN.md, "The engine stays generic").
+# `tests/engine_stays_generic.rs` reads this file - and, following its path
+# dependencies, every manifest under it - and fails if a crate outside the
+# stack's own closed allowlist appears ANYWHERE in the tree. The check is
+# transitive because nothing in the stack reaches outside the allowlist at any
+# step, so the stronger rule is true for free: a rule that holds transitively
+# cannot be evaded by routing an edge through a sibling.
 [package]
 name = "libpipeline"
 version = "0.1.0"
 edition = "2024"
-description = "The pipeline engine: memoization and the two drivers of PIPELINE_PLAN.md §5, generic over every expression type"
+description = "An incremental pipeline engine: memoized, poll-driven stages under a frame driver and a blocking driver, generic over every payload type"
 license = "MIT OR Apache-2.0"
 publish = false
 

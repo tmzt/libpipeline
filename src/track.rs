@@ -1,11 +1,11 @@
-//! The read-observation ledger (`PIPELINE_PLAN.md` §3:225-230).
+//! The read-observation ledger.
 //!
-//! §3's rule, verbatim: "edges are **recorded by observing reads, not
-//! declared** - the salsa / MobX / Vue / Solid mechanism: while a stage runs,
-//! every keyed read is logged as an edge; the set is re-logged on every run so
-//! it follows conditionals (a branch not taken this run contributes no edge, so
-//! a change behind it wakes nothing). Declared dependency lists are what this
-//! design explicitly does not have."
+//! The rule (`DESIGN.md`, "Reads are observed, not declared"): edges are
+//! **recorded by observing reads, not declared** - the salsa / MobX / Vue /
+//! Solid mechanism: while a stage runs, every keyed read is logged as an edge;
+//! the set is re-logged on every run so it follows conditionals (a branch not
+//! taken this run contributes no edge, so a change behind it wakes nothing).
+//! Declared dependency lists are what this design explicitly does not have.
 //!
 //! Three pieces implement exactly that sentence and nothing more:
 //!
@@ -17,9 +17,9 @@
 //!   a run scope is what logs an edge, and changing one marks every node that
 //!   read it - transitively - stale.
 //!
-//! **The engine still names no IR** (`PIPELINE_PLAN.md`:579-583). A node is an
-//! opaque [`NodeId`] and a tracked value is an opaque `T`; nothing here matches
-//! on an expression type, because none is in scope.
+//! **The engine still names no consumer type** (`DESIGN.md`, "The engine stays
+//! generic"). A node is an opaque [`NodeId`] and a tracked value is an opaque
+//! `T`; nothing here matches on a payload type, because none is in scope.
 
 // **Dead in the shipped library, alive in the test build - and that is the
 // flip's honest arithmetic rather than an oversight.**
@@ -80,7 +80,7 @@ thread_local! {
 /// **Why observation rather than declaration.** The other available fix is for
 /// the stage to fold [`Ledger::revision`] of everything it reads into its own
 /// key. That works and is exact, and it is a DECLARED dependency list - the one
-/// thing §3 says this design explicitly does not have, and it fails the way
+/// thing this design explicitly does not have, and it fails the way
 /// declarations fail: silently, when someone forgets. The ambient inputs are
 /// already observed; the correction belongs on the same channel as the
 /// observation.
@@ -110,8 +110,7 @@ pub(crate) struct NodeId {
     index: u32,
 }
 
-/// What a stage read while it ran, and who reads whom
-/// (`PIPELINE_PLAN.md` §3:225-230).
+/// What a stage read while it ran, and who reads whom.
 ///
 /// **Reads are observed, never declared.** Nothing here accepts a dependency
 /// list. An edge exists because [`TrackedInput::get`] (or a poll of a
@@ -119,15 +118,15 @@ pub(crate) struct NodeId {
 /// follows a conditional for free: the branch not taken this run did not read,
 /// so it logged nothing.
 ///
-/// **Safe interior mutability** (`CLAUDE.md`): one `Mutex` behind `&self`,
+/// **Safe interior mutability** (this crate forbids `unsafe`): one `Mutex` behind `&self`,
 /// because reads are observed DURING a poll and a poll holds `&self` all the
 /// way down - the same reason `MemoStore` takes `&self` on its recording side.
 /// No `UnsafeCell`, and no lock is ever held across the stage's own poll.
 ///
 /// **Single-threaded per drive.** The running-node stack is per-ledger, so two
 /// threads polling different graphs through ONE ledger would interleave their
-/// scopes and attribute reads to each other. §5's drivers are each one loop - a
-/// frame loop and a CLI loop - so the shape that is supported is one ledger per
+/// scopes and attribute reads to each other. The two drivers are each one loop
+/// - a frame loop and a blocking loop - so the shape that is supported is one ledger per
 /// drive. Sharing one across concurrent drives is a misuse this type does not
 /// try to detect.
 #[derive(Debug)]
@@ -256,7 +255,7 @@ impl Ledger {
     ///
     /// **What is committed, and when.** Reads land in a scratch set for the
     /// duration and replace the node's recorded set when the scope closes -
-    /// "the set is re-logged on every run" (§3). Two deliberate exceptions:
+    /// the set is re-logged on every run. Two deliberate exceptions:
     ///
     /// * **A scope that observed NO reads leaves the previous set standing.**
     ///   The ledger cannot distinguish "ran and read nothing" from "returned a
@@ -332,7 +331,7 @@ impl Ledger {
     /// EXPANSION only - a node already visited still records the new reason.
     ///
     /// **Subscribers are woken only if something was marked.** A change nobody
-    /// read wakes nothing, which is §3's conditional clause seen from the other
+    /// read wakes nothing, which is the conditional clause seen from the other
     /// end: "a branch not taken this run contributes no edge, so a change
     /// behind it wakes nothing".
     pub fn changed(&self, node: NodeId) -> usize {
@@ -380,7 +379,7 @@ impl Ledger {
     }
 
     /// Declare that `node` has just recomputed to the value it already had, so
-    /// its readers may stop counting it as a reason to be stale - §3's
+    /// its readers may stop counting it as a reason to be stale - the design's
     /// **backdating**, one level above the leaf.
     ///
     /// Returns how many nodes stopped being stale.
@@ -390,7 +389,7 @@ impl Ledger {
     /// DERIVED node: a stage whose output ignores part of its input - a
     /// formatter fed a re-indented file, a lowering fed a renamed local - would
     /// recompute the same answer and still make every consumer re-run.
-    /// §3: "without cutoff every keystroke invalidates the whole pipeline".
+    /// Without cutoff, every keystroke invalidates the whole pipeline.
     ///
     /// **The retraction is per edge, and that is why staleness carries
     /// reasons.** A reader stops being stale only when EVERY dependency whose
@@ -501,13 +500,13 @@ impl Ledger {
     ///
     /// **This is the layer's payoff.** A driver that subscribes is woken
     /// because a read was OBSERVED, not because the stage remembered to stash
-    /// the waker it was handed - which is the defect class step 1 measured
+    /// the waker it was handed - which is the measured defect class
     /// (`two_drivers_one_graph.rs`'s
     /// `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
     /// A stage that reads a [`TrackedInput`] cannot forget, because it never
     /// had to remember.
     ///
-    /// **Subscription is not one-shot** and waking does not drain it: §3's wake
+    /// **Subscription is not one-shot** and waking does not drain it: a wake
     /// means "stale, poll again", not "the thing you waited for has arrived".
     /// A frame loop subscribes once and stays subscribed - and may re-subscribe
     /// every frame without accumulating, because a waker that would wake the
@@ -581,7 +580,7 @@ impl Drop for Scope<'_> {
     }
 }
 
-/// A stage whose reads are observed (`PIPELINE_PLAN.md` §3:225-230).
+/// A stage whose reads are observed.
 ///
 /// **Transparent by construction.** Id and memo key delegate, exactly as
 /// [`Memo`](crate::memo::Memo)'s do, for the same reason: tracking must not change
@@ -599,7 +598,7 @@ impl Drop for Scope<'_> {
 /// **What it does not do is register a waker.** That is the difference this
 /// layer makes: a `TrackedInput` change reaches the driver because the read was
 /// OBSERVED, not because the stage remembered to stash the waker it was handed
-/// (`PIPELINE_PLAN.md` §3, and the step-1 finding pinned by
+/// (the lost-wake finding pinned by
 /// `two_drivers_one_graph.rs`'s
 /// `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
 pub(crate) struct Tracked<S> {
@@ -665,7 +664,8 @@ impl<S: Stage> Stage for Tracked<S> {
             // the work it has left.
             //
             // **`Failed` is the same case and used to be missed.** A failure
-            // produces no value either, and the state was unreachable until §7:
+            // produces no value either, and the state was unreachable until the
+            // boundary layer landed:
             // a failure ended the drive, so what the ledger thought about the
             // failed node afterwards did not matter. An error boundary is what
             // lets the drive continue past one - and then a node that has never
@@ -681,7 +681,7 @@ impl<S: Stage> Stage for Tracked<S> {
 }
 
 /// A [`Tracked`] node whose consumers are spared when its output does not move
-/// - §3's **early cutoff**, above the leaf.
+/// - **early cutoff**, above the leaf.
 ///
 /// **What it adds to `Tracked`, and only that.** It IS a `Tracked` inside, so
 /// the reads, the scope, the `Pending` re-mark and the delegated id and memo key
@@ -689,8 +689,8 @@ impl<S: Stage> Stage for Tracked<S> {
 /// the output addresses to what it addressed to last time, the node calls
 /// [`Ledger::unchanged`] and its consumers stop being stale.
 ///
-/// **Why `ContentHash` and not `PartialEq`.** §3's equality for this purpose is
-/// the content address (§9's step 2), and it is what a memo already trusts
+/// **Why `ContentHash` and not `PartialEq`.** The equality for this purpose is
+/// the content address (`ContentHash`), and it is what a memo already trusts
 /// "INSTEAD of comparing the value"
 /// ([`ContentAddressHasher`](libpipelinedata::ContentAddressHasher)'s doc). It also
 /// answers the storage half of the problem cheaply: what has to be kept between
@@ -788,7 +788,7 @@ where
 ///
 /// **`get` is the read that logs the edge**, which is why it exists at all
 /// rather than the value being handed to a stage as an argument: an argument is
-/// a declared dependency, and §3's design "explicitly does not have" those. A
+/// a declared dependency, and this design explicitly does not have those. A
 /// stage holds the input and reads it when it needs it, including not at all on
 /// a run that takes the other branch.
 ///
@@ -833,7 +833,7 @@ impl<T: Clone> TrackedInput<T> {
     /// For a caller that is not a stage - a driver deciding what to draw, a
     /// test asserting what a value is. Named so that using it inside a stage
     /// reads as the mistake it would be: a stage that peeks is a stage whose
-    /// dependency is invisible, and §3's tracking cannot see what did not
+    /// dependency is invisible, and the tracking cannot see what did not
     /// announce itself.
     pub fn peek(&self) -> T {
         self.value
@@ -850,7 +850,7 @@ impl<T: Clone + PartialEq> TrackedInput<T> {
     /// Returns whether the value moved.
     ///
     /// **A write of an equal value is not a change, and marks nothing.** This
-    /// is §3's backdating ("early cutoff" in the build-systems literature) at
+    /// is backdating ("early cutoff" in the build-systems literature) at
     /// the leaf, where it is exact and costs one comparison: "without cutoff
     /// every keystroke invalidates the whole pipeline". Taking it here does not
     /// pre-empt the harder half - a DERIVED value that recomputes to something
@@ -887,15 +887,16 @@ mod invalidation_marks_dependents {
     //! back out unchanged but for its imports.
     //!
     //! Gate: **a changed input marks its dependents stale, transitively - and
-    //! nothing else** (`PIPELINE_PLAN.md` §3:225-230).
+    //! nothing else.**
     //!
     //! The edges are the previous gate's subject (`reads_become_edges.rs`); this
     //! one is what they are FOR. Four clauses are pinned separately because they
     //! fail separately: who gets marked, how far the marking travels, what a write
     //! that changes nothing does, and how the mark reaches a driver.
     //!
-    //! **The payoff clause is the last one.** Step 1 measured that staleness
-    //! reaches a driver only because a stage registered the waker it was handed
+    //! **The payoff clause is the last one.** `two_drivers_one_graph.rs`
+    //! measures that staleness ordinarily reaches a driver only because a
+    //! stage registered the waker it was handed
     //! (`two_drivers_one_graph.rs`'s
     //! `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
     //! Here the stage registers nothing, holds no waker and has no idea a driver
@@ -904,7 +905,8 @@ mod invalidation_marks_dependents {
     //! [`TrackedInput::peek`](crate::track::TrackedInput::peek) instead of `get`:
     //! same value, same answer, no edge, and the frame loop is never told.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -972,7 +974,7 @@ mod invalidation_marks_dependents {
         }
     }
 
-    /// A stage that reads ONE of two inputs, chosen per run - §3's conditional,
+    /// A stage that reads ONE of two inputs, chosen per run - the conditional case,
     /// which is where "the set is re-logged on every run" earns its keep.
     struct ReadsEither {
         left: Arc<TrackedInput<String>>,
@@ -1026,7 +1028,7 @@ mod invalidation_marks_dependents {
         }
     }
 
-    /// A stage that never lands - §4's rows 10 and 11 in miniature, minus the
+    /// A stage that never lands - the effectful, pending shape in miniature, minus the
     /// upstream, because what this file needs from it is only the `Pending`.
     struct Parks;
 
@@ -1128,7 +1130,7 @@ mod invalidation_marks_dependents {
         }
     }
 
-    /// Stand-in for step 2's content hash - FNV over the bytes, as in
+    /// Stand-in for the streaming content hash - FNV over the bytes, as in
     /// `two_drivers_one_graph.rs`. Equal inputs key equally; nothing more is
     /// claimed.
     fn content_key_of(text: &str) -> ContentKey {
@@ -1216,7 +1218,7 @@ mod invalidation_marks_dependents {
 
     #[test]
     fn an_unchanged_input_marks_nothing_and_moves_no_revision() {
-        // §3's backdating at the leaf: "without cutoff every keystroke invalidates
+        // Backdating at the leaf: "without cutoff every keystroke invalidates
         // the whole pipeline". An editor writing back the value it already held is
         // that keystroke.
         let ledger = Ledger::new();
@@ -1234,7 +1236,7 @@ mod invalidation_marks_dependents {
 
     #[test]
     fn an_input_a_stage_no_longer_reads_marks_nothing() {
-        // The invalidation half of §3's conditional clause: "a branch not taken
+        // The invalidation half of the conditional clause: "a branch not taken
         // this run contributes no edge, so a change behind it wakes nothing".
         // `reads_become_edges.rs` shows the edge going away; this shows what that
         // buys.
@@ -1327,7 +1329,7 @@ mod invalidation_marks_dependents {
 
     #[test]
     fn the_same_stage_reading_unobserved_never_reaches_the_frame_loop() {
-        // The known-bad input, and the exact shape of step 1's finding: the value
+        // The known-bad input, and the exact shape of the lost-wake finding: the value
         // is there for the asking and the frame loop never asks, because nothing
         // told it to. `peek` is the one line that differs.
         let ledger = Ledger::new();
@@ -1372,7 +1374,7 @@ mod invalidation_marks_dependents {
         title.set("C".to_string());
         assert!(
             driver.take_stale(),
-            "the subscription survives the wake - §3's wake means `stale, poll \
+            "the subscription survives the wake - a wake means `stale, poll \
              again`, not `the thing you waited for arrived`",
         );
     }
@@ -1613,25 +1615,27 @@ mod an_equal_recompute_stops_at_its_node {
     //! back out unchanged but for its imports.
     //!
     //! Gate: **backdating above the leaf** - a derived node that recomputes to the
-    //! value it already had leaves its consumers fresh (`PIPELINE_PLAN.md` §3).
+    //! value it already had leaves its consumers fresh.
     //!
-    //! §3 wants both halves - "constructive keys give the *lookup*, backdating gives
-    //! the *cutoff*, and a live IDE needs both" - and until now only the leaf had
-    //! one: [`TrackedInput::set`] refuses to invalidate on a write of an equal
-    //! value, exactly and for one comparison. That does nothing for the case §3
-    //! names, "without cutoff every keystroke invalidates the whole pipeline",
+    //! The design wants both halves - constructive keys give the LOOKUP,
+    //! backdating gives the CUTOFF, and a live interactive host needs both -
+    //! and until now only the leaf had one: [`TrackedInput::set`] refuses to
+    //! invalidate on a write of an equal value, exactly and for one comparison.
+    //! That does nothing for the named case, "without cutoff every keystroke
+    //! invalidates the whole pipeline",
     //! because the keystroke DOES move the source. What saves the pipeline is the
     //! first stage above it whose output ignores the difference - a formatter fed a
     //! re-indented file, a lowering fed a renamed local - and that stage's
     //! consumers were re-run anyway.
     //!
     //! The missing half needed "somewhere to keep the last output and an equality to
-    //! trust". §9's step 2 supplied the equality (`ContentHash`), so what is kept is
+    //! trust". `ContentHash` supplies the equality, so what is kept is
     //! its 128-bit address rather than the output; the retraction is
     //! [`Ledger::unchanged`], and staleness carries REASONS so that there is
     //! something to retract.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Waker};
@@ -1729,7 +1733,7 @@ mod an_equal_recompute_stops_at_its_node {
     }
 
     /// A consumer that polls its inner stage - so the edge is real - and then never
-    /// lands. §4's rows 10 and 11 in miniature.
+    /// lands. The effectful, pending-then-ready shape in miniature.
     struct ParksAfterReading<S> {
         inner: Arc<S>,
     }
@@ -1813,7 +1817,7 @@ mod an_equal_recompute_stops_at_its_node {
     fn without_backdating_the_same_chain_recomputes_to_the_top() {
         // The known-bad twin: one word different - `Tracked` where the test above
         // has `Backdated` - and the same equal recompute leaves the whole chain
-        // waiting, which is the state of things §3 calls out.
+        // waiting, which is the state of things the wake contract calls out.
         let ledger = Ledger::new();
         let source = Arc::new(TrackedInput::new(&ledger, "source", "A".to_string()));
         let a = Arc::new(Tracked::new(&ledger, "a", Normalizes::new(&source)));
@@ -1964,7 +1968,7 @@ mod an_equal_recompute_stops_at_its_node {
         // The reason that cannot be taken back. A `Pending` poll marks its own node
         // - it produced no value, so it revalidated nothing - and no equality below
         // it answers for a value that was never produced. A cutoff that cleared this
-        // would drop the parked node out of the schedule, which is step 1's "lost
+        // would drop the parked node out of the schedule, which is "lost
         // rather than late" arriving by a new road.
         let ledger = Ledger::new();
         let source = Arc::new(TrackedInput::new(&ledger, "source", "A".to_string()));
@@ -2033,8 +2037,7 @@ mod reads_become_edges {
     //! assertion is the one it arrived with; when finding 1 lands this migrates
     //! back out unchanged but for its imports.
     //!
-    //! Gate: **a stage's reads are recorded as edges while it runs**
-    //! (`PIPELINE_PLAN.md` §3:225-230).
+    //! Gate: **a stage's reads are recorded as edges while it runs.**
     //!
     //! The sentence being checked is "while a stage runs, every keyed read is
     //! logged as an edge; the set is re-logged on every run so it follows
@@ -2043,15 +2046,16 @@ mod reads_become_edges {
     //! on a consequence of it - what the graph does with the edges is the next
     //! gate's subject, and mixing the two would leave neither pinned.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589). `Text` and
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic"). `Text` and
     //! `Shout` are invented for this file; the engine has no expression type to
     //! offer and this test suite is where that is proved rather than asserted.
     //!
     //! **The known-bad input is `Untracked`** - the same stage, minus the wrapper
     //! that opens the run scope. It reads exactly what the tracked one reads and
     //! the ledger records nothing, which is what makes the passing assertions
-    //! evidence rather than a scanner reporting on an empty graph (step 1's
-    //! precedent: `engine_stays_generic.rs`'s `A_MANIFEST_THAT_MUST_NOT_PASS`).
+    //! evidence rather than a scanner reporting on an empty graph (the same
+    //! precedent as `engine_stays_generic.rs`'s `A_MANIFEST_THAT_MUST_NOT_PASS`).
 
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Waker};
@@ -2095,7 +2099,7 @@ mod reads_become_edges {
         }
     }
 
-    /// A stage that reads ONE of two inputs, chosen per run. §3's conditional: the
+    /// A stage that reads ONE of two inputs, chosen per run. The conditional case: the
     /// branch not taken contributes no edge.
     struct ReadsEither {
         left: Arc<TrackedInput<String>>,
@@ -2238,7 +2242,7 @@ mod reads_become_edges {
 
     #[test]
     fn the_read_set_is_re_logged_on_every_run_so_a_branch_not_taken_contributes_no_edge() {
-        // §3's conditional clause, which is the whole reason the set is re-logged
+        // The conditional clause, which is the whole reason the set is re-logged
         // rather than accumulated: "a change behind it wakes nothing".
         let ledger = Ledger::new();
         let left = Arc::new(TrackedInput::new(&ledger, "left", "L".to_string()));
@@ -2395,7 +2399,7 @@ mod a_fallback_is_not_a_revalidation {
     //! back out unchanged but for its imports.
     //!
     //! Gate: **a poll that produced no value leaves its node owing one - `Failed`
-    //! exactly as much as `Pending`** (`PIPELINE_PLAN.md` §3, §7).
+    //! exactly as much as `Pending`.**
     //!
     //! # The second thing a boundary launders
     //!
@@ -2417,7 +2421,7 @@ mod a_fallback_is_not_a_revalidation {
     //!    [`Ledger::schedule`], and never polled again by anything that asks the
     //!    ledger what to poll.
     //!
-    //!    That state was **unreachable before §7**: a failure used to end the
+    //!    That state was **unreachable before the boundary layer**: a failure used to end the
     //!    drive, so what the ledger thought about the failed node afterwards did not
     //!    matter. A boundary is what lets the drive continue past it.
     //!
@@ -2429,7 +2433,7 @@ mod a_fallback_is_not_a_revalidation {
     //!
     //! # What this can and cannot see
     //!
-    //! The defect is invisible to a driver that re-polls unconditionally. §5's
+    //! The defect is invisible to a driver that re-polls unconditionally. The
     //! offline driver loops until it gets a value and `FrameDriver` polls its root
     //! every frame; both would reach the real answer regardless. What loses it is a
     //! driver that polls what the LEDGER says needs polling, which is what
@@ -2438,7 +2442,8 @@ mod a_fallback_is_not_a_revalidation {
     //! `watch.rs`'s finding: a defect only one of the drivers can even express is a
     //! defect that ships.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Waker};
@@ -2456,7 +2461,7 @@ mod a_fallback_is_not_a_revalidation {
     #[derive(Clone, PartialEq, Eq, Debug)]
     struct Text(String);
 
-    /// Transient in the sense §7 cares about: it can clear.
+    /// Transient in the sense a boundary cares about: it can clear.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     struct Boom;
 
@@ -2536,7 +2541,7 @@ mod a_fallback_is_not_a_revalidation {
 
     const GUARD: StageId = StageId::new("test.guard", 1);
 
-    /// Poll unconditionally, as both of §5's drivers do.
+    /// Poll unconditionally, as both drivers do.
     fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<S::Output, S::Error> {
         stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
     }

@@ -1,10 +1,10 @@
-//! Watching a poll for the wake it owes (`PIPELINE_PLAN.md` §3, §5).
+//! Watching a poll for the wake it owes.
 //!
 //! **The defect this makes visible.** `Effect::poll_effect`'s doc makes the
 //! obligation explicit: a poll that answers `Pending` MUST have arranged for
 //! `cx`'s waker to be woken, "otherwise the frame that drew a stand-in is never
-//! told to redraw and the value is lost rather than late". Step 1 measured what
-//! breaking it costs and, worse, WHERE: a stage that forgets is fatal to the
+//! told to redraw and the value is lost rather than late". What breaking it
+//! costs is measured, and worse, WHERE: a stage that forgets is fatal to the
 //! frame driver and INVISIBLE to the blocking one, because the offline driver
 //! re-polls without being asked
 //! (`tests/two_drivers_one_graph.rs`'s
@@ -24,7 +24,7 @@
 //! composed graph it reports that the poll as a whole left no wake path, not
 //! which half owed it. Narrowing is bisection: drive a subgraph and watch that.
 //! No per-node version is offered here, because it would mean a fresh waker per
-//! node per frame in the IDE's hot path for a diagnostic.
+//! node per frame in the frame drive's hot path for a diagnostic.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Wake, Waker};
@@ -142,15 +142,15 @@ impl WakeReport {
 /// **The answer is not affected, and that is the point.** This drives exactly
 /// as the offline driver does and returns exactly what it returns - including
 /// for a graph whose stages forget, which the offline driver reaches a value
-/// for regardless. §5's claim is that a stage cannot tell which driver is
-/// polling it, and a driver that failed a graph the plain one completes would
+/// for regardless. The two-driver rule's claim is that a stage cannot tell
+/// which driver is polling it, and a driver that failed a graph the plain one completes would
 /// break that claim in order to report on it. So the finding rides ALONGSIDE
 /// the result, in the same shape `NoMemo` gives the memo layer: the control and
 /// the real thing must agree on answers and differ only in what they observe.
 ///
-/// Which makes this the CLI's answer to a defect the CLI could not previously
-/// see: run the offline driver, read the report, and a stage that would strand
-/// the IDE is named before it gets there.
+/// Which makes this the batch tool's answer to a defect it could not
+/// previously see: run the offline driver, read the report, and a stage that
+/// would strand a frame drive is counted before it gets there.
 pub(crate) fn run_to_completion_watched<S, W>(
     stage: &S,
     input: &S::Input,
@@ -197,7 +197,8 @@ mod tests {
     //! They migrate outward to `tests/` unchanged, minus the `poll_watched`
     //! call, the day the runner grows one.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Waker};
@@ -223,7 +224,7 @@ mod tests {
         RegisterAndDrop,
         /// Wake before returning `Pending`: a yield, not a park.
         Yield,
-        /// Nothing at all - step 1's `ForgetfulEmit`.
+        /// Nothing at all - `two_drivers_one_graph.rs`'s `ForgetfulEmit`.
         Forget,
     }
 

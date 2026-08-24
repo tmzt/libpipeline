@@ -1,9 +1,8 @@
-//! An error boundary around a STAGE (`PIPELINE_PLAN.md` §7), and the memo key
-//! it refuses.
+//! An error boundary around a STAGE, and the memo key it refuses.
 //!
 //! The mechanism is `libeffects`' and is not repeated here. [`Recover`],
-//! [`Boundary`], `Fallback` and `Arms` landed there in `9b42cd6`, with the scope
-//! as a WRAPPER so that which boundary catches is decided by composition; this
+//! [`Boundary`], `Fallback` and `Arms` live there, with the scope as a
+//! WRAPPER so that which boundary catches is decided by composition; this
 //! module wraps a [`Stage`] and hands the failure to that machinery unchanged.
 //!
 //! What this layer adds is the one thing `libeffects` could not say, because it
@@ -32,7 +31,7 @@ use libpipelinedata::{BoundStage, EffectPoll, MemoKey, Stage, StageId};
 
 use crate::driver::{DriveError, PendingWork, run_to_completion};
 
-/// A stage with an error boundary around it - §7's scope, at stage level.
+/// A stage with an error boundary around it - the failure scope, at stage level.
 ///
 /// # What it is, and what it delegates
 ///
@@ -46,7 +45,7 @@ use crate::driver::{DriveError, PendingWork, run_to_completion};
 /// [`BoundStage`] - a stage with its input bound, which IS an
 /// [`Effect`] - wraps it in `libeffects`' [`Boundary`] and polls that. So the
 /// arms, the ordering, the pass-through and the substitution count are the same
-/// code an effect-level boundary runs, and a change to §7's semantics has one
+/// code an effect-level boundary runs, and a change to the boundary semantics has one
 /// place to land rather than two that agree by convention.
 ///
 /// **The boundary is built per poll, and that is a fact about `Stage` rather
@@ -61,8 +60,8 @@ use crate::driver::{DriveError, PendingWork, run_to_completion};
 ///
 /// **A boundary LAUNDERS an uncacheable answer into a cacheable-looking one.**
 /// [`Memo`](crate::memo::Memo) already refuses to record `Failed`, for
-/// `OBJECTS_PLAN_PI.md:707`'s reason - "effects are never replayed by an
-/// implicit cache", so a transient failure is not served back as a settled fact
+/// the standing rule's reason - effects are never replayed by an
+/// implicit cache - so a transient failure is not served back as a settled fact
 /// (`memo.rs:57-63`). A boundary turns exactly that `Failed` into a `Ready`.
 /// Cache it and the key says "input X, value V" while V is the fallback; the
 /// input never moved, so the key never moves, and **the real value is never
@@ -86,13 +85,13 @@ use crate::driver::{DriveError, PendingWork, run_to_completion};
 /// order also memoizes the REAL answers, which the forbidden one cannot - but
 /// getting it wrong now costs speed rather than correctness.
 ///
-/// That is the third use of the `Option` step 1 put on
-/// [`Stage::memo_key`], after [`Chain`](crate::chain::Chain) - a composite whose
-/// derived key needs §9's fold - and `highbay_elements`' unattributable
-/// registry, where a pass no contributor claims has no honest content value
-/// (`crates/highbay_elements/src/pipeline.rs:401-407` **\[read\]**). Three
-/// unrelated reasons to refuse, one answer: "Refusing to key is the safe
-/// answer; faking one is not."
+/// That is the third use of the `Option` on [`Stage::memo_key`], after
+/// [`Chain`](crate::chain::Chain) - a composite whose derived key would need a
+/// fold not yet built - and the ambient-input case: a consumer's stage whose
+/// output depends on a registry of definitions no single input contributes,
+/// where a pass has no honest content value to key by. Three unrelated
+/// reasons to refuse, one answer: "Refusing to key is the safe answer; faking
+/// one is not."
 ///
 /// # The second thing a laundered `Ready` poisons: the ledger
 ///
@@ -188,7 +187,7 @@ impl<S, H> Guarded<S, H> {
     ///
     /// **Why it exists.** Substituting is designed to be invisible in the value
     /// channel, so something else has to carry it. `libeffects::Boundary`'s doc
-    /// names three readers; the one this crate owns is §5's offline driver,
+    /// names three readers; the one this crate owns is the offline driver,
     /// where `run_to_completion` returns `Ok(value)` for a graph that
     /// substituted every one of its answers - right for a frame, wrong for a
     /// build. [`run_to_completion_counted`] is that reader.
@@ -198,7 +197,7 @@ impl<S, H> Guarded<S, H> {
 }
 
 /// How many answers were substituted, counted across every boundary that shares
-/// one of these - §7's "built" versus "built on fallbacks".
+/// one of these - "built" versus "built on fallbacks".
 ///
 /// **Why a shared type rather than one counter per boundary.** The question a
 /// build asks is about the GRAPH ("did anything I am about to ship stand on a
@@ -218,11 +217,11 @@ impl<S, H> Guarded<S, H> {
 /// answers exactly is the yes/no one - `count() == 0` means nothing was
 /// substituted - and the magnitude is a poll count, not a census of the graph.
 /// Nothing here can do better: the engine holds no node identity for a stage
-/// (`PIPELINE_PLAN.md`:579-583), which is the same reason
+/// (`DESIGN.md`, "The engine stays generic"), which is the same reason
 /// [`Schedule`](crate::schedule::Schedule) deals in ids and not work.
 #[derive(Debug, Default)]
 pub(crate) struct Substitutions {
-    /// Safe interior mutability (`CLAUDE.md`): a poll holds `&self` all the way
+    /// Safe interior mutability (this crate forbids `unsafe`): a poll holds `&self` all the way
     /// down, exactly as the ledger's own lock and `libeffects::Boundary`'s
     /// counter do.
     count: Mutex<usize>,
@@ -251,18 +250,18 @@ impl Substitutions {
 /// [`run_to_completion`], reporting how many of the answers it drove through
 /// were SUBSTITUTED.
 ///
-/// **The finding this closes**, in `PIPELINE_PLAN.md` §7's words: "a build that
-/// silently ships fallbacks is the failure mode this section exists to
-/// prevent". `run_to_completion` returns `Ok(value)` for a graph whose every
+/// **The finding this closes**: a build that silently ships fallbacks is the
+/// failure mode boundaries must not be allowed to create.
+/// `run_to_completion` returns `Ok(value)` for a graph whose every
 /// answer was a fallback, which is right for a frame - the pane draws the
 /// stand-in and the wake brings the real thing - and wrong for a build, which
 /// has nowhere to put a value that will be correct later. The count is what
-/// separates the two, and until this function existed nothing said the CLI
-/// should ask.
+/// separates the two, and until this function existed nothing said a batch
+/// run should ask.
 ///
 /// **It is the same drive, not a second driver**, and that is literal: it calls
-/// [`run_to_completion`] and returns exactly what that returns. §5's rule is
-/// that a stage cannot tell which driver polls it, so an observation must ride
+/// [`run_to_completion`] and returns exactly what that returns. The two-driver
+/// rule is that a stage cannot tell which driver polls it, so an observation must ride
 /// ALONGSIDE the result rather than change its type - the shape
 /// [`run_to_completion_watched`](crate::watch::run_to_completion_watched) already
 /// takes for the wake report. Nothing is asked of the stage; the tally is the
@@ -297,7 +296,7 @@ where
 {
     type Input = S::Input;
     type Output = S::Output;
-    /// What this scope raises when its handler declines - §7's bubble, retyped
+    /// What this scope raises when its handler declines - the bubble, retyped
     /// into the containing scope's channel by the handler's choice.
     type Error = H::Escalated;
 
@@ -373,12 +372,12 @@ mod a_boundary_is_not_a_cacheable_answer {
     //! 2 lands this migrates back out unchanged but for its imports.
     //!
     //! Gate: **a boundary refuses to be memoized, and a boundary that did not
-    //! would poison the memo it sits under** (`PIPELINE_PLAN.md` §7, §3).
+    //! would poison the memo it sits under.**
     //!
     //! The hazard, stated on [`Guarded`](crate::boundary::Guarded) and on
     //! `libeffects::Boundary` before it: a boundary LAUNDERS an uncacheable answer
     //! into a cacheable-looking one. [`Memo`] already refuses to record `Failed`,
-    //! for `OBJECTS_PLAN_PI.md:707`'s reason - effects are never replayed by an
+    //! for the standing rule's reason - effects are never replayed by an
     //! implicit cache - and a boundary turns exactly that `Failed` into a `Ready`.
     //! Cache it and the key says "input X, value V" while V is the fallback; the
     //! input never moved, so the key never moves, and the real value is never
@@ -402,7 +401,8 @@ mod a_boundary_is_not_a_cacheable_answer {
     //! gated too (`a_boundary_outside_a_memo_caches_only_real_answers`), because
     //! what it buys is the reason to keep composing that way.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Waker};
@@ -780,14 +780,14 @@ mod a_stage_boundary_catches_what_its_stage_raises {
     //! 2 lands this migrates back out unchanged but for its imports.
     //!
     //! Gate: **a stage-level boundary is `libeffects`' boundary, applied to a
-    //! [`Stage`]** (`PIPELINE_PLAN.md` §7).
+    //! [`Stage`].**
     //!
     //! `libeffects` already gates the mechanism - caught, declined, bubbled,
-    //! pending-fallback, first-match-wins, and the composition twins (`9b42cd6`).
+    //! pending-fallback, first-match-wins, and the composition twins.
     //! This file does not re-gate any of that. It gates the seam:
     //! [`Guarded`](crate::boundary::Guarded) hands a `Stage`'s failure to that machinery
     //! and hands its answer back, so what a scope does about failure is the same at
-    //! both scales and there is one place for §7's semantics to live.
+    //! both scales and there is one place for the failure semantics to live.
     //!
     //! Four claims, each of which could fail on its own:
     //!
@@ -797,13 +797,14 @@ mod a_stage_boundary_catches_what_its_stage_raises {
     //! 2. **A boundary is not in the path of a value.** `Ready` and `Pending` pass
     //!    through untouched - including the [`Context`], which the pending gates
     //!    measure through this crate's own wake probe rather than by inspection.
-    //! 3. **Both drivers see the same thing** (§5: a stage cannot tell which driver
-    //!    polls it). A boundary is where that would be easiest to break, since it is
+    //! 3. **Both drivers see the same thing** (the two-driver rule: a stage
+    //!    cannot tell which driver polls it). A boundary is where that would be easiest to break, since it is
     //!    the first stage type whose answer depends on a failure.
     //! 4. **The answers do not change when the cache is disabled.** `NoMemo` is a
     //!    legitimate implementation, and a boundary must not be what breaks it.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
@@ -830,7 +831,7 @@ mod a_stage_boundary_catches_what_its_stage_raises {
     /// variant would let a handler that catches unconditionally pass every gate.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum Boom {
-        /// Transient in the sense §7 cares about: it can clear.
+        /// Transient in the sense a boundary cares about: it can clear.
         Network,
         /// A different failure, used to make declining observable.
         Malformed,
@@ -1004,7 +1005,7 @@ mod a_stage_boundary_catches_what_its_stage_raises {
     #[test]
     fn a_handler_that_declines_bubbles_into_this_scopes_own_channel() {
         // An arm for `Network` only: the scope has expressed one failure case and
-        // says nothing about the other, which per §7 is what bubbling IS.
+        // says nothing about the other, which is what bubbling IS.
         let arms = || {
             Arms::escalating(Escaped)
                 .catching(|boom: &Boom| matches!(boom, Boom::Network), "fallback".to_string())
@@ -1076,7 +1077,7 @@ mod a_stage_boundary_catches_what_its_stage_raises {
     #[test]
     fn a_fallback_that_is_still_loading_is_pending_rather_than_a_value() {
         // The handler's second answer: this scope HAS a case for the failure, and
-        // that case is itself still computing. §3's rule then applies to it
+        // that case is itself still computing. The no-cached-failures rule then applies to it
         // unchanged - and the waker it registers is the one the boundary was
         // handed, which is what the probe measures.
         let parked: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1104,7 +1105,7 @@ mod a_stage_boundary_catches_what_its_stage_raises {
     }
 
     // ---------------------------------------------------------------------------
-    // Gate 3: both drivers, one answer (§5).
+    // Gate 3: both drivers, one answer.
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -1240,15 +1241,15 @@ mod a_build_can_ask_whether_it_stood_on_a_fallback {
     //! 2 lands this migrates back out unchanged but for its imports.
     //!
     //! Gate: **the offline driver can say whether it built on fallbacks, without
-    //! the two drivers answering differently** (`PIPELINE_PLAN.md` §7, §5).
+    //! the two drivers answering differently.**
     //!
-    //! §7's finding, verbatim: "`run_to_completion` returns `Ok(value)` for a graph
+    //! The finding: `run_to_completion` returns `Ok(value)` for a graph
     //! that substituted EVERY answer - right for a frame, wrong for a build.
-    //! `substitutions()` separates 'built' from 'built on fallbacks' without giving
-    //! the two drivers different return types, which §5 forbids - but that means
-    //! the CLI must ASK, and until this sentence nothing said it should. **A build
-    //! that silently ships fallbacks is the failure mode this section exists to
-    //! prevent.**"
+    //! `substitutions()` separates "built" from "built on fallbacks" without giving
+    //! the two drivers different return types, which the two-driver rule forbids
+    //! - but that means the batch run must ASK, and until this function existed
+    //! nothing said it should. **A build that silently ships fallbacks is the
+    //! failure mode this layer exists to prevent.**
     //!
     //! Three claims:
     //!
@@ -1264,7 +1265,8 @@ mod a_build_can_ask_whether_it_stood_on_a_fallback {
     //!    the outermost one cannot answer for a scope further in that recovered on
     //!    its own; sharing a [`Substitutions`] is what makes the number the build's.
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::sync::Mutex;
     use std::task::{Context, Waker};
@@ -1437,7 +1439,7 @@ mod a_build_can_ask_whether_it_stood_on_a_fallback {
             driven.map_err(|_| "failed"),
             Ok("fallback".to_string()),
             "the RESULT is unchanged - a driver that failed a graph the plain one \
-             completes would break §5 in order to report on it",
+             completes would break the two-driver rule in order to report on it",
         );
         assert_eq!(
             substitutions, 1,
@@ -1571,7 +1573,7 @@ mod a_build_can_ask_whether_it_stood_on_a_fallback {
 
     #[test]
     fn a_frame_loop_takes_the_same_measurement_by_differencing_the_tally() {
-        // §5 forbids giving the two drivers different return types, and this is
+        // The two-driver rule forbids giving the two drivers different return types, and this is
         // the other end of that: there is no counted FRAME driver, because a frame
         // loop already holds the tally and a frame is a difference across it. The
         // same graph, the same measurement, spelled where a frame loop can spell

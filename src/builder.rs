@@ -223,8 +223,8 @@ impl<S: Stage> StagedPipelineBuilder<S> {
 ///
 /// The graph parameter is opaque (`impl Stage` out of the builder); consumers
 /// hold a `Pipeline` by inference and cannot reach the machinery inside. Both
-/// drive modes of `PIPELINE_PLAN.md` section 5 are here - same graph, same
-/// keys, and a stage cannot tell which one is polling it.
+/// drive modes are here (`DESIGN.md`, "Two drivers, one graph") - same graph,
+/// same keys, and a stage cannot tell which one is polling it.
 pub struct Pipeline<S> {
     graph: S,
     frame: FrameDriver,

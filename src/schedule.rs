@@ -1,5 +1,4 @@
-//! Scheduling: what a driver polls next, given the stale set
-//! (`PIPELINE_PLAN.md` §6:484-485).
+//! Scheduling: what a driver polls next, given the stale set.
 //!
 //! **In a pull graph the schedule is not what makes the answer right - the pull
 //! is.** Polling a node polls what it reads, so any stale node reached from a
@@ -10,8 +9,9 @@
 //! That makes [`Schedule::to_poll`] the headline and [`Schedule::order`] the
 //! supporting fact. A stale node that another stale node reads does not need
 //! polling by the driver - its consumer will pull it - so the set worth polling
-//! is the stale nodes with no stale reader. On §3's diamond that set is one
-//! node, and the shared consumer runs once instead of once per stale path.
+//! is the stale nodes with no stale reader. On the diamond graph (one input,
+//! two readers, one joiner) that set is one node, and the shared consumer runs
+//! once instead of once per stale path.
 
 // **Dead in the shipped library, alive in the test build - and that is the
 // flip's honest arithmetic rather than an oversight.**
@@ -39,8 +39,8 @@ use crate::track::{Ledger, NodeId};
 ///
 /// **Ids, not work.** A `Schedule` says which NODES; mapping a node to the
 /// typed stage that polls it is the caller's, because the engine is generic
-/// over every expression type and the stages of one graph do not share an
-/// `Input` or `Output` (`PIPELINE_PLAN.md`:579-583). A registry of type-erased
+/// over every payload type and the stages of one graph do not share an
+/// `Input` or `Output` (`DESIGN.md`, "The engine stays generic"). A registry of type-erased
 /// closures could live here, but it would be the caller's map with the types
 /// thrown away rather than something the engine knows.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -80,8 +80,8 @@ impl Schedule {
 /// The stale set could not be ordered: some of it reads itself, directly or
 /// through others.
 ///
-/// §5's termination argument is "the DAG's acyclicity plus effect completion",
-/// so a cycle is a graph bug rather than a case to schedule around - and it is
+/// The drivers' termination argument is the DAG's acyclicity plus effect
+/// completion, so a cycle is a graph bug rather than a case to schedule around - and it is
 /// reported rather than dropped or looped on, because the two silent answers
 /// are worse than the loud one: dropping the nodes loses the work, and walking
 /// the cycle would not stop.
@@ -173,10 +173,9 @@ mod the_schedule_polls_each_node_once {
     //! it arrived with; when the findings land this migrates back out unchanged
     //! but for its imports.
     //!
-    //! Gate: **what the driver polls next, given the stale set**
-    //! (`PIPELINE_PLAN.md` §6:484-485).
+    //! Gate: **what the driver polls next, given the stale set.**
     //!
-    //! The graph is §3's diamond - one input, two stages that read it, one stage
+    //! The graph is the diamond - one input, two stages that read it, one stage
     //! that reads both - because it is the smallest shape where the answer is not
     //! "poll everything": the shared consumer is reachable by two stale paths and
     //! must run once.
@@ -185,10 +184,11 @@ mod the_schedule_polls_each_node_once {
     //! same graph, the same change, and the schedule ignored; it re-runs the two
     //! middle stages twice each. Both drivers reach the same answers - what differs
     //! is the work - which is the same control shape `NoMemo` gives the memo layer
-    //! (`store.rs:44-49`: "a pipeline whose ANSWERS change when the cache is
-    //! disabled has a bug the cache was hiding").
+    //! ("a pipeline whose ANSWERS change when the cache is disabled has a bug
+    //! the cache was hiding").
     //!
-    //! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+    //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+    //! generic").
 
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -505,7 +505,7 @@ mod the_schedule_polls_each_node_once {
 
     #[test]
     fn a_cycle_in_the_stale_set_is_reported_rather_than_dropped() {
-        // §5's termination argument is the DAG's acyclicity, so a cycle is a graph
+        // The termination argument is the DAG's acyclicity, so a cycle is a graph
         // bug. The ledger records what it observes and cannot refuse one, which is
         // why the scheduler has to answer for it: dropping the nodes would lose the
         // work silently and walking the cycle would not stop.

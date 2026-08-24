@@ -1,28 +1,28 @@
-//! Gate 3 of `PIPELINE_PLAN.md` §9 step 1: **the engine never learns an IR.**
+//! Gate: **the engine never learns a consumer's types.**
 //!
-//! §6:584-589 states the rule and names its enforcement: "the proof is
-//! mechanical, in the tests: `libpipeline`'s test suite is generic
-//! implementations over STAND-IN expression types, never the real IRs. If the
-//! engine's tests cannot be written without importing `libtsx` or a Highbay
-//! crate, the engine has learned something it must not know - and unlike the
-//! composition-boundary regressions this repo has already suffered, this one is
-//! caught by a dependency list, not by review."
+//! The rule (`DESIGN.md`, "The engine stays generic"): the engine is generic
+//! over every payload type, and its test suite is generic implementations over
+//! STAND-IN types the tests invent. If the suite could not be written without
+//! importing a consumer's IR crate, the engine would have learned something it
+//! must not know - and that regression is caught by a dependency list, not by
+//! review.
 //!
 //! So this file reads the dependency list. It is a check on `Cargo.toml`
 //! because that is the artifact the rule is about; a check on the source would
 //! be looking for the symptom.
 //!
+//! **The surface is CLOSED AND NAMED, not denylisted.** A denylist of
+//! known-bad crate names cannot know about a consumer crate named something
+//! new; an allowlist does not need to. Every dependency name the walk finds
+//! must be a stack crate or a registry crate the stack has already decided on
+//! - so a new name ANYWHERE in the tree fails here until it is added below, as
+//! a visible decision in review, rather than arriving as drift.
+//!
 //! **The check is TRANSITIVE** - the whole stack's tree, not this crate's
-//! direct edges (§6:591-604). It was direct in step 1, for a reason that has
-//! since expired: `libpipelinedata` was going to acquire a types-only `libtsx`
-//! dependency at step 6, which would have put `libtsx` in this crate's
-//! transitive list with nothing having gone wrong. `PipelineExpr` now lives in
-//! `highbay_data` instead (`52b6562`), so **nothing in the stack depends on
-//! `libtsx` at any step** and the stronger check is true for free. The plan's
-//! reason for preferring it: "a rule that holds transitively cannot be evaded
-//! by routing an edge through a sibling". The direct check would still have
-//! been SUFFICIENT - a crate reachable only transitively cannot be named in a
-//! `use` - but sufficiency is not a reason to keep the weaker gate.
+//! direct edges. A direct check would have been SUFFICIENT - a crate reachable
+//! only transitively cannot be named in a `use` - but a rule that holds
+//! transitively cannot be evaded by routing an edge through a sibling, and
+//! sufficiency is not a reason to keep the weaker gate.
 //!
 //! **How the tree is walked without a TOML parser or a `cargo` invocation.**
 //! Every crate in the stack is a PATH dependency, so the walk is: read a
@@ -31,40 +31,33 @@
 //! unaffected by whether the workspace currently resolves - a gate that fails
 //! because a sibling crate is mid-edit is noise, and noise gets switched off.
 //!
-//! **What it cannot catch**, in two parts. A stand-in expression type in a test
-//! that is secretly shaped to one real IR's variants would pass; nothing
-//! mechanical reaches that, and a judgment-shaped check would trade a gate that
-//! always means something for one that usually does not. And the walk follows
-//! PATH dependencies only, so it would miss an IR-bearing crate pulled in from
-//! a registry or a git URL by a stack crate. That is not the shape the rule is
-//! about - `libtsx` and the Highbay crates are unpublished path dependencies of
-//! this workspace - and the direct-name checks below still see any such edge in
-//! this crate's own manifest.
+//! **What it cannot catch**, in two parts. A stand-in type in a test that is
+//! secretly shaped to one consumer's variants would pass; nothing mechanical
+//! reaches that, and a judgment-shaped check would trade a gate that always
+//! means something for one that usually does not. And the walk follows PATH
+//! dependencies only, so it reads no manifest of a registry or git crate - but
+//! the NAME of any such edge still appears in the manifest that declares it,
+//! and an undeclared name fails the allowlist wherever it appears.
 
-/// Crate names an engine that has stayed generic will never name.
-///
-/// `libtsx` is where `BindingExpr` lives and where the dag types live; the
-/// `highbay_` family and the four below are Highbay's own vocabulary -
-/// `NodeGraph`, `Element`, `.hbdef`, `ProgramPlan` and the saga steps
-/// (`PIPELINE_PLAN.md`:605-609).
-const NEVER: &[&str] = &[
-    "libtsx",
-    "libhbui",
-    "libhbuisim",
-    "libteststand",
-    "hb_pack",
-];
+/// The stack itself: the only crates a path dependency may point at, and the
+/// only path-reachable names permitted in a dependency table.
+const THE_STACK: &[&str] = &["libeffects", "libpipelinedata", "libpipelinedata-macros"];
 
-/// The engine's whole permitted dependency surface is the rest of the stack.
-/// Named here only to keep the scanner honest - see the assertion.
-const THE_REST_OF_THE_STACK: &[&str] = &["libeffects", "libpipelinedata"];
+/// Registry crates the stack has decided to use, anywhere in its tree
+/// (dependencies and dev-dependencies alike). Adding a dependency to any stack
+/// crate means adding its name here - that is the point.
+const PERMITTED_REGISTRY: &[&str] = &["hecs", "proc-macro2", "quote", "serde", "syn", "trybuild"];
+
+fn permitted(name: &str) -> bool {
+    THE_STACK.contains(&name) || PERMITTED_REGISTRY.contains(&name)
+}
 
 #[test]
-fn the_stack_names_no_ir_bearing_crate_at_any_depth() {
+fn the_stacks_dependency_surface_is_closed_and_named() {
     let walk = walk_the_stack();
 
     // A scanner that quietly found nothing would let this test pass forever.
-    for expected in THE_REST_OF_THE_STACK {
+    for expected in THE_STACK {
         assert!(
             walk.dependencies.iter().any(|d| d.name == *expected),
             "the manifest scanner did not find {expected}, so it is not reading \
@@ -82,46 +75,42 @@ fn the_stack_names_no_ir_bearing_crate_at_any_depth() {
     );
 
     for reached in &walk.dependencies {
-        let named_by = &reached.named_by;
         assert!(
-            !NEVER.contains(&reached.name.as_str()),
-            "`{}` reaches `{}` (named by {named_by}). The stack is generic over \
-             every expression type and may never name one at any depth \
-             (PIPELINE_PLAN.md:584-604); whatever needed this belongs behind a \
-             libpipelinedata trait, on the stage's side of the seam.",
+            permitted(&reached.name),
+            "`{}` reaches `{}` (named by {}), which is neither a stack crate \
+             nor a permitted registry crate. The engine is generic over every \
+             payload type and may never grow an edge toward a consumer's \
+             vocabulary at any depth; if this dependency is a real decision, \
+             add it to the allowlist in this file so the decision is visible.",
             env!("CARGO_PKG_NAME"),
             reached.name,
-        );
-        assert!(
-            !reached.name.starts_with("highbay"),
-            "`{}` reaches the Highbay crate `{}` (named by {named_by}). See \
-             PIPELINE_PLAN.md:605-609: Highbay's app vocabulary stays out of \
-             all three stack crates.",
-            env!("CARGO_PKG_NAME"),
-            reached.name,
+            reached.named_by,
         );
     }
 }
 
 #[test]
-fn the_stack_reaches_into_no_first_party_crate_by_path() {
-    // The name checks above are a denylist, and a denylist does not know about
-    // a Highbay crate named something new. This one does not need to: any path
-    // dependency pointing into `crates/` is reaching into the Core Repo, which
-    // is the one place Highbay's own vocabulary lives (CLAUDE.md's workspace
-    // philosophy - crates/ is code strictly tied to the framework, deps/ holds
-    // the cleanly abstractable units).
+fn path_dependencies_point_only_at_stack_crates() {
+    // The name check above sees what a manifest CALLS its dependency; this one
+    // sees where the path actually POINTS. The two can disagree (a `package =`
+    // rename, a path into a directory whose manifest declares another name),
+    // so both are checked.
     let walk = walk_the_stack();
     assert!(
         !walk.paths.is_empty(),
         "the path scanner found no path dependencies at all, so it proves nothing",
     );
     for reached in &walk.paths {
+        let target = std::path::Path::new(&reached.name)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| reached.name.clone());
         assert!(
-            !reached.name.contains("crates/"),
-            "a stack crate has a path dependency into the Core Repo (`{}`, \
-             named by {}). A stack crate depends only on other stack crates; \
-             the direction runs the other way (PIPELINE_PLAN.md:655-664).",
+            THE_STACK.contains(&target.as_str()),
+            "a stack crate has a path dependency that leaves the stack \
+             (`{}`, resolving to `{target}`, named by {}). A stack crate \
+             depends only on other stack crates; anything else reaches into a \
+             consumer's tree, and the direction runs the other way.",
             reached.name,
             reached.named_by,
         );
@@ -140,7 +129,7 @@ struct Reached {
 struct Walk {
     /// Dependency names, from every manifest reached.
     dependencies: Vec<Reached>,
-    /// `path = ".."` values, from every manifest reached.
+    /// Resolved `path = ".."` values, from every manifest reached.
     paths: Vec<Reached>,
     /// Which manifests were read, in visit order. A walk that read one manifest
     /// is a direct check.
@@ -189,11 +178,15 @@ fn walk_manifests(
         }
         let dir = manifest.parent().unwrap_or(&manifest).to_path_buf();
         for path in path_dependency_values(&text) {
+            // Recorded RESOLVED, so "a path that leaves the stack" is a
+            // question about where it points, not about how it is spelled -
+            // `".."` from a nested crate is a legitimate edge to its parent.
+            let resolved = normalize(&dir.join(&path));
             walk.paths.push(Reached {
-                name: path.clone(),
+                name: resolved.to_string_lossy().into_owned(),
                 named_by: label.clone(),
             });
-            queue.push_back(normalize(&dir.join(&path).join("Cargo.toml")));
+            queue.push_back(normalize(&resolved.join("Cargo.toml")));
         }
     }
     walk
@@ -279,8 +272,8 @@ fn dependency_names(manifest: &str) -> Vec<String> {
 
 /// Every `path = "..."` value in a manifest, wherever it appears.
 ///
-/// Deliberately not scoped to the dependency tables: a path that reaches into
-/// `crates/` is worth refusing whichever key it hangs off.
+/// Deliberately not scoped to the dependency tables: a path that leaves the
+/// stack is worth refusing whichever key it hangs off.
 fn path_dependency_values(manifest: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in manifest.lines() {
@@ -304,7 +297,9 @@ fn path_dependency_values(manifest: &str) -> Vec<String> {
     paths
 }
 
-/// A manifest with every spelling of the edge this file exists to refuse.
+/// A manifest with every spelling of the edge this file exists to refuse. The
+/// names are invented consumer crates - an IR crate, an app's data crate - none
+/// of them on the allowlist.
 ///
 /// A gate that has only ever seen a passing input is a gate nobody has watched
 /// fail. Rather than reason about whether the scanner would catch these, the
@@ -313,21 +308,21 @@ fn path_dependency_values(manifest: &str) -> Vec<String> {
 const A_MANIFEST_THAT_MUST_NOT_PASS: &str = r#"
 [package]
 name = "libpipeline"
-# libtsx = "in a comment, which is not a dependency"
+# app_ir = "in a comment, which is not a dependency"
 
 [dependencies]
 libeffects = { path = "../libeffects" }
 libpipelinedata = { path = "../libpipelinedata" }
-libtsx = { path = "../libtsx", default-features = false }
+app_ir = { path = "../app_ir", default-features = false }
 
 [dev-dependencies]
-highbay_data.workspace = true
+consumer_data.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-libhbui = "0.1"
+app_widgets = "0.1"
 
-[dependencies.hb_pack]
-path = "../../crates/hb_pack"
+[dependencies.app_pack]
+path = "../../app/crates/app_pack"
 features = ["publish"]
 "#;
 
@@ -335,14 +330,18 @@ features = ["publish"]
 fn the_scanner_catches_every_spelling_of_the_edge_it_refuses() {
     let names = dependency_names(A_MANIFEST_THAT_MUST_NOT_PASS);
     for (spelling, expected) in [
-        ("a plain [dependencies] key", "libtsx"),
-        ("a dotted workspace key in [dev-dependencies]", "highbay_data"),
-        ("a target-specific dependency table", "libhbui"),
-        ("the [dependencies.name] spelling", "hb_pack"),
+        ("a plain [dependencies] key", "app_ir"),
+        ("a dotted workspace key in [dev-dependencies]", "consumer_data"),
+        ("a target-specific dependency table", "app_widgets"),
+        ("the [dependencies.name] spelling", "app_pack"),
     ] {
         assert!(
             names.iter().any(|n| n == expected),
             "the scanner missed {spelling} (`{expected}`): {names:?}",
+        );
+        assert!(
+            !permitted(expected),
+            "`{expected}` is on the allowlist, so catching it proves nothing",
         );
     }
     assert!(
@@ -357,8 +356,8 @@ fn the_scanner_catches_every_spelling_of_the_edge_it_refuses() {
 
     let paths = path_dependency_values(A_MANIFEST_THAT_MUST_NOT_PASS);
     assert!(
-        paths.iter().any(|p| p.contains("crates/")),
-        "the path scanner missed the reach into the Core Repo: {paths:?}",
+        paths.iter().any(|p| p.contains("app/crates/app_pack")),
+        "the path scanner missed the edge that leaves the stack: {paths:?}",
     );
 }
 
@@ -374,7 +373,7 @@ fn the_path_scanner_sees_the_stacks_own_edges() {
 }
 
 /// A stack whose engine manifest is CLEAN and which is still a violation: the
-/// `libtsx` edge is two crates away, and a Highbay crate three.
+/// consumer IR edge is two crates away, and an app crate three.
 ///
 /// This is the input that separates the transitive check from the direct one.
 /// A direct check reads the first manifest, finds `libeffects` and
@@ -389,13 +388,13 @@ fn a_stack_that_must_not_pass(path: &std::path::Path) -> Option<String> {
         "/stack/libpipelinedata/Cargo.toml" => {
             "[dependencies]\n\
              libeffects = { path = \"../libeffects\" }\n\
-             libtsx = { path = \"../libtsx\", default-features = false }\n\
+             app_ir = { path = \"../app_ir\", default-features = false }\n\
              libpipelinedata-macros = { path = \"./libpipelinedata-macros\" }\n"
         }
         "/stack/libpipelinedata/libpipelinedata-macros/Cargo.toml" => {
             "[dependencies]\n\
              syn = \"2\"\n\
-             highbay_macros = { path = \"../../../crates/highbay_macros\" }\n"
+             app_macros = { path = \"../../../app/crates/app_macros\" }\n"
         }
         "/stack/libeffects/Cargo.toml" => "[dependencies]\n",
         _ => return None,
@@ -404,34 +403,36 @@ fn a_stack_that_must_not_pass(path: &std::path::Path) -> Option<String> {
 }
 
 #[test]
-fn the_walk_catches_an_ir_bearing_crate_two_manifests_away() {
+fn the_walk_catches_an_undeclared_crate_two_manifests_away() {
     let root = std::path::Path::new("/stack/libpipeline/Cargo.toml");
     let walk = walk_manifests(root, &a_stack_that_must_not_pass);
 
     assert!(
-        !dependency_names(&a_stack_that_must_not_pass(root).unwrap())
+        dependency_names(&a_stack_that_must_not_pass(root).unwrap())
             .iter()
-            .any(|name| name == "libtsx"),
+            .all(|name| permitted(name)),
         "the fake root manifest must be clean, or this proves nothing about \
          what the direct check would have missed",
     );
     assert!(
         walk.dependencies
             .iter()
-            .any(|d| d.name == "libtsx" && d.named_by == "libpipelinedata"),
-        "the walk missed the depth-2 libtsx edge: {:?}",
+            .any(|d| d.name == "app_ir" && d.named_by == "libpipelinedata"),
+        "the walk missed the depth-2 consumer IR edge: {:?}",
         walk.dependencies,
     );
     assert!(
         walk.dependencies
             .iter()
-            .any(|d| d.name == "highbay_macros" && d.named_by == "libpipelinedata-macros"),
-        "the walk missed the depth-3 Highbay edge: {:?}",
+            .any(|d| d.name == "app_macros" && d.named_by == "libpipelinedata-macros"),
+        "the walk missed the depth-3 app crate edge: {:?}",
         walk.dependencies,
     );
     assert!(
-        walk.paths.iter().any(|p| p.name.contains("crates/")),
-        "the walk missed the reach into the Core Repo: {:?}",
+        walk.paths
+            .iter()
+            .any(|p| p.name.ends_with("app/crates/app_macros")),
+        "the walk missed the path that leaves the stack: {:?}",
         walk.paths,
     );
     assert_eq!(
@@ -442,7 +443,8 @@ fn the_walk_catches_an_ir_bearing_crate_two_manifests_away() {
             "libpipelinedata",
             "libpipelinedata-macros",
         ],
-        "each manifest read once, breadth first",
+        "each manifest read once, breadth first; `app_ir` has no readable \
+         manifest and is skipped, exactly as an unreadable edge should be",
     );
 }
 
@@ -476,4 +478,3 @@ fn a_manifest_that_cannot_be_read_is_skipped_rather_than_fatal() {
     assert_eq!(walk.manifests, ["libpipeline"]);
     assert_eq!(walk.paths.len(), 2, "the unreadable edges are still recorded");
 }
-

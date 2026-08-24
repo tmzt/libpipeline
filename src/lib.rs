@@ -1,4 +1,6 @@
-//! The pipeline engine and its two drivers (`PIPELINE_PLAN.md` §5, §6).
+#![doc = include_str!("../README.md")]
+//!
+//! # Inside the crate (an inventory, not an API)
 //!
 //! * `Memo` - the memo layer. The lookup precedes the work, only `Ready` is
 //!   recorded, and the store is not consulted at all while `revalidating` -
@@ -6,40 +8,38 @@
 //!   has ruled out on account of an ambient one.
 //! * `Chain` - two stages composed, which is itself a `Stage`, so a graph is
 //!   not a second kind of thing a driver must know how to walk.
-//! * `Guarded` - §7's error boundary at stage level, delegating to
+//! * `Guarded` - the error boundary at stage level, delegating to
 //!   `libeffects`' `Boundary` for the mechanism and adding the one thing that
 //!   crate has no vocabulary for: a boundary refuses to be memoized, because a
 //!   substituted fallback cached under a key that never moves is a permanent
 //!   fallback indistinguishable from a correct answer.
-//! * `run_to_completion` and `FrameDriver` - §5's two drivers over the same
+//! * `run_to_completion` and `FrameDriver` - the two drivers over the same
 //!   graph, the same contract and the same keys.
-//! * `Ledger`, `Tracked`, `TrackedInput` - §3's read-observation ledger:
+//! * `Ledger`, `Tracked`, `TrackedInput` - the read-observation ledger:
 //!   edges recorded by observing reads rather than declared, re-logged on every
 //!   run so they follow conditionals; and invalidation over those edges, where
 //!   a changed input marks its dependents stale transitively and wakes whoever
 //!   subscribed.
-//! * `Backdated` - §3's early cutoff above the leaf: a node whose output
+//! * `Backdated` - early cutoff above the leaf: a node whose output
 //!   addresses to what it addressed to last time retracts itself as a reason
 //!   for its consumers to re-run.
 //! * `Schedule` - what a driver polls next given the stale set: the stale
 //!   nodes no stale node reads, since the pull revalidates the rest.
-//! * `run_to_completion_watched` - the offline driver, reporting `Pending`
+//! * `run_to_completion_watched` - the blocking driver, reporting `Pending`
 //!   polls that left no wake path. Same answers, one more observation.
 //! * `run_to_completion_counted` - the same drive again, reporting how many
 //!   of its answers a boundary SUBSTITUTED, which is what separates a build
 //!   from a build that silently shipped fallbacks.
 //!
-//! **The engine never learns an IR, and the proof is the manifests.**
-//! Everything here is generic over `S: Stage`; nothing matches on a concrete
-//! expression type, because there is no concrete expression type in scope to
-//! match on (`PIPELINE_PLAN.md`:579-583). `tests/engine_stays_generic.rs` walks
-//! the stack's manifests - this crate's and, through its path dependencies,
-//! every crate under it - and fails if `libtsx` or a Highbay crate appears
-//! anywhere in the tree (§6:591-604). That check is TRANSITIVE as of
-//! `52b6562`, which moved `PipelineExpr` into `highbay_data` and so left
-//! nothing in the stack depending on `libtsx` at any step; the earlier
-//! direct-edge check was sufficient, since a crate reachable only transitively
-//! cannot be named in a `use`, but a rule that holds transitively cannot be
+//! **The engine never learns a consumer's types, and the proof is the
+//! manifests.** Everything here is generic over `S: Stage`; nothing matches on
+//! a concrete payload type, because there is no concrete payload type in scope
+//! to match on (`DESIGN.md`, "The engine stays generic").
+//! `tests/engine_stays_generic.rs` walks the stack's manifests - this crate's
+//! and, through its path dependencies, every crate under it - and fails if a
+//! crate outside the stack's own closed allowlist appears ANYWHERE in the
+//! tree. The check is TRANSITIVE because nothing in the stack reaches outside
+//! the allowlist at any step, and a rule that holds transitively cannot be
 //! evaded by routing an edge through a sibling.
 //!
 //! **What is not here yet.** `Backdated` cuts off where a node's output
@@ -64,9 +64,9 @@
 //! key at all.
 //!
 //! **Read the list above as an inventory, not as an API.** Every item named in
-//! it is `pub(crate)` as of the visibility flip: the only things this crate
-//! exports are [`PipelineBuilder`], [`Pipeline`] and the result/report
-//! vocabulary their signatures name ([`DriveError`], [`ChainError`],
+//! it is `pub(crate)`: the only things this crate exports are
+//! [`PipelineBuilder`], [`Pipeline`] and the result/report vocabulary their
+//! signatures name ([`DriveError`], [`ChainError`],
 //! [`PendingWork`]/[`NoPendingWork`], [`WakePath`]/[`WakeReport`]). `DESIGN.md`
 //! says why, and says what to do when a consumer needs one of the internals:
 //! that is a FINDING about the builder's reach, recorded there, not a

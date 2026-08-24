@@ -1,11 +1,12 @@
-//! The two drivers (`PIPELINE_PLAN.md` §5).
+//! The two drivers.
 //!
 //! **Same stages, same keys, different driver** - that is the whole claim of
-//! §5, and this module is where it either holds or does not. Both drivers below
+//! the two-driver rule (`DESIGN.md`, "Two drivers, one graph"), and this
+//! module is where it either holds or does not. Both drivers below
 //! take an arbitrary `S: Stage` and touch nothing else; neither has a method
 //! the other's stages would need. A stage cannot tell which one is polling it,
-//! and that is the property that makes the IDE and the CLI one API rather than
-//! two implementations that agree by convention.
+//! and that is the property that makes an interactive host and a batch tool
+//! one API rather than two implementations that agree by convention.
 
 use std::sync::Arc;
 use std::task::{Context, Waker};
@@ -16,30 +17,30 @@ use libpipelinedata::{EffectPoll, Stage};
 /// How a blocking drive ended other than with a value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DriveError<E> {
-    /// The stage's own typed error channel (§7).
+    /// The stage's own typed error channel.
     Failed(E),
     /// The graph answered `Pending` and there was no outstanding work left to
     /// run, so re-polling could only produce `Pending` again.
     ///
     /// This is a real end state, not a timeout: it means something registered a
     /// waker for an input nothing was ever going to land. Offline, that is a
-    /// bug in the graph; in the IDE the same situation is normal and simply
+    /// bug in the graph; under a frame drive the same situation is normal and simply
     /// means the frame keeps its stand-in until a user action lands the value.
     Stalled,
 }
 
 /// What the blocking driver pumps when a poll answers `Pending`.
 ///
-/// §5's offline half: "when `Pending`, run the pending effect's future on a
-/// plain executor and poll again". This trait is that executor's seam, kept
-/// abstract because which executor - and whether there is a real one at all -
-/// is the caller's, and because a real one must not be linked by the engine
-/// (the same reason `ModuleRuntime`'s crate never links a wasm runtime).
+/// The blocking half of the contract: when `Pending`, run the pending
+/// effect's work on a plain executor and poll again. This trait is that
+/// executor's seam, kept abstract because which executor - and whether there
+/// is a real one at all - is the caller's, and because a real one must never
+/// be linked by the engine.
 pub trait PendingWork {
     /// Make progress on something a `Pending` poll is waiting for.
     ///
     /// Returns `false` when there is nothing left to run. Termination is then
-    /// §5's: the DAG's acyclicity plus effect completion. An implementation that
+    /// the graph's: the DAG's acyclicity plus effect completion. An implementation that
     /// returns `true` forever will loop forever, and no budget here would make
     /// that correct - it would only turn a hang into a wrong answer.
     fn run_once(&self) -> bool;
@@ -56,18 +57,18 @@ impl PendingWork for NoPendingWork {
     }
 }
 
-/// The offline driver: poll until the graph produces a value (`PIPELINE_PLAN.md`
-/// §5's CLI half).
+/// The offline driver: poll until the graph produces a value (the blocking
+/// half of the two-driver rule).
 ///
-/// **The waker is deliberately a no-op.** §5: "a waker of no consequence
-/// because there is no frame to keep alive". The loop re-polls unconditionally
+/// **The waker is deliberately a no-op** - a waker of no consequence, because
+/// there is no frame to keep alive. The loop re-polls unconditionally
 /// after pumping, so nothing depends on being woken - and a stage that registers
 /// [`Waker::noop`] and is never woken behaves identically to one that is. That
 /// the same stage works under both drivers *because* it cannot observe the
 /// difference is the claim, not a coincidence to be re-checked per stage.
 ///
-/// A CLI run against an unchanged tree is all cache hits, because the memo keys
-/// are the same ones the IDE used (§5).
+/// A batch run against an unchanged tree is all cache hits, because the memo
+/// keys are the same ones the interactive host used.
 pub(crate) fn run_to_completion<S, W>(
     stage: &S,
     input: &S::Input,
@@ -93,20 +94,19 @@ where
 }
 
 /// The real-time driver: poll once per frame and return whatever the graph says
-/// (`PIPELINE_PLAN.md` §5's IDE half).
+/// (the interactive half of the two-driver rule).
 ///
 /// **Nothing waits inside a frame, ever.** A poll that answers `Pending` is a
 /// frame that draws its stand-in and returns; the waker left behind schedules
 /// the redraw; the next frame polls and gets `Ready`. There is no method here
 /// that blocks, which is the mechanical form of that rule.
 ///
-/// **On wasm the wake target is an `EventLoopProxy` send.** §5:446-450: winit's
-/// loop is the only pump there, and `begin_publish(proxy:
-/// EventLoopProxy<HbEvent>, ..)` (`src/publish.rs:194-195`) is how an async
-/// result re-enters it today. This driver holds a [`WakeFlag`] instead, which
-/// records staleness without knowing how a redraw is requested - so the wasm
-/// version is this driver plus a proxy send beside the flag, not a different
-/// driver.
+/// **On a single-threaded host the wake target is an event-loop message.** In
+/// a browser or windowing event loop, the loop itself is the only pump, and an
+/// async result re-enters it by posting an event to a proxy. This driver holds
+/// a [`WakeFlag`] instead, which records staleness without knowing how a
+/// redraw is requested - so such a host is this driver plus a proxy send
+/// beside the flag, not a different driver.
 pub(crate) struct FrameDriver {
     stale: Arc<WakeFlag>,
 }
@@ -132,7 +132,7 @@ impl FrameDriver {
     }
 
     /// Whether a wake has arrived since this was last called - "stale, poll
-    /// again" (§3). Reading clears it.
+    /// again". Reading clears it.
     pub(crate) fn take_stale(&self) -> bool {
         self.stale.take_stale()
     }

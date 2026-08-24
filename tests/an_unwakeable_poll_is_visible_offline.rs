@@ -1,12 +1,13 @@
 //! Gate: **a `Pending` poll that leaves no wake path is detectable from the
-//! offline driver** (`PIPELINE_PLAN.md` §3, §5).
+//! offline driver.**
 //!
-//! Step 1's finding, in its own words: a `Pending` stage that registers no
-//! waker is "invisible to the blocking/CLI driver and fatal to the frame/IDE
-//! driver - the value is lost rather than late, and the offline path cannot
-//! detect it". This file is that sentence's last clause tested again with the
-//! watching driver in place, and it now fails: the CLI run reaches the same
-//! value it always did AND reports the defect.
+//! The finding this driver exists to close: a `Pending` stage that registers
+//! no waker is invisible to the blocking driver and fatal to the frame driver
+//! - the value is lost rather than late, and the offline path cannot detect
+//! it (`tests/two_drivers_one_graph.rs` measures exactly that). This file is
+//! that sentence's last clause tested again with the watching driver in
+//! place, and it now fails: the blocking run reaches the same value it always
+//! did AND reports the defect.
 //!
 //! **Two claims, and they pull against each other, so both are gated.**
 //!
@@ -27,7 +28,8 @@
 //! Those six tests live beside `poll_watched` in `src/watch.rs` and migrate back
 //! here if the runner ever grows one.
 //!
-//! **Every type here is a stand-in** (`PIPELINE_PLAN.md`:584-589).
+//! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
+//! generic").
 
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
@@ -46,7 +48,7 @@ struct Text(String);
 enum OnPark {
     /// Stash a clone, as `Effect::poll_effect`'s doc obliges.
     Register,
-    /// Nothing at all - step 1's `ForgetfulEmit`.
+    /// Nothing at all - `two_drivers_one_graph.rs`'s `ForgetfulEmit`.
     Forget,
 }
 
@@ -162,8 +164,8 @@ impl PendingWork for LandsOnFirstPump {
 
 #[test]
 fn the_offline_driver_reports_the_defect_without_changing_its_answer() {
-    // Step 1's finding, closed. The same graph, the same drive, the same value
-    // - and now the run says that a frame driver would have lost it.
+    // The lost-wake finding, closed. The same graph, the same drive, the same
+    // value - and now the run says that a frame driver would have lost it.
     let (stage, pipeline) = parking(OnPark::Forget);
     let (out, report) = pipeline.run_watched(&Text("hi".to_string()), &LandsOnFirstPump::for_stage(&stage));
 
@@ -177,8 +179,8 @@ fn the_offline_driver_reports_the_defect_without_changing_its_answer() {
     assert_eq!(report.unwakeable_polls(), 1);
     assert!(!report.is_clean());
 
-    // And the plain driver agrees on the answer, which is §5's claim: the
-    // watching is an observation, not a different drive.
+    // And the plain driver agrees on the answer, which is the two-driver
+    // rule's claim: the watching is an observation, not a different drive.
     let (plain_stage, plain) = parking(OnPark::Forget);
     assert_eq!(
         plain.run(
