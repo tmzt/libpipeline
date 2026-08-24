@@ -2,10 +2,18 @@
 
 `libpipeline` is an incremental computation engine for pipelines of pure
 stages: a source value goes in, derived outputs come out, and everything
-between is memoized, dependency-tracked, and drivable either one poll per
-frame or blocking to completion. The engine is generic over every payload
-type - it never learns what a stage computes, only how to poll it, key it,
-and remember its answers.
+between is memoized and re-derivable on demand. The engine is generic over
+every payload type - it never learns what a stage computes, only how to poll
+it, key it, and remember its answers.
+
+This revision of the document exists to capture one intended public shape -
+the pipeline as a SELF-CONTAINED STATE TRACKER with a single way to run it
+and four possible outcomes - and to measure the distance between that shape
+and the crate as it stands. The definition is Tim's (2026-08-24): "it's the
+self-contained state tracker for the steps defined via a builder pattern
+with one way to run it and three possible results" - four outcomes once the
+error channel is counted among them, and with `Computed` in place of `Ok`,
+"to match `Unchanged`".
 
 ## How to read this
 
@@ -24,7 +32,9 @@ The distinction carries more weight here than in most design documents,
 because this one is read as a specification: an unmarked paragraph is a
 claim you can check against the source, and a marked one is a claim about
 intent. Confusing the two sends a reader looking in `src/` for something
-nobody has written.
+nobody has written. Proposed behaviour is never written in the present
+tense as if it existed; where a marked section must speak of today's code,
+it names it as today's.
 
 Two further conventions worth knowing before the first section:
 
@@ -32,190 +42,68 @@ Two further conventions worth knowing before the first section:
   with no path is a claim about design rather than about this
   implementation.
 * **"Public" and "internal" are drawn strictly.** The public-API section is
-  the whole contract a consumer or a test may touch. The internals section
-  is machinery the builder assembles, which may be reorganized without
-  notice and is named there only so this crate can discuss itself.
+  the whole contract a consumer or a test may touch, and it names no
+  internal type. The internals section is machinery the builder assembles,
+  which may be reorganized without notice and is named there only so this
+  crate can discuss itself.
 
 ## What is in it
 
-Three parts. THE MODEL is the set of ideas the engine embodies; source
-comments cite its section names rather than restating them. THE CURRENT
-DESIGN is the builder-only public API and why it is shaped that way. The
-rest is the LEDGER: what is proposed, what the builder cannot yet express,
-and one lesson about testing that was expensive to learn.
+Five parts. WHAT A PIPELINE IS and the PUBLIC API are the intended shape,
+marked proposed almost throughout. WHAT EXISTS TODAY and THE MODEL are the
+crate as it stands - the unmarked ground truth, including the current
+four-door surface the proposal replaces. INTERNALS covers the layers, how
+they compose, and where the proposed pieces land among them. The rest is
+the ledger: the findings, the recorded stage-shape intent, the subcrate
+boundary, and the document ends with a verdict and a migration plan.
 
-## The model
+## What a pipeline is
 
-Ten commitments. Each is carried by a specific piece of the crate, named in
-parentheses.
+!!! PROPOSED
 
-### A pipeline is a chain of pure stages
+A pipeline is the self-contained state tracker for a sequence of steps
+defined through a builder. Self-contained means the pipeline itself holds
+what it last ran against and what it remembered along the way; none of that
+state lives in the caller, and none of it lives in hand-composed wrappers
+around the pipeline. A caller holds a pipeline, hands it the current state
+of the world, and reads one of four answers.
 
-A pipeline is a chain of stages from a source to a derived output. A stage
-consumes one input type and produces one output type; stages compose by the
-next stage's `Input` equaling the previous stage's `Output`. The composite
-of two stages is itself a stage, so a graph is never a second kind of thing
-a driver must know how to walk: a four-level lowering is three composites
-nested, driven with the same two methods as a leaf (`src/chain.rs`).
+* **Steps come from a builder.** Each step is registered once, with a name
+  and a behaviour version, and the pipeline owns everything about how the
+  steps compose and what they remember between runs.
+* **There is ONE way to run it.** Not a blocking door and a frame door - one
+  method. Whether a caller blocks until the answer or returns and waits for
+  a wake is what the caller DOES with the `Delayed` outcome, not an API it
+  chose up front.
+* **A run has four outcomes.** `Computed(Output)` - work happened, here is
+  the new value. `Unchanged` - nothing moved; the value the caller already
+  holds still stands. `Delayed` - not ready yet; a wake is coming. And
+  `Failed(Error)` - the stage's typed error.
+* **Input is a `(version, readable)` pair, supplied per run.** The version
+  says WHICH state this is; the readable IS that state. A version matching
+  the previous run's answers `Unchanged` without reading the readable at
+  all.
 
-### Poll and wake, not a one-shot future
-
-A stage is driven by a poll/waker protocol rather than awaited as a one-shot
-future. A poll answers one of three things: `Ready(value)` ("here is the
-current value", not "finished"), `Failed(error)` (the typed error channel),
-or `Pending` - "I cannot answer yet". Answering `Pending` OBLIGES the stage
-to arrange for the supplied waker to be woken when the answer becomes
-possible; a stage that forgets has made its value lost rather than late, and
-`src/watch.rs` exists to catch exactly that. The contract lives in
-`libpipelinedata::Stage`, which reuses `libeffects`' poll protocol: a stage
-bound to an input IS an effect.
-
-### The lookup precedes the work
-
-Memoization is keyed by `(stage identity, content keys of the inputs)` - a
-key computable BEFORE the stage runs. That ordering is the design's center
-of gravity: a lookup that precedes the work can skip the work, rather than
-validate it afterwards. An unchanged input hits at the first stage and the
-rest of the chain is never entered.
-
-Only `Ready` is recorded. `Pending` is not a value, and `Failed` is
-deliberately never cached - the standing rule is that effects are never
-replayed by an implicit cache, and a cached failure is exactly that: a
-transient failure (a network that was down, a file not yet written) served
-back as a settled fact under a key that says it is fresh. A stage that
-cannot honestly key an input answers `memo_key -> None` and is neither
-looked up nor recorded; refusing to key is the safe answer, faking one is
-not (`src/memo.rs`).
-
-### Content addressing is a streaming hash
-
-A content key is produced by streaming a value's parts through a hasher -
-never by serializing to a buffer and digesting the bytes. The vocabulary
-(`ContentKey`, `ContentHash`, the streaming `ContentHasher` and the derive)
-lives in `libpipelinedata`; this crate only trusts that equal values give
-equal keys.
-
-### The store is a seam
-
-WHERE answers are remembered is a separate decision from the engine.
-`MemoStore` (in `libpipelinedata`) is a two-method trait - `lookup` and
-`record` - and the builder accepts any implementation per stage
-(`stage_in`), owns a fresh map by default (`stage`), or turns every store
-off (`uncached`). One map-backed store is enough for this crate's entire
-test suite; heavier backends are a consumer's business and are invisible
-here.
-
-### Reads are observed, not declared
-
-Dependency edges are RECORDED BY OBSERVING READS, never accepted as a
-declared list - the salsa / MobX / Vue / Solid mechanism. While a stage
-runs, every tracked read is logged as an edge; the set is re-logged on every
-run so it follows conditionals (a branch not taken this run contributes no
-edge, so a change behind it wakes nothing). Changing a tracked input marks
-every node that read it - transitively - stale, and wakes whoever
-subscribed. Invalidation is selective: what did not read the change is not
-touched (`src/track.rs`, `src/schedule.rs`).
-
-### An equal recompute stops at its node
-
-Early cutoff, above the leaf: a node that recomputes to a value whose
-content address equals what it addressed to last time RETRACTS itself as a
-reason for its consumers to re-run. The recompute stops at its node rather
-than cascading; without cutoff, every keystroke invalidates the whole
-pipeline (`Backdated` in `src/track.rs`). At the leaf, setting a tracked
-input to the value it already had marks nothing stale at all.
-
-### Two drivers, one graph
-
-The same set of stages runs under two drives, and A STAGE CANNOT TELL WHICH
-ONE IS POLLING IT. That is what makes an interactive host and a batch tool
-one API rather than two implementations that agree by convention.
-
-* The FRAME drive polls once and returns immediately, whatever the answer. A
-  `Pending` frame draws its stand-in; the registered waker marks the
-  pipeline stale when the value lands; the next frame polls again. Nothing
-  waits inside a frame, ever.
-* The BLOCKING drive polls until a value or a typed failure, pumping an
-  executor seam (`PendingWork`) while polls answer `Pending`. Its waker is
-  deliberately a no-op - it re-polls unconditionally after pumping, so
-  nothing depends on being woken. A `Pending` with nothing left to pump is a
-  `Stalled` error, a real end state: something waited for an input nothing
-  was going to land.
-
-A batch run against an unchanged tree is all cache hits, because the memo
-keys are the same ones the interactive host used. The blocking drive also
-comes in a WATCHED form that reports, alongside an unchanged answer, every
-`Pending` poll that left no wake path - each one a value a frame drive would
-lose rather than receive late (`src/driver.rs`, `src/watch.rs`).
-
-### A boundary refuses the cache
-
-An error boundary turns a `Failed` poll into a substituted `Ready` - which
-LAUNDERS an uncacheable answer into a cacheable-looking one. Cache it and
-the key says "input X, value V" while V is the fallback; the input never
-moves, so the key never moves, and the real value is never computed again.
-So the stage-level boundary (`Guarded`, `src/boundary.rs`) answers
-`memo_key -> None` structurally, and a substitution COUNT rides alongside
-the drive's result, separating "built" from "built on fallbacks" without
-giving the two drivers different return types. The recovery mechanism
-itself is `libeffects`' and is not duplicated here.
-
-### The engine stays generic
-
-The engine never learns a consumer's types. Everything is generic over
-`S: Stage`; nothing matches on a concrete payload type, because none is in
-scope to match on. Every test in this crate invents STAND-IN types of its
-own (`Source`, `Lowered`, `Text`, dotted-path strings) - if the suite could
-not be written without importing a consumer's IR, the engine would have
-learned something it must not know. The proof is mechanical:
-`tests/engine_stays_generic.rs` walks this crate's manifest and, through its
-path dependencies, every manifest under it, and fails if the tree names a
-crate outside the stack's own closed allowlist. A rule that holds
-transitively cannot be evaded by routing an edge through a sibling.
-
-The stack is three crates, dependencies pointing strictly downward:
-
-| crate | role |
-|---|---|
-| `libpipeline` | the engine: memoization, tracking, scheduling, the two drivers |
-| `libpipelinedata` | the port: `Stage`, the key types, `ContentHash`, `MemoStore` |
-| `libeffects` | the base: the poll/waker protocol, boundaries, wake flags |
-
-## Why the builder is the only door
-
-An earlier revision of this crate exported its machinery flat - 23 items,
-no builder. An API that invites assembly at each call site gets assembly at
-each call site: two consumers hand-rolled their own memoization BESIDE the
-crate rather than composing the memo layer, and both were later found
-defective. The same flat surface let a stage be used un-memoized
-(memoization was something a caller remembered), and let a stage's version
-live far from the behaviour it versions - one consumer declared its
-`StageId` 761 lines from the key construction it governed. A stale version
-makes the memo serve a value computed by the OLD behaviour under a key
-claiming to be current, and nothing downstream can detect that.
-
-Three decisions follow, and the current design is their consequences:
-
-1. **The builder is the only public way to compose, memoize or drive.**
-   `Stage` stays public to IMPLEMENT - a consumer must be able to write one -
-   but not to compose, memoize or drive by hand.
-2. **Memoization is intrinsic to registration.** There is no un-memoized
-   `add_stage`. A stage that must not be served from cache says so through
-   `memo_key -> None` (the vocabulary that already exists for exactly this),
-   not by a caller forgetting a wrapper.
-3. **The version is declared at the registration call site.** `stage(name,
-   version, |id| ...)` puts the number in the same lexical scope as the
-   closure that constructs the behaviour it versions. Much of this code is
-   written by LLM agents, which do not scroll to a module-level `const` to
-   ask whether it should move; the invariant has to be in the way, not
-   remembered.
+`Computed` rather than `Ok` is deliberate. `Ok` says only "not an error";
+`Computed` says WORK HAPPENED, and contrasts exactly with `Unchanged`. Both
+are success. The distinction between them is the entire point of a
+memoizing pipeline: a caller that cannot tell "here is a new value" from
+"keep what you have" cannot avoid re-consuming the value, and the work the
+pipeline saved reappears one layer up.
 
 ## Public API
 
-### The builder
+!!! PROPOSED
+
+This section is the whole contract. A consumer learns here what a pipeline
+is, how to build one, how to run it, and what the four outcomes mean - and
+meets nothing else. The machinery behind it is described under "Internals"
+and is deliberately absent here.
+
+### Building a pipeline
 
 ```rust,ignore
-use libpipeline::PipelineBuilder;
+use libpipeline::{PipelineBuilder, Run};
 
 let pipeline = PipelineBuilder::new()
     .stage("parse", 3, |id| Parse::new(id))
@@ -223,562 +111,729 @@ let pipeline = PipelineBuilder::new()
     .build();
 ```
 
-* `PipelineBuilder::new()` - the empty builder. (Not `Pipeline::builder()`:
-  `Pipeline` is generic over the graph, so an associated constructor there
-  would demand a type the caller cannot yet name.)
-* `.stage(name, version, make)` - register one stage. `make: FnOnce(StageId)
-  -> S` receives the id the builder minted from `(name, version)`; the stage
-  stores it and answers it from `Stage::id`. **The builder checks
-  `stage.id() == id` at registration and panics on mismatch** - a stage
-  registered under a version its keys do not carry is exactly the stale-memo
-  defect this design exists to close, so it fails at construction, not at
-  poll time. Each registered stage is memoized in a store the builder owns
-  (a fresh map per stage); this is why `S::Output: Clone` is required.
-  Stages chain: the Nth stage's `Input` must equal the (N-1)th's `Output`.
-* `.stage_in(name, version, store, make)` - same, but memoized in a store the
-  CALLER provides (`impl MemoStore<S::Output>`). This is how a cache outlives
-  one build of the pipeline (an interactive session rebuilding its graph),
-  and it is what makes the version rule observable in a test: share a store
-  across two builds, bump the version, and the second build must recompute.
-* `.uncached()` - the control switch: every stage runs with a store that
-  remembers nothing. Kept public because "a pipeline whose ANSWERS change
-  when the cache is disabled has a bug the cache was hiding" is a property
-  consumers should be able to assert about their own graphs.
-* `.build() -> Pipeline<impl Stage<...>>` - the runner. The graph type is
-  opaque (`impl Stage`); consumers hold it by inference and can never reach
-  the machinery inside.
+* `PipelineBuilder::new()` - the empty builder.
+* `.stage(name, version, make)` - register one step. The number is the
+  STEP'S BEHAVIOUR VERSION - which code this is - declared at the
+  registration call site so it lives beside the behaviour it versions; a
+  stage constructed under a different identity than it answers is refused
+  at build time, loudly. Steps chain: each consumes what the previous one
+  produced. Every registered step remembers its answers; there is no
+  un-remembering registration to forget.
+* `.stage_in(name, version, store, make)` - the same, remembering into a
+  store the caller provides, so what a step remembers can outlive one build
+  of the pipeline.
+* `.uncached()` - the control switch: the pipeline remembers nothing.
+  Answers must not change, only speed; a pipeline whose answers change when
+  remembering is disabled has a bug the remembering was hiding.
+* `.build()` - the finished pipeline. Its input type is the first step's
+  input; its output type is the last step's output; its version type is
+  fixed here, as part of the pipeline's own type.
 
-### The runner
+A consumer implements steps against the stage contract in
+`libpipelinedata` (`Stage`, `StageId`, and the key vocabulary), which
+exists so a step can be DECLARED without linking the engine that runs it.
+A consumer implements stages and assembles nothing.
 
-`Pipeline<S>` is generic over the opaque graph and exposes the two drive
-modes - same graph, same keys:
+### Running it
 
-* `.run(&input, &work) -> Result<Output, DriveError<Error>>` - the blocking
-  drive. `work: impl PendingWork` pumps whatever a `Pending` poll is waiting
-  for.
-* `.run_pure(&input)` - `run` with `NoPendingWork`, for graphs of pure
-  stages.
-* `.run_watched(&input, &work) -> (Result<...>, WakeReport)` - the same
-  drive, reporting `Pending` polls that left no wake path (each one a value
-  a frame drive would lose rather than receive late).
-* `.poll_frame(&input) -> EffectPoll<Output, Error>` - the frame drive: one
-  poll, returns immediately, never blocks.
-* `.take_stale() -> bool` - whether a wake arrived since last asked ("stale,
-  poll again"); reading clears it.
-* `.waker() -> Waker` - for landing values out of band.
+```rust,ignore
+match pipeline.run(version, &document) {
+    Run::Computed(output) => held = Some(output),
+    Run::Unchanged => { /* `held` still stands */ }
+    Run::Delayed => { /* draw the stand-in; a wake is coming */ }
+    Run::Failed(error) => { /* the stage's typed error */ }
+}
+```
+
+`run(version, &readable)` is the one door. It polls once and returns
+immediately, whatever the answer; nothing inside it waits, ever.
+
+The `version` here is NOT the builder's per-step number. The step version
+says which CODE a step is; the run version says which STATE the input is.
+The two never meet: one is fixed at registration, the other arrives with
+every run.
+
+### The four outcomes, and what each answer means
+
+| outcome | meaning |
+|---|---|
+| `Computed(Output)` | work happened; here is the new value |
+| `Unchanged` | nothing moved; the value from the last `Computed` still stands |
+| `Delayed` | not ready; a wake is coming |
+| `Failed(Error)` | the stage's typed error channel |
+
+**`Computed` and `Unchanged` are both success**, and the pipeline's memory
+is what tells them apart. The pipeline records the version each `Computed`
+answered for; a run handed that same version again answers `Unchanged`
+without reading the readable. So `Unchanged` always means: the value I
+last handed you derives from exactly this state - keep it.
+
+**Only `Computed` records the version.** A `Delayed` run has not produced
+the value for that version, so asking again with the same version polls
+again rather than falsely answering `Unchanged`. A `Failed` run records
+nothing either: a failure is this run's answer, not the pipeline's verdict,
+and a later run with the same version retries rather than serving the
+failure back as a settled fact. A consequence worth knowing: after a newer
+version fails, re-running the OLD version still answers `Unchanged` - the
+old value still stands, which is true.
+
+**`Delayed` is a promise.** A run that answers it has arranged for the
+pipeline's waker to be woken when the answer becomes possible. A step that
+cannot keep that promise has made its value lost rather than late, and the
+pipeline treats that as the defect it is (see "Delayed keeps its promise"
+under Internals).
+
+**Neither `Computed` nor `Failed` is terminal.** A pipeline is a standing
+derivation over inputs that change; a later run over a changed version can
+move `Failed` back to `Computed`, and `Computed` to a different value.
+
+### The version
+
+The version type is fixed when the pipeline is built and is bounded
+`Copy + Eq`. `Eq` and not `PartialEq`, deliberately: `PartialEq` admits
+`f64`, `NaN != NaN`, and a version that never equals itself makes the
+`Unchanged` gate silently never fire.
+
+The pipeline NEVER computes a version. It compares the ones it is handed.
+Where a version comes from is the consumer's business - an edit store's
+cursor, a build number, a git sha - anything cheap to copy and honest
+about identity. That cheapness is the point of the pair: the version costs
+a comparison, and the readable may be a large snapshot that a matching
+version never touches. Versions are compared for identity, not order;
+running an older state again is just another state.
+
+### After `Delayed`: the wake
+
+* `.take_stale() -> bool` - whether a wake arrived since last asked
+  ("stale, run again"); reading clears it.
+* `.waker() -> Waker` - the wake target, for landing values out of band.
+
+### Blocking and frame are what a caller does, not what it chooses between
+
+A frame-driven caller runs once per frame when there is reason to:
+
+```rust,ignore
+if pipeline.take_stale() || version != drawn_for {
+    match pipeline.run(version, &document) { /* ... */ }
+}
+```
+
+A blocking caller loops on `Delayed`, making its own progress between
+runs:
+
+```rust,ignore
+let outcome = loop {
+    match pipeline.run(version, &document) {
+        Run::Delayed if executor.run_once() => continue,
+        Run::Delayed => break stalled(), // the caller's own condition
+        done => break done,
+    }
+};
+```
+
+The second arm is what used to be the engine's `Stalled` error: a
+`Delayed` when the caller has nothing left to run means something waited
+for an input nothing was going to land. Waiting stopped being the
+pipeline's job, so having-nothing-left-to-wait-on stopped being its
+vocabulary; the caller that owns the executor is the one that can see its
+queue is empty.
+
+### What else is public
+
+* **The stage contract** (`Stage`, `StageId`, `MemoKey`, `ContentKey`,
+  `EffectPoll`, `MemoStore`, `MemoMap`, `NoMemo`) - lives in
+  `libpipelinedata`, not here; a stage AUTHOR needs it, and it is the
+  implement-side contract, not composition machinery.
+* **`Run`** - the outcome type above.
+* **`ChainError`** - result vocabulary, not machinery: a pipeline of two or
+  more steps fails with nested `ChainError`, and a caller matching on WHICH
+  step failed needs the name. The type that composes such pipelines stays
+  internal.
+
+Nothing else. In particular, the executor seam (`PendingWork`), the
+blocking drive's error type (`DriveError`), and the watched drive's report
+(`WakeReport`, `WakePath`) - all public today - leave the surface with the
+doors that named them.
+
+## What exists today
+
+Everything in this section is checkable against the source as of this
+revision. It is the ground the proposal above has to be reached from.
+
+### The builder (built)
+
+`src/builder.rs`: `PipelineBuilder::new`, `.stage(name, version, make)`,
+`.stage_in(name, version, store, make)`, `.uncached()`, and
+`StagedPipelineBuilder::build`. Memoization is intrinsic to registration -
+every `stage()` call wraps its stage in the memo layer with an owned map,
+a caller-given store, or the off switch. The version is declared at the
+registration call site, and `checked` in `src/builder.rs` panics at
+construction when a stage answers a different id than it was registered
+under - the stale-memo defect refused at build time rather than served at
+poll time. All of this carries forward under the proposal unchanged except
+for the version type parameter `build` acquires.
+
+### The four doors (built, and what the proposal replaces)
+
+`Pipeline` in `src/builder.rs` exposes four ways to run one graph, onto
+two drives:
+
+* `.run(&input, &work) -> Result<Output, DriveError<Error>>` - the
+  blocking drive, pumping `work: impl PendingWork` while polls answer
+  `Pending`.
+* `.run_pure(&input)` - `run` with `NoPendingWork`.
+* `.run_watched(&input, &work) -> (Result<..>, WakeReport)` - the same
+  drive, additionally reporting `Pending` polls that left no wake path.
+* `.poll_frame(&input) -> EffectPoll<Output, Error>` - the frame drive:
+  one poll, returns immediately.
+
+Plus `.take_stale()` and `.waker()`, which the proposal keeps. The public
+result vocabulary these doors name is re-exported from `src/lib.rs`:
+`ChainError`, `DriveError`, `PendingWork`/`NoPendingWork`,
+`WakePath`/`WakeReport`.
+
+There is no version gate, no `Unchanged`, and no outcome type: today a
+caller cannot be told "keep what you have" - an unchanged input produces
+the same output again (cheaply, via the memo, but produced and handed over
+all the same).
+
+### What a run answers today
+
+Three result types, at three scopes, all replaced or resituated by the
+proposal but true today:
+
+* **`EffectPoll<A, E>`** (`libeffects`, re-exported by `libpipelinedata`) -
+  what one poll answers: `Ready(value)` ("here is the current value", not
+  "finished"), `Pending` ("I cannot answer yet" - which OBLIGES the poll to
+  have registered the supplied waker), `Failed(error)`. Neither `Ready`
+  nor `Failed` is terminal; only `Pending` carries an obligation.
+* **`DriveError<E>`** (`src/driver.rs`) - how a blocking run ends badly:
+  `Failed(E)`, or `Stalled` - the graph answered `Pending` with no
+  outstanding work left, so re-polling could only answer `Pending` again.
+  `Stalled` is not a timeout, and the same state means opposite things
+  under the two drives: offline it is a bug in the graph, under a frame
+  drive it is normal and the frame keeps its stand-in. That asymmetry is
+  why `run_watched` exists today, and it is the asymmetry the one-door
+  design dissolves by making the waiting the caller's.
+* **`ChainError<A, B>`** (`src/chain.rs`) - WHICH stage failed: `First(A)`
+  (the second never ran) or `Second(B)` (the first produced a value and
+  the second failed on it), nesting once per join. This one survives the
+  proposal unchanged.
 
 ### What else stays public, and why
 
-* **`Stage` and its contract types** (`Stage`, `StageId`, `MemoKey`,
-  `ContentKey`, `EffectPoll`, `MemoStore`, `MemoMap`, `NoMemo`) - these live
-  in `libpipelinedata`, not here; a stage AUTHOR needs them and they are the
-  implement-side contract, not composition machinery.
-* **`PendingWork` / `NoPendingWork`** - the executor seam. Which executor
-  (and whether there is one) is the caller's decision; the engine may not
-  link one.
-* **`DriveError`** - what `run` answers with; `Stalled` is a real end state.
-* **`ChainError`** - result VOCABULARY, not machinery: the runner's error
-  type for a multi-stage pipeline is nested `ChainError`, and a caller
-  matching on which stage failed needs the name. The type that COMPOSES
-  such a pipeline is internal; see "Internals". A public error type whose
-  producer is private is the normal shape here - you match on what came
-  back without being able to build the thing that produced it.
-* **`WakePath` / `WakeReport`** - the watched drive's findings.
-
-`WakePath` is the one item on that list no public signature names, and it is
-worth saying so rather than letting a reader assume otherwise: the runner's
-watched door is `run_watched`, which reports a `WakeReport` (counts). It
-stays exported as that report's vocabulary. The tests that read a per-poll
-path are `poll_watched`'s, and they are unit tests in `src/watch.rs` for
-exactly that reason - see finding 6.
+Today's full export list, from `src/lib.rs`: `PipelineBuilder`,
+`StagedPipelineBuilder`, `Pipeline`, `ChainError`, `DriveError`,
+`PendingWork`, `NoPendingWork`, `WakePath`, `WakeReport`. `WakePath` is
+named by no public signature and is kept as `WakeReport`'s vocabulary. The
+stage contract lives in `libpipelinedata` and is re-exported by nothing
+here (finding 8 records the open decision).
 
 ### Where a consumer works, and what it may never name
 
 **A consumer of this crate implements `Stage` and assembles nothing.**
+`Stage` is a trait in `libpipelinedata` (`src/stage.rs` there); the
+builder takes `S: Stage`. Everything on the composition side - tracking,
+memoization, chaining, scheduling, driving - belongs to whoever links the
+engine, reaches a consumer's stage only through registration, and cannot
+be named from outside this crate. A consumer-level test that hand-composes
+the graph is testing the wrong layer whether or not it passes, and the
+remedy is never a re-export: a property the builder cannot express is a
+FINDING, recorded below.
 
-`Stage` is a TRAIT, today and in every shipped version of this crate. It
-lives in `libpipelinedata` (`src/stage.rs`), a consumer implements it on a
-type of its own, and the builder takes `S: Stage`. The closure form
-described later in this document is PROPOSED and does not exist; where the
-two disagree, the trait is what is true now. Nothing below should be read
-as saying a stage is already a function.
-`Stage` and its contract types live in `libpipelinedata`, which exists
-precisely so a consumer can DECLARE a step - an id, a version, an input, an
-output, a memo key - without linking the engine that runs it. It is the
-port; this crate is the implementation behind it.
+**The measurement.** `tests/` holds what the public API can reach: **30
+tests in 4 binaries** (`an_unwakeable_poll_is_visible_offline.rs`,
+`builder_is_the_only_door.rs`, `engine_stays_generic.rs`,
+`two_drivers_one_graph.rs`), plus the README's 6 doctests - against **71
+unit tests in `src/`** that admit it cannot (37 in `src/track.rs`, 20 in
+`src/boundary.rs`, 8 in `src/schedule.rs`, 6 in `src/watch.rs`). When a
+finding closes, tests migrate outward. The subcrate boundary section below
+is aimed at exactly this ratio.
 
-Everything on the composition side - tracking, memoization, chaining,
-dependency bookkeeping and driving - belongs to whoever LINKS the engine,
-and reaches a consumer's stage only by that assembler registering it. Those
-layers are named and described under "Internals" below; they are named
-THERE and not here on purpose, because a consumer reading this section
-should not come away with a construction it could copy. Under the correct
-split a consumer cannot spell them at all - it does not depend on this
-crate - so hand-composing that graph is not merely reaching past the
-builder, it is working at a layer the consumer has no business at. Three
-consequences:
+## The model
 
-* A consumer-level test that hand-composes the stage graph is testing the
-  wrong LAYER, whether or not it passes.
-* The remedy is never to re-export a type so such a test compiles. If a
-  consumer-level property is genuinely wanted, it is expressible through the
-  builder or it is a finding here.
-* Where such a property is held over a stand-in stage inside this crate,
-  that is the RIGHT shape rather than a lesser substitute for the real
-  stage: the engine is generic, so a stand-in exercises exactly what a real
-  stage would.
+The commitments the engine embodies, each carried by a named piece of the
+crate. Source comments cite these section names rather than restating
+them. All of this is true today, and all of it survives the proposal - the
+proposal changes the door, not the engine.
 
-### What tests may touch
+### A pipeline is a chain of pure stages
 
-Only the above. A test that needs anything from the internals section is a
-FINDING that the builder cannot express something a consumer will need;
-record it here, do not re-export.
+A stage consumes one input type and produces one output type; stages
+compose by the next stage's `Input` equaling the previous stage's
+`Output`. The composite of two stages is itself a stage, so a graph is
+never a second kind of thing a driver must know how to walk
+(`src/chain.rs`). A stage is driven by a poll/waker protocol
+(`libpipelinedata::Stage`, reusing `libeffects`' poll contract): `Ready`,
+`Pending` - which obliges the stage to arrange a wake - or `Failed`.
 
-**Which makes the count of tests in `tests/` the measurement.** It is what
-the public API can reach: **30 tests in 4 binaries** (plus the README's
-doctests), against **71 unit tests** in `src/` that admit it cannot. When a
-finding closes, its tests migrate OUTWARD and that first number goes up. A
-test moved inward is placed in the MODULE THAT OWNS THE INTERNAL it reaches
-for - not in one collecting `mod tests` at the crate root - so it moves with
-that module when the module is reshaped, and so that reaching an internal
-stays local and visible rather than having a sanctioned home.
+### The lookup precedes the work
 
-## Internals (assembled by the builder, never exported)
+Memoization is keyed by `(stage identity, content keys of the inputs)` - a
+key computable BEFORE the stage runs, so the cache can skip the work
+rather than validate it afterwards. An unchanged input hits at the first
+stage and the rest of the chain is never entered. Only `Ready` is
+recorded: `Pending` is not a value, and `Failed` is deliberately never
+cached - a transient failure served back under a key that says it is fresh
+would be a settled fact that never was. A stage that cannot honestly key
+an input answers `memo_key -> None` and is neither looked up nor recorded
+(`src/memo.rs`). Content keys are streaming hashes; the vocabulary lives
+in `libpipelinedata`, and WHERE answers are remembered is a seam
+(`MemoStore`), not the engine's decision.
+
+### Reads are observed, not declared
+
+Dependency edges are RECORDED BY OBSERVING READS, never accepted as a
+declared list. While a stage runs, every tracked read is logged as an
+edge; the set is re-logged on every run so it follows conditionals.
+Changing a tracked input marks every node that read it - transitively -
+stale, and wakes whoever subscribed; a node that recomputes to the same
+content address retracts itself as a reason for its consumers to re-run
+(`src/track.rs`: `Ledger`, `Tracked`, `TrackedInput`, `Backdated`;
+`src/schedule.rs`: what a driver polls next given the stale set). This
+whole layer is real, tested, and UNWIRED: the builder has no spelling for
+any of it (finding 1), so nothing a consumer can build today reaches it.
+
+### Two drivers, one graph
+
+The same set of stages runs under two drives, and a stage cannot tell
+which one is polling it: the blocking drive (`run_to_completion`,
+`src/driver.rs`) polls until a value or a typed failure, pumping the
+executor seam, with a deliberately no-op waker; the frame drive
+(`FrameDriver`, `src/driver.rs`) polls once, never waits, and records
+wakes in a flag. The blocking drive's watched form (`src/watch.rs`)
+reports `Pending` polls that left no wake path - each one a value a frame
+drive would lose rather than receive late. Under the proposal the same two
+loops survive as CALLER PATTERNS around the one door; the claim "a stage
+cannot tell how it is being driven" is unchanged.
+
+### A boundary refuses the cache
+
+An error boundary turns a `Failed` poll into a substituted `Ready`, which
+launders an uncacheable answer into a cacheable-looking one - so the
+stage-level boundary (`Guarded`, `src/boundary.rs`) answers
+`memo_key -> None` structurally, and a substitution count rides alongside
+the drive's result, separating "built" from "built on fallbacks". Also
+real, tested, and unwired (finding 2).
+
+### The engine stays generic
+
+The engine never learns a consumer's types. Everything is generic over
+`S: Stage`; every test invents stand-in types of its own. The proof is
+mechanical: `tests/engine_stays_generic.rs` walks this crate's manifest
+and, through its path dependencies, every manifest under it, and fails if
+the tree names a crate outside the stack's closed allowlist (`THE_STACK`
+in that file). The stack is three crates, dependencies pointing strictly
+downward:
+
+| crate | role |
+|---|---|
+| `libpipeline` | the engine: memoization, tracking, scheduling, the drivers |
+| `libpipelinedata` | the port: `Stage`, the key types, `ContentHash`, `MemoStore` |
+| `libeffects` | the base: the poll/waker protocol, boundaries, wake flags |
+
+## Internals
 
 **Nothing in this section is reachable by a consumer, and nothing in it
-appears in a public-API example.** The names below exist so that this
-crate's own maintainers and its tests can talk about the machinery; a
-reader looking for what to CALL wants "Public API" above. That separation
-is the point of the section: an internal named in a consumer-facing
-passage reads as something to use, and one reader already took it that
-way.
+appears in a public-API example.** The names exist so this crate's
+maintainers and tests can talk about the machinery.
 
-All of the below is `pub(crate)`. `boundary.rs`, `schedule.rs`, `track.rs`,
-`chain.rs` and `memo.rs` each carry
-`#![cfg_attr(not(test), allow(dead_code))]`: with no flat exports, the parts
-the builder has no spelling for have no caller but their own tests, and the
-`not(test)` form keeps the lint fully armed under `cargo test` so anything
-that becomes genuinely unused still fails the gate. The allow comes off when
-the builder becomes the caller.
+### The layers, and the wrap order
 
-* **`Chain`** (`src/chain.rs`) - two stages composed, itself a `Stage`. The
-  builder nests these; the composite id is a fixed internal `StageId`
-  because a chain never keys (`memo_key -> None`, its parts are memoized
-  instead).
+All internal machinery is `pub(crate)` today. Bottom-up:
+
+* **`Chain`** (`src/chain.rs`) - two stages composed, itself a `Stage`.
+  Refuses to key (`memo_key -> None`); its parts are memoized instead. The
+  builder nests these under a fixed internal `StageId`.
 * **`Memo`** (`src/memo.rs`) - the memo layer: lookup precedes the work,
-  only `Ready` recorded, store skipped while `revalidating`. Merged into
-  registration: every `stage()` call wraps its stage in one.
-* **`FrameDriver`** (`src/driver.rs`) - held inside `Pipeline`, surfaced as
-  `poll_frame`/`take_stale`/`waker`.
-* **`run_to_completion`**, **`run_to_completion_watched`**,
-  **`poll_watched`** (`src/driver.rs`, `src/watch.rs`) - surfaced as
-  `run`/`run_watched`.
-* **`BuilderStore`** (`src/builder.rs`) - the store the builder wraps around
-  each stage: owned map / caller-given / off (the `.uncached()` control).
+  only `Ready` recorded, and the store is skipped entirely while
+  `revalidating()` (`src/track.rs`) is true - the thread-local channel by
+  which the ledger outranks the store without any stage declaring
+  anything. Merged into registration: every `stage()` call wraps its stage
+  in one (`src/builder.rs`).
 * **The tracked layer** (`src/track.rs`: `Ledger`, `Tracked`,
   `TrackedInput`, `Backdated`, `NodeId`, `revalidating`) and
-  **`Schedule`/`Cycle`** (`src/schedule.rs`) - internal, and private, even
-  though the builder cannot yet express them (findings 1 and 4). The tests
-  over these layers live in `src/track.rs` and `src/schedule.rs`.
+  **`Schedule`/`Cycle`** (`src/schedule.rs`) - observed reads, transitive
+  invalidation, early cutoff, and what-to-poll-next. Unwired: private even
+  though the builder cannot yet express them (findings 1 and 4).
 * **`Guarded`/`Substitutions`/`run_to_completion_counted`**
-  (`src/boundary.rs`) - same, with their tests in `src/boundary.rs`
-  (finding 2).
-* **`poll_watched`** (`src/watch.rs`) - the watched SINGLE poll.
-  `run_watched` is the public watched drive; there is no public single-poll
-  counterpart (finding 6).
+  (`src/boundary.rs`) - the stage-level error boundary and its tally.
+  Unwired (finding 2).
+* **The drives** - `run_to_completion` and `FrameDriver`
+  (`src/driver.rs`); `poll_watched` and `run_to_completion_watched`
+  (`src/watch.rs`).
+* **`BuilderStore`** (`src/builder.rs`) - owned map / caller-given / off,
+  the three answers to "where does this stage remember".
 
-Two composition rules hold by convention rather than by type, and each is
-stated in the owning module's doc and pinned by a known-bad twin: a cache
-belongs INSIDE the tracking (`Memo`'s doc - a cache outside the tracking is
-a cache the ledger cannot reach), and a boundary belongs OUTSIDE the
-tracking (`Guarded`'s doc - a substituted `Ready` tells the ledger the node
-is up to date when it is still owed its real answer). The third of that
-family - a boundary belongs outside the MEMO - is closed structurally by
-`Guarded` refusing to key at all.
+Two composition rules hold by convention rather than by type, each stated
+in the owning module's doc and pinned by a known-bad twin:
+
+* **The cache goes INSIDE the tracking** - `Tracked::new(&ledger, label,
+  Memo::new(stage, store))`, never `Memo::new(Tracked::new(..), store)`.
+  A cache outside the tracking answers before any run scope opens, so the
+  ledger's staleness mark goes unread (`src/memo.rs`'s doc; the twin lives
+  in `src/track.rs`'s test modules). Memoization sits inside the node's
+  scope precisely so the lookup can see the node's staleness - that is
+  where tracking and memoization sit relative to each other, and the
+  builder is intended to own this order so it becomes unwritable
+  (finding 1).
+* **The boundary goes OUTSIDE the tracking** - a substituted `Ready`
+  inside the tracking tells the ledger a node is up to date while it is
+  still owed its real answer (`src/boundary.rs`'s doc and twins). The
+  third rule of the family - a boundary belongs outside the memo - is
+  closed structurally by `Guarded` refusing to key.
+
+The five modules whose machinery has no caller but its own tests carry
+`#![cfg_attr(not(test), allow(dead_code))]` (`src/boundary.rs`,
+`src/chain.rs`, `src/memo.rs`, `src/schedule.rs`, `src/track.rs`), armed
+under `cargo test` so anything genuinely unused still fails the gate.
+
+### The version gate and the one door
+
+!!! PROPOSED
+
+The one door is the frame drive plus a version gate plus an outcome
+mapping - no new engine semantics anywhere in it.
+
+`Pipeline` gains a type parameter and one field: `Pipeline<V, S>` holding
+the graph, the existing `FrameDriver`, and `last: Mutex<Option<V>>` (safe
+interior mutability, as everywhere in this crate; `run` keeps `&self`
+because a poll holds `&self` all the way down). `run(version, input)`:
+
+1. If `last` holds exactly `version`: return `Run::Unchanged`. The
+   readable is not dereferenced, no memo key is computed, no stage is
+   polled.
+2. Otherwise poll once through the frame driver (today's
+   `FrameDriver::poll_frame`, `src/driver.rs`) and map the answer:
+   `Ready(v)` becomes `Run::Computed(v)` and records the version;
+   `Pending` becomes `Run::Delayed`; `Failed(e)` becomes
+   `Run::Failed(e)`. Nothing else records the version.
+
+The blocking drive (`run_to_completion`, `src/driver.rs`) stops being a
+public door and becomes the caller's loop; it and its watched and counted
+forms remain internal machinery with their own tests, and they remain the
+reference semantics for what such a loop does. `PendingWork`,
+`NoPendingWork`, `DriveError`, `WakeReport` and `WakePath` leave the
+public surface with the doors that named them; `ChainError` stays, because
+the one door still fails with it.
+
+The version gate sits ABOVE the whole graph, outermost: it is the pipeline
+remembering what it last ran against, not a per-stage concern. Stage-level
+memoization is untouched and still does its work on the version-mismatch
+path - an input that moved its version but not its content still hits at
+the first stage. The gate does not wire the tracking layer, and does not
+need it; a later wiring of the ledger would let `Unchanged` also fire when
+a recompute reaches the root with an unchanged content address
+(root-level backdating), through the same variant, with no API change.
+
+### Delayed keeps its promise
+
+!!! PROPOSED
+
+`Delayed` publicly promises "a wake is coming", and the engine can check
+it: `poll_watched` (`src/watch.rs`) already measures, per poll and in safe
+code, whether a `Pending` poll left a wake path. The one door polls
+through it in debug builds and panics on `WakePath::Missing` with the
+diagnosis (a stage answered `Pending` without arranging a wake - the value
+is lost rather than late); release builds poll plain and trust the stage
+contract, keeping the probe allocation out of the hot path. This subsumes
+finding 6 and replaces the public `run_watched` door: what was an optional
+offline diagnostic becomes enforcement of the outcome's meaning, at the
+door itself. The alternative - an accessor exposing a wake-debt count
+instead of a debug panic - is one decision Tim may flip; the shape of the
+check is the same either way.
 
 ## Not built yet (engine-level, distinct from the builder findings)
 
-* **The derived-key fold for composites.** A chain's own memo key would be a
-  fold `H(stage_id, key(inputs))` over its parts; until that exists, `Chain`
-  honestly refuses to key and its parts are memoized individually. Nothing
-  is lost meanwhile - the cheapness argument is about hitting at the FIRST
-  level.
-* **Deep verification.** `Backdated` cuts off where a node's output REPEATS,
-  which needs the node to have run. A node whose consumers could be spared
-  before it runs at all - an unchanged dependency set being enough, as in
-  salsa's deep verify - is not here. Neither is any policy for which nodes
-  are worth addressing on every poll: `Backdated` is opt-in per node because
-  the address costs a traversal of the output, and a chain that backdates at
-  every level pays for it at every level.
+* **The derived-key fold for composites.** A chain's own memo key would be
+  a fold over its parts; until that exists, `Chain` honestly refuses to
+  key and its parts are memoized individually (`src/chain.rs`).
+* **Deep verification.** `Backdated` cuts off where a node's output
+  REPEATS, which needs the node to have run; sparing a node's consumers
+  before it runs at all (salsa's deep verify) is not here, and neither is
+  a policy for which nodes are worth addressing per poll (`src/track.rs`).
+
+## What the builder cannot yet express (findings, in priority order)
+
+The numbering is load-bearing: source comments cite these by number.
+Each entry now also records its status under the one-door design.
+
+1. **Tracked state graphs.** `Ledger`/`Tracked`/`TrackedInput` composition
+   - including the load-bearing wrap order - is exactly the assembly the
+   builder exists to own, and the builder has no spelling for it. The 45
+   tests over the tracked and schedule layers stay on internals until it
+   does (the suites in `src/track.rs` and `src/schedule.rs`). Status:
+   OPEN and unchanged by the one door - the version gate answers
+   `Unchanged` from version identity, not from the ledger. When this
+   lands, the wrap order becomes unwritable and its known-bad twin is
+   deleted rather than migrated.
+2. **Error boundaries.** `Guarded` placement and the substitution tally
+   are caller assembly today (`src/boundary.rs`). Status: OPEN; under the
+   one door the tally would surface as an accessor on `Pipeline` rather
+   than a counted drive variant.
+3. **Non-linear graphs.** The builder builds chains; a diamond exists in
+   the engine via `Arc<S>: Stage` (`libpipelinedata/src/stage.rs`) but has
+   no builder spelling. Status: OPEN, orthogonal.
+4. **Scheduling.** `Ledger::schedule` (`src/schedule.rs`) has no
+   builder-level door; rides on finding 1. Status: OPEN.
+5. **Store lifecycle.** `.stage_in` lets a cache outlive a build; there is
+   no whole-pipeline store policy. Status: OPEN, orthogonal.
+6. **A watched single poll.** Nothing public answers "what did THIS poll
+   leave behind". Status: SUBSUMED by "Delayed keeps its promise" - the
+   one door checks the wake path itself, and the finding closes by
+   deletion rather than by a new door.
+7. **The registration-site guarantee protects only what is registered.**
+   A stage-authoring crate that never links the engine carries its
+   versions unchecked; the gap closes per consumer, by an assembler
+   existing. Status: unchanged by anything here.
+8. **Assembling a pipeline takes two manifest edges** (`libpipeline` plus
+   `libpipelinedata`). This crate could re-export the port so one edge
+   suffices without weakening the split. Status: OPEN; the subcrate
+   boundary below makes the facade the natural place to decide it, and it
+   remains deliberately undecided.
 
 ## The intended stage shape: a function, with everything through Ctx
 
 !!! PROPOSED
 
-None of this section is built, INCLUDING ITS SUBSECTIONS - the `!!!` marker
-above scopes to the whole section, so nothing inside it describes code that
-exists. It is the shape the API is heading for, recorded so the next wave
-does not re-derive it, and so that the trait-taking door the builder has
-TODAY (`stage`/`stage_in`, taking `S: Stage`) is understood as the thing
-being replaced rather than as the general case with a convenience beside
-it.
+Recorded intent from 2026-08-24, compressed from the previous revision of
+this document (full form in git history); orthogonal to the one-door
+design - registration shape and run shape are independent decisions, and
+nothing in the one door forecloses this.
 
-### A stage is a pure closure taking `Ctx`, and there is no other form
-
-The registration door takes a `fn` pointer - not `impl Fn`, not a trait:
-
-```text
-stage_fn(name, version, f: fn(&I, &mut Ctx) -> O)
-```
-
-A non-capturing closure coerces to `fn`; a capturing one does not. So the
-TYPE refuses captured state at compile time - no lint, no convention, no
-review. `impl Fn` would permit capture and a trait would permit fields;
-`fn` permits neither.
-
-**There is no trait-taking variant, and that is the decision rather than
-an omission.** Tim, 2026-08-24: *"we just dismissed the trait variant as
-something that grows local state we don't want. the pipeline has pure
-closures as stages taking cx: Ctx."*
-
-An earlier draft of this section kept a second door for stages with
-"genuine per-build config", citing one consumer's expansion stage - it held
-an `environment` field, a `ContentKey` over the definition tables it
-expands against, computed once at construction and folded into every memo
-key. That was preserving an existing shape rather than following the design
-through.
-
-**A resource a stage reads comes through `Ctx`, and the read-set covers
-it.** The definition tables are things the expansion READS. Reaching them
-through `cx` puts them in the read log (`Ctx::observe_read`), which is
-strictly better than the field:
-
-* nothing is hashed at construction, so a stage that never consults the
-  table on a given run does not carry it in that run's read-set;
-* the set is re-addressed per run rather than frozen when the stage was
-  built, which closes the staleness the field's own doc had to assume away
-  (the table could not change mid-build, and the field was only correct
-  because of that);
-* and the operand stops being something an author must remember to fold
-  into `memo_key` - the door that logs it is the only door there is.
-
-The manual key operand existed because there was a struct to hang it on.
-Remove the struct and the reason goes with it.
-
-**What a stage is keyed by, then**: its `StageId` - name and version, the
-version declared at the registration call site - plus whatever its run
-actually read, as the read-set records it. No `ContentKey` computed over a
-whole input to discover what the source's version already says, and no
-per-stage decision about which fields belong in the key, because there are
-no fields.
-
-**This binds every door that comes later, including the tracked one.**
-When finding 1 lands it is a CLOSURE form - a tracked registration taking
-`fn`, with the builder owning the ledger and the wrap order. Tim,
-2026-08-24, on the alternative: *"if we did have an add_tracked_stage
-taking the full trait that might cause problems later on with local state
-getting added to the structs."* A door typed on the trait hands back a
-struct, and structs accrete: today `{ id }`, later
-`{ id, cache, last_seen, config }`, each field a candidate input that
-moves the output without moving the key, none of it arriving as a visible
-decision. The point of the `fn` door is that the field is IMPOSSIBLE
-rather than reviewable, and a second door typed on the trait would give
-that back for whichever stage was written through it.
-
-### In-flight state lives in `Ctx`, addressed - not in a field
-
-The objection to the `fn` form is that a stage which polls `Pending` then
-`Ready` needs somewhere to keep its work between polls, and that somewhere
-looks like a field.
-
-It is not. Tim, 2026-08-24: *"it feels more like that's the role of
-ctx/cx, and we already have the concept with ecs keyed on widget (in this
-case, stageid and pipelineid)."*
-
-The addressing pattern is the one to copy: state lives in a store and the
-thing using it holds only an ADDRESS - `(PipelineId, StageId)` here, where
-a widget id serves the same role in a UI consumer's world. What is NOT
-copied is the backing. Tim, same date: *"MemoStore is a trait we provide
-to the builder, the ecs is not libpipeline's concern."*
-
-So the store is a SEAM, not a structure this crate owns. `MemoStore` is
-already exactly that - a trait, with `stage_in` on the builder taking a
-caller-provided implementation - and in-flight state should reach the `Ctx`
-the same way: through a trait the consumer satisfies, addressed by
-`(PipelineId, StageId)`. Whether a consumer backs it with an ECS, a map, or
-anything else is its business and is invisible here.
-
-**Correcting an earlier draft of this section**, which said in-flight work
-lives "in the world the `Ctx` carries". That baked a specific backing into
-the engine, which is the opposite of what the seam exists for. The `Ctx`
-carries ACCESS TO A STORE; it does not carry a world.
-
-That collapses the design to one rule - **a stage is a function, and
-everything it touches comes through `Ctx`**:
-
-* reads through `Ctx::observe_read`, so they enter the read-set and
-  invalidation stays precise;
-* in-flight state in `Ctx`, addressed, so a pending poll resumes without
-  a field;
-* writes through the same door, so nothing escapes the log.
-
-Purity stops being a convention and becomes structural: there is nowhere
-else to reach. No captured environment (the type forbids it), no fields
-(there is no struct), and the only handle in scope is the one that logs.
-
-### `PipelineId`: a shape hash plus a serial
-
-Tim, 2026-08-24: *"I think it's a quick hash over the stageids in order,
-along with a serial when the pipeline is constructed via the builder."*
-
-Two halves answering two questions:
-
-* **The hash over the `StageId`s IN ORDER** identifies the pipeline's
-  SHAPE - which stages, in which order. Because a `StageId` is
-  `(name, version)`, a version bump changes the shape hash automatically,
-  so state keyed on a pipeline cannot survive a stage's behaviour
-  changing underneath it. That property is free and worth naming.
-* **The serial, minted by the builder at construction**, distinguishes
-  INSTANCES. Two pipelines of identical shape built separately are
-  different instances - which is exactly the authoring/runtime case: same
-  stages, same shape hash, different serial, different memo stores, and
-  both correct while holding different cached answers.
-
-Keyed state therefore dies with its instance: rebuild the pipeline and the
-serial changes, so nothing leaks across. Same instance and same stage
-resumes. That is the load/unload rule one layer down, and it needs no new
-vocabulary.
-
-**Note the addressing question is separate from the store's backing.** A
-memo store is addressed by a `MemoKey` - stage id plus content keys, a
-CONTENT address. In-flight state is addressed by IDENTITY,
-`(PipelineId, StageId)`. Two different questions over possibly the same
-backing, and an implementation should say which of the two any given
-store answers. That the backing might be one an implementor already has
-(an ECS world, say) is a consumer's convenience and not a fact this crate
-knows.
-
-## What a run answers, and what each answer means
-
-Three result types, at three different scopes. A consumer meets all of
-them, and their meanings are not guessable from their names.
-
-### `EffectPoll<A, E>` - what ONE poll answers
-
-This is what `poll_frame` returns and what a stage's own poll produces.
-
-| variant | meaning |
-|---|---|
-| `Ready(A)` | a value |
-| `Pending` | an upstream effect has not landed; a waker was registered, so expect a wake |
-| `Failed(E)` | the stage's typed error channel |
-
-**Neither `Ready` nor `Failed` is terminal**, and that is the part worth
-saying out loud because it differs from `Result`. A pipeline is a standing
-derivation over inputs that change, so a later poll over changed inputs
-can move `Failed` back to `Ready` - and can move `Ready` to a different
-value. A `Failed` is this poll's answer, not the pipeline's verdict. Only
-`Pending` carries an obligation: the poll that returned it MUST have
-registered a waker, or the value is lost rather than late.
-
-### `DriveError<E>` - how a BLOCKING run ends badly
-
-`run` and its variants return `Result<Output, DriveError<E>>`.
-
-| variant | meaning |
-|---|---|
-| `Failed(E)` | a stage's own typed error, surfaced from its poll |
-| `Stalled` | the graph answered `Pending` with no outstanding work left to run, so re-polling could only answer `Pending` again |
-
-**`Stalled` is not a timeout**, and it means opposite things in the two
-drives - which is the single most useful thing to know about this API.
-Something registered a waker for an input nothing was ever going to land.
-Under a BLOCKING drive that is a bug in the graph: nothing else was coming.
-Under a FRAME drive the identical situation is normal - the frame keeps
-its stand-in and a later user action lands the value. So the same state is
-a defect offline and expected behaviour in an interactive host, and that
-asymmetry is exactly why `run_watched` exists: it lets an offline run
-report the unwakeable polls that a frame drive would silently lose.
-
-### `ChainError<A, B>` - WHICH stage failed
-
-A pipeline of two or more stages returns
-`Result<_, DriveError<ChainError<..>>>`, nesting one `ChainError` per join.
-
-| variant | meaning |
-|---|---|
-| `First(A)` | the first stage failed; the second never ran |
-| `Second(B)` | the first produced a value and the second failed on it |
-
-The types are the answer to "where did this break", so the error channel
-stays typed all the way out rather than collapsing to a string. A
-three-stage pipeline nests them - `ChainError<ChainError<A, B>, C>` - which
-is verbose to name and precise to match on; a consumer usually matches the
-outermost and only destructures further when it must.
-
-### `PendingWork` and `NoPendingWork`
-
-`run` takes something to pump while polls answer `Pending`: that is
-`PendingWork`. `NoPendingWork` is the implementation for a graph of pure
-stages, where nothing can be pumped because nothing is waiting on the
-outside world. `run_pure` is `run` with it supplied.
-
-## What the builder cannot yet express (findings, in priority order)
-
-1. **Tracked state graphs.** `Ledger`/`Tracked`/`TrackedInput` composition -
-   including the load-bearing order "wrap the memo in the tracking, not the
-   tracking in the memo" - is exactly the kind of assembly the builder
-   exists to own, and it is not in the builder yet. Sketch:
-   `.tracked_input(label, value)` and a `stage` variant taking a ledger
-   label, with the builder owning the ledger and the wrap order so the
-   known-bad composition becomes unwritable. Until then the tracked layer
-   stays private and the 45 tests over it stay on internals (the
-   invalidation, cutoff, read-edge, fallback-revalidation and schedule
-   suites in `src/track.rs` and `src/schedule.rs`).
-
-   The exact expression a consumer cannot write today, and its error:
-
-   ```text
-   error[E0432]: unresolved imports `libpipeline::Ledger`, `libpipeline::Memo`,
-                 `libpipeline::Tracked`
-   ```
-
-   **When this finding lands, the wrap order stops being testable, and that
-   is the point.** A builder that owns the order makes
-   `Memo::new(Tracked::new(..), store)` unspellable; a test asserting the
-   order is then asserting about a composition nobody can construct, which
-   is worse than no test because it implies the mistake is still reachable.
-   `Memo`'s known-bad twin
-   `a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach` is
-   therefore scheduled for DELETION with this finding, not migration - it
-   is the record of why the builder owns the order, and the builder will be
-   that record.
-2. **Error boundaries.** `Guarded` placement ("outside the tracking") and
-   the substitution tally are caller assembly today. Sketch:
-   `.guarded_stage(name, version, handler, make)` plus
-   `Pipeline::substitutions()`.
-3. **Non-linear graphs.** The builder builds chains. A diamond (one
-   producer, two consumers, one joiner) exists in the engine via
-   `Arc<S>: Stage` but has no builder spelling.
-4. **Scheduling.** `Ledger::schedule` has no builder-level door; it rides
-   on finding 1.
-5. **Store lifecycle.** `.stage_in` lets a cache outlive a build, but there
-   is no whole-pipeline store policy (a single backend serving every stage
-   needs per-output-type stores; the seam is per-stage on purpose, but a
-   factory hook may be wanted).
-6. **A watched single poll.** `Pipeline::run_watched` reports a
-   `WakeReport` over a whole DRIVE; `Pipeline::poll_frame` is unwatched.
-   Nothing public answers "what did THIS poll leave behind", so `WakePath` -
-   a public type - is named by no public signature, and the six tests that
-   read one are `src/watch.rs`'s. Sketch:
-   `Pipeline::poll_frame_watched(&input) ->
-   (EffectPoll<..>, Option<WakePath>)`.
-7. **The registration-site guarantee protects only what is registered.**
-   The id check runs where a builder call constructs the stage. A crate
-   that authors stages against the port (`libpipelinedata`) but is
-   assembled nowhere carries its versions at its own construction sites,
-   unchecked - the same placement of the version, without the panic behind
-   it. That is a property of the port/adapter split, not a defect in it: a
-   stage-authoring crate deliberately never links this engine, so the
-   guarantee can only exist at an assembly site. The gap closes per
-   consumer, by an assembler existing, not by anything this crate can add.
-8. **Assembling a pipeline takes two manifest edges.** An assembler needs
-   `libpipeline` for the builder and `libpipelinedata` for the vocabulary
-   its closures must name (`Stage`, `StageId`, `MemoKey`, `ContentKey`,
-   `EffectPoll`, `MemoStore`) - the README's every example imports both.
-   This crate could re-export the port so one edge suffices, without
-   weakening the split (stage authors would still depend on the port
-   alone). Deliberately not done in the same wave that wrote the README;
-   recorded here as the open decision it is.
+* **A stage is a pure closure taking `Ctx`, registered as a `fn` pointer**
+  - not `impl Fn` (permits capture), not a trait (permits fields). The
+  type refuses captured state at compile time. There is deliberately no
+  trait-taking variant: a door typed on the trait hands back a struct, and
+  structs accrete fields that move the output without moving the key.
+* **Everything a stage touches comes through `Ctx`**: reads through
+  `Ctx::observe_read` so they enter the read-set; in-flight state between
+  a `Pending` and a `Ready` lives in a store the consumer provides through
+  a trait seam (as `MemoStore` already is), addressed by
+  `(PipelineId, StageId)` - never in a field, and the `Ctx` carries ACCESS
+  TO A STORE, not a world.
+* **`PipelineId` is a shape hash plus a serial**: the hash over the
+  `StageId`s in order identifies the pipeline's shape (a version bump
+  changes it for free); the serial, minted at build, distinguishes
+  instances, so keyed state dies with its instance.
 
 ## The ledger test, measured (a lesson in what a test holds)
 
-`the_ledger_scope_changes_speed_and_not_answers` arrived in this crate
-relocated from a consumer's suite, and finding 1 was recorded as the reason
-it could not be written through the public API. It was re-examined by
-asking, of each of its four assertions, what defect would make it fail. The
-method was mutation: break one thing, run the suite, see who notices.
-
-```rust,ignore
-let ledger = Ledger::new();
-let tracked = Tracked::new(&ledger, "test.pure", Memo::new(Pure::new(), MemoMap::new()));
-let first = offline(&tracked, &input);
-let second = per_frame(&tracked, &input);
-assert_eq!(tracked.stage().stage().runs(), 1);   // 1
-assert_eq!(first, second);                       // 2
-assert_eq!(first, offline(&Pure::new(), &input));// 3
-assert!(!ledger.is_stale(tracked.node()));       // 4
-```
-
-| mutation | subject test | who else notices |
-|---|---|---|
-| `Memo::new(Tracked::new(..), store)` - the KNOWN-BAD order | **passes** | `a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach` |
-| delete the `Tracked` wrapper outright | **passes** | nothing - it was inert |
-| delete `Memo`'s `!revalidating()` gate | **passes** | 2 tests |
-| `revalidating()` true whenever a scope is open | fails (1) | 4 tests, 3 with a real edge |
-| `Tracked` marks stale after a `Ready` poll | fails (4) | 20 tests |
-
-What that establishes:
-
-* **The test contains nothing about the ledger.** Deleting the tracking
-  layer from it changes no assertion, so the `Ledger` in its name and the
-  "scope" in its comment were never observed. Its comment on assertion 1 -
-  "the lookup sits inside the node's scope" - names the wrap order, and the
-  inverted, known-bad order passes all four assertions.
-* **The SPEED half is the memo's, not the ledger's.** With no
-  `TrackedInput` in the test, nothing can go stale, so `revalidating()` is
-  false either way and the scope cannot change a lookup's outcome. Deleting
-  the gate the assertion appeals to leaves the test green.
-* **Assertions 2 and 3 cannot fail here.** `Tracked` returns its inner poll
-  verbatim; the only route by which tracking changes an ANSWER is a stale
-  value served from a store, which needs a tracked input to move.
-* **Assertion 4 is close to tautological** and owned elsewhere:
-  `polling_a_node_clears_its_staleness_and_a_pending_poll_does_not` is the
-  test for it, over a node that was actually stale first.
-* **What the ledger is FOR is tested elsewhere and well** - dependency
-  edges and selective invalidation live in the read-edge, invalidation and
-  cutoff suites. This test was never part of that.
-
-**Outcome: a defect in the TEST, not in the builder** - and the
-reproduction that remains after the empty half is removed DOES build
-through the public door, as
+A test relocated from a consumer's suite
+(`the_ledger_scope_changes_speed_and_not_answers`) was examined by
+mutation - break one thing, run the suite, see who notices - and found to
+observe nothing its name claimed: deleting the tracking layer from it
+changed no assertion, and the known-bad wrap order passed all four. The
+reproduction that remained does build through the public door, as
 `one_memo_serves_both_drivers_and_the_stage_runs_once` in
-`tests/two_drivers_one_graph.rs`. It reuses that file's existing stand-ins,
-so the cost was zero new machinery. It also covers a gap:
-`both_drivers_give_the_same_answer_for_the_same_graph` builds one graph per
-driver, so until then nothing measured ONE store serving both.
+`tests/two_drivers_one_graph.rs`; the empty test was deleted rather than
+parked, and should not return when finding 1 lands. The lesson is the
+method: a test's name and comments claim what it holds; only mutating the
+code under it shows what it observes.
 
-The test is therefore deleted rather than parked, and should not return
-when finding 1 lands. Two independent reasons, either of which is
-sufficient:
+## The subcrate boundary
 
-1. It asserts a property the builder is meant to make UNWRITABLE (the wrap
-   order) - and does not even assert it successfully. A test that survives
-   its own fix by testing the now-unconstructible case implies the mistake
-   is still reachable.
-2. Its consumer-level form should not come back in a consumer's suite
-   either, per "Where a consumer works": a consumer does not assemble the
-   stage graph, so holding the property over a REAL stage from the consumer
-   was never a thing to restore. A stand-in inside this crate is the right
-   shape, not a substitute for one.
+!!! PROPOSED
 
-The general lesson is the method: a test's name and comments claim what it
-holds; only mutating the code under it shows what it observes. A test whose
-every mutation is caught by some OTHER test is not redundant cover - it is
-empty, and its name is misdirection.
+Tim, 2026-08-24: "we should also use a subcrate boundary and explicit
+re-exports where needed moving the internals tests to the subcrate."
 
-## State of the implementation
+Today "public versus internal" is a `pub(crate)` boundary, and the
+measurement it produces is the 71-versus-30 ratio above: 71 tests live in
+`src/` because they reach machinery the public API cannot spell. The
+subcrate boundary redraws the line as a CRATE boundary - unfakeable, and
+it gives the internals what they have never had: an API of their own to be
+integration-tested through.
 
-DONE: `src/builder.rs` (builder, runner, id check at registration,
-intrinsic memoization with owned/given/off stores); the visibility flip
-that made the builder the only door, with every internals-reaching test
-moved into the module that owns the internal it reaches for; the four
-public-API test binaries in `tests/`; the README as the public API's front
-door, its examples running as doctests.
+### The shape
 
-NOT done: findings 1-6 (each one is a test in `src/` that wants to be a
-test in `tests/` - with the correction that finding 1's tests want to move
-outward as INVALIDATION tests, and one of them,
-`a_cache_outside_the_tracking_..`, wants to be deleted instead, because the
-builder will be the thing that holds what it holds); the `Ctx` closure form
-above; the engine-level items under "Not built yet".
+A nested subcrate, `libpipeline/libpipeline-internals/`, on the
+workspace's own precedent: `libpipelinedata-macros` nests inside
+`libpipelinedata` because that subrepo's root IS its crate, and a path
+dependency inside the workspace directory becomes a workspace member on
+its own (`../libpipelinedata/Cargo.toml` records the reasoning). The same
+constraint holds here, so the same shape applies.
+
+### What moves, what stays, what is re-exported
+
+**Moves to `libpipeline-internals`** - the seven machinery modules,
+verbatim, with `pub(crate)` becoming `pub`:
+
+* `src/chain.rs`, `src/memo.rs`, `src/driver.rs`, `src/watch.rs`,
+  `src/boundary.rs`, `src/track.rs`, `src/schedule.rs`.
+
+**Moves with them** - all 71 internals tests, out of `#[cfg(test)]`
+modules and into `libpipeline-internals/tests/`, one file per module,
+changed only in their imports: `src/track.rs`'s four suites
+(`invalidation_marks_dependents`, `an_equal_recompute_stops_at_its_node`,
+`reads_become_edges`, `a_fallback_is_not_a_revalidation`),
+`src/schedule.rs`'s `the_schedule_polls_each_node_once`,
+`src/boundary.rs`'s three (`a_boundary_is_not_a_cacheable_answer`,
+`a_stage_boundary_catches_what_its_stage_raises`,
+`a_build_can_ask_whether_it_stood_on_a_fallback`), and `src/watch.rs`'s
+`tests`. Most of these arrived in `src/` at the visibility flip with docs
+promising they "migrate back out unchanged but for the imports"; this is
+that migration, to the boundary that can actually take them.
+
+**Stays in `libpipeline`** - the facade: `src/lib.rs` and `src/builder.rs`
+(the builder, `Pipeline`, `BuilderStore`, the `checked` id panic), the
+four public test binaries in `tests/`, and the README with its doctests.
+
+**Re-exported, explicitly** - the facade re-exports exactly today's public
+vocabulary from the internals crate: `ChainError`, `DriveError`,
+`PendingWork`, `NoPendingWork`, `WakePath`, `WakeReport` (until the door
+collapse removes the last five). Nothing else: no glob, no module
+re-export, each name a visible decision in `src/lib.rs`.
+
+**Manifests** - `libpipeline-internals` depends on `libeffects` and
+`libpipelinedata` only; `libpipeline` adds the path edge to it.
+`tests/engine_stays_generic.rs` adds `libpipeline-internals` to
+`THE_STACK`; its walk already follows path dependencies transitively, so
+the new crate's manifest is checked without new machinery.
+
+### What it costs, honestly
+
+* **The dead-code arithmetic dies.** Everything `pub` in the internals
+  crate is "used" by definition, so the
+  `#![cfg_attr(not(test), allow(dead_code))]` discipline - the lint armed
+  under test, catching machinery that becomes genuinely unused - is lost
+  with the attributes it justified. The replacement measurements are the
+  facade's explicit re-export list and the internals crate's own test
+  suite; a weaker signal, and named as such.
+* **The boundary is unfakeable but not unreachable.** A consumer could add
+  a manifest edge to `libpipeline-internals` directly. Nothing in this
+  subrepo can police other crates' manifests; the guard is the same one
+  `libpipelinedata-macros` has - the edge is glaring in review, and the
+  internals crate's docs state it is not a supported surface. What the
+  boundary DOES make impossible is the accidental leak: no `pub(crate)`
+  mistake, no test import that quietly widens, can expose machinery
+  through `libpipeline` itself.
+* **Two crates to compile and version instead of one**, one more manifest
+  in the generic-stack allowlist, and cross-module doc links inside the
+  internals stay intact while the facade's links to them become
+  cross-crate paths.
+* **The measurement moves rather than disappears.** The 71 tests become
+  integration tests - of the INTERNALS crate. The count of tests in
+  `libpipeline/tests/` remains the measurement of the public API's reach,
+  and finding-driven migration outward still means facade tests. The
+  ratio stops being "tests that admit defeat in `src/`" and becomes
+  "internals coverage versus public coverage", which is what it always
+  measured, now enforced by the compiler.
+
+## Verdict: migrate, do not rewrite
+
+The judgement was asked for plainly, so here it is plainly: MIGRATE. The
+crate should not be rewritten, because the distance from what exists to
+what is proposed is almost entirely in the facade, and the facade is the
+smallest part of the crate.
+
+The evidence, weighed:
+
+* **The one door is a thin total mapping over machinery that exists.**
+  `run` is the version gate (new: one `Mutex<Option<V>>` and one
+  comparison) plus `FrameDriver::poll_frame` (exists, `src/driver.rs`)
+  plus a four-arm match from `EffectPoll` to `Run` (new: one enum). The
+  blocking drive it displaces becomes a documented caller loop whose
+  reference semantics - `run_to_completion` and its watched and counted
+  forms - stay as internals with their tests. No engine semantics change.
+* **The four doors are facade, not engine.** The doors and their
+  vocabulary re-exports total well under a hundred lines of
+  `src/builder.rs` and `src/lib.rs`. Deleting doors is not a
+  rewrite-scale event.
+* **The 71 internals tests survive by motion, not reconstruction.** Their
+  own module docs already promise an outward migration "unchanged but for
+  the imports"; the subcrate split is that migration. A rewrite would
+  forfeit 2,831 lines of tracked-layer implementation and its 45 tests
+  (`src/track.rs`, `src/schedule.rs`) - machinery the new definition does
+  not even touch - to arrive back at the same `Stage` contract.
+* **What genuinely must be rewritten is bounded and identified**: the 30
+  public tests and the README's 6 doctests, which speak the four-door
+  vocabulary; the two-drivers file translates property-for-property into
+  one-door-two-patterns form (its central claims - same answers, memo
+  shared, wake obligations - are door-independent).
+* **The version parameter threads as a type parameter, not a rewrite.**
+  `Pipeline<S>` becomes `Pipeline<V, S>`; the builder's chaining types are
+  untouched until `build`.
+
+What would have tipped it the other way, and did not: if the outcome type
+had needed the engine to distinguish `Computed` from `Unchanged` per
+stage, the memo/track layers would have needed a new result channel
+throughout - but the gate is at the root, and the engine below it already
+answers everything the mapping needs.
+
+## Migration plan
+
+(This heading deliberately restores a section name that five source
+comments still cite - the `#![cfg_attr(not(test), allow(dead_code))]`
+notes in `src/boundary.rs`, `src/chain.rs`, `src/memo.rs`,
+`src/schedule.rs` and `src/track.rs` refer to "`DESIGN.md`, 'Migration
+plan'" - a citation left dead by an earlier revision of this document.
+Dead citations mark real defects; this one is closed by the section
+existing again.)
+
+Ordered steps. Each step leaves `cargo test` green; the counts named are
+the gates.
+
+**Step 1 - the subcrate split (motion only).**
+Create `libpipeline-internals/` (manifest: `libeffects`,
+`libpipelinedata` path deps; same license and edition). Move
+`src/{chain,memo,driver,watch,boundary,track,schedule}.rs` into its
+`src/`, flipping `pub(crate)` to `pub` and deleting the five
+`#![cfg_attr(not(test), allow(dead_code))]` attributes. Move the nine
+`#[cfg(test)]` modules listed under "The subcrate boundary" to
+`libpipeline-internals/tests/`, imports only. Facade `src/builder.rs`
+imports `Chain`, `Memo`, `FrameDriver`, `run_to_completion`,
+`run_to_completion_watched` from the internals crate; `src/lib.rs`
+re-exports `ChainError`, `DriveError`, `NoPendingWork`, `PendingWork`,
+`WakePath`, `WakeReport` from it explicitly. Add `libpipeline-internals`
+to `THE_STACK` in `tests/engine_stays_generic.rs`.
+*Gate*: facade 30 tests + 6 doctests; internals 71 tests; zero test
+bodies changed; `builder_is_the_only_door.rs` unchanged and green.
+
+**Step 2 - the outcome and the one door (the flip).**
+In `src/builder.rs`: add `Run<Output, Error>` (exported from
+`src/lib.rs`); give `Pipeline` the `V: Copy + Eq` parameter and the
+`last: Mutex<Option<V>>` field; implement `run(&self, version, &input)`
+as gate + `poll_frame` + mapping, recording the version only on `Ready`.
+Delete `run`, `run_pure`, `run_watched`, `poll_frame` (the door, not the
+internals they call); keep `take_stale` and `waker`. Drop the
+`DriveError`/`PendingWork`/`NoPendingWork`/`WakePath`/`WakeReport`
+re-exports from `src/lib.rs`; keep `ChainError`. Port the public tests:
+`tests/builder_is_the_only_door.rs` re-spells its 8 tests through the one
+door (pure graphs answer `Computed` first run, `Unchanged` second - which
+finally lets the public suite assert the memo's headline directly);
+`tests/two_drivers_one_graph.rs` becomes
+`tests/one_door_two_patterns.rs`, its 12 properties translated (blocking
+loop and wake-wait patterns, same answers, one memo, the
+lost-not-late wake test spelled as `take_stale` staying false);
+`tests/an_unwakeable_poll_is_visible_offline.rs` moves to
+`libpipeline-internals/tests/` against `run_to_completion_watched`,
+unchanged but for imports. Rewrite the README's examples (the doctests
+are the gate). Sweep `libpipeline-internals` for citations of renamed
+public tests and update them.
+*Gate*: full suite green; `grep -rn "run_pure\|run_watched\|poll_frame\|PendingWork\|DriveError"`
+finds nothing in facade `src/` public items or `tests/`; every test name
+cited from internals docs exists (`grep` each cited name); ASCII check on
+everything rendered or exported.
+
+**Step 3 - Delayed keeps its promise.**
+In the facade's `run`, on the `Pending` path under
+`#[cfg(debug_assertions)]`, poll through
+`libpipeline_internals::poll_watched` and panic on `WakePath::Missing`
+with the lost-not-late diagnosis. Add a facade test
+(`#[cfg(debug_assertions)]`, `#[should_panic]`) driving a stage that
+forgets its waker.
+*Gate*: full suite green in debug and `--release`.
+
+**Step 4 - the document catches up.**
+Flip this document's landed sections from `!!! PROPOSED` to unmarked
+present tense, section by section as each step lands (part of each step's
+review, listed once here so it is nobody's afterthought). Update "What
+exists today" and the findings' status lines; retire the four-door
+description into git history.
+
+Deliberately NOT in this plan: wiring the tracked layer (finding 1),
+boundaries (finding 2), non-linear graphs (finding 3), the `Ctx` stage
+shape, and `PipelineId`. Each becomes strictly easier after the split -
+they are builder spellings over an internals crate that now has a public
+API to compose - and none of them blocks, or is blocked by, the one door.
