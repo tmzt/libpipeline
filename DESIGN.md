@@ -201,53 +201,71 @@ builder becomes the caller.
 ## The intended stage shape: a function, with everything through Ctx (PROPOSED)
 
 None of this section is built. It is the shape the API is heading for,
-recorded so the next wave does not re-derive it and so the trait-taking
-doors are not widened by habit first.
+recorded so the next wave does not re-derive it - and so that the
+trait-taking door the builder has TODAY (`stage`/`stage_in`, taking
+`S: Stage`) is understood as the thing being replaced rather than as the
+general case with a convenience beside it.
 
-### A stage is a FUNCTION, and Rust can enforce that
+### A stage is a PURE CLOSURE taking `Ctx`. There is no other form.
 
-The default registration door takes a `fn` pointer, not `impl Fn` and not
-a trait object:
+The registration door takes a `fn` pointer - not `impl Fn`, not a trait:
 
 ```
 stage_fn(name, version, f: fn(&I, &mut Ctx) -> O)
 ```
 
 A non-capturing closure coerces to `fn`; a capturing one does not. So the
-type REFUSES captured state at compile time - no lint, no convention, no
+TYPE refuses captured state at compile time - no lint, no convention, no
 review. `impl Fn` would permit capture and a trait would permit fields;
 `fn` permits neither.
 
-Two forms, split by what they are for:
+**There is no trait-taking variant, and that is the decision rather than
+an omission.** Tim, 2026-08-24: *"we just dismissed the trait variant as
+something that grows local state we don't want. the pipeline has pure
+closures as stages taking cx: Ctx."*
 
-| form | holds | keyed by | for |
-|---|---|---|---|
-| `stage_fn(name, version, fn)` | nothing, provably | `StageId` alone | wrappers - a `Component` expansion, most steps |
-| `stage(name, version, make)` | per-build config | `StageId` + a `ContentKey` of that config | the minority, e.g. `ExpandStage`'s `environment` |
+An earlier draft of this section kept a second door for stages with
+"genuine per-build config", citing `ExpandStage`'s `environment` field - a
+`ContentKey` over the registry and prototypes, computed once at
+construction and folded into every memo key. That was preserving an
+existing shape rather than following the design through.
 
-**Losing the content key on the first form is the POINT, not a cost.** A
-stage with no captured state has exactly one input; if the source's
-version already covers it, hashing it is paying `O(input)` to discover
-what the write path recorded. Those stages belong at the cheapest tier of
-invalidation, which is where measurement already put them.
+**A resource a stage reads comes through `Ctx`, and the read-set covers
+it.** The registry and the prototypes are things the expansion READS.
+Reaching them through `cx` puts them in the read log
+(`Ctx::observe_read`), which is strictly better than the field:
 
-### Why the trait-taking door must not become the default
+* nothing is hashed at construction, so a stage that never consults the
+  registry on a given run does not carry it in that run's read-set;
+* the set is re-addressed per run rather than frozen when the stage was
+  built, which closes the staleness the field's own doc had to assume away
+  (the registry cannot change mid-build TODAY, and the field is only
+  correct because of that);
+* and the operand stops being something an author must remember to fold
+  into `memo_key` - the door that logs it is the only door there is.
 
-Tim, 2026-08-24: *"if we did have an add_tracked_stage taking the full
-trait that might cause problems later on with local state getting added to
-the structs."*
+The manual key operand existed because there was a struct to hang it on.
+Remove the struct and the reason goes with it.
 
-A door typed on the trait hands back a struct, and structs accrete: today
-`{ id }`, later `{ id, cache, last_seen, config }`, each new field a
-candidate input that moves the output without moving the key, and none of
-it arriving as a visible decision. An exhaustive destructure in
-`memo_key` catches that only if someone remembers to write it that way. A
-`fn`-typed door makes the field IMPOSSIBLE rather than reviewable, which
-is the difference this crate keeps choosing.
+**What a stage is keyed by, then**: its `StageId` - name and version, the
+version declared at the registration call site - plus whatever its run
+actually read, as the read-set records it. No `ContentKey` computed over a
+whole input to discover what the source's version already says, and no
+per-stage decision about which fields belong in the key, because there are
+no fields.
 
-So when a tracked variant lands (finding 1), `tracked_stage_fn` comes
-first and the trait-taking form exists only where per-build config
-genuinely does.
+**This binds every door that comes later, including the tracked one.**
+When finding 1 lands it is a CLOSURE form - a tracked registration taking
+`fn`, with the builder owning the ledger and the wrap order. Tim,
+2026-08-24, on the alternative: *"if we did have an add_tracked_stage
+taking the full trait that might cause problems later on with local state
+getting added to the structs."* A door typed on the trait hands back a
+struct, and structs accrete: today `{ id }`, later
+`{ id, cache, last_seen, config }`, each field a candidate input that
+moves the output without moving the key, none of it arriving as a visible
+decision. The point of the `fn` door is that the field is IMPOSSIBLE
+rather than reviewable, and a second door typed on the trait would give
+that back for whichever stage was written through it.
 
 ### In-flight state lives in `Ctx`, addressed - not in a field
 
