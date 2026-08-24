@@ -257,12 +257,26 @@ looks like a field.
 
 It is not. Tim, 2026-08-24: *"it feels more like that's the role of
 ctx/cx, and we already have the concept with ecs keyed on widget (in this
-case, stageid and pipelineid)."* The precedent is in
-`libpipelinedata`: `EcsMemoStore` keeps values in a `SharedWorld` and
-holds only the address, with its address map private so *"every entity
-named here is one this store put there"*. The same shape one level over:
-a stage's in-flight work lives in the world the `Ctx` carries, addressed
-by `(PipelineId, StageId)`.
+case, stageid and pipelineid)."*
+
+The addressing pattern is the one to copy: state lives in a store and the
+thing using it holds only an ADDRESS - `(PipelineId, StageId)` here, where
+a widget id serves the same role in the consumer's world. What is NOT
+copied is the backing. Tim, same date: *"MemoStore is a trait we provide
+to the builder, the ecs is not libpipeline's concern."*
+
+So the store is a SEAM, not a structure this crate owns. `MemoStore`
+(`libpipelinedata`'s `src/store.rs`) is already exactly that - a trait,
+with `stage_in` on the builder taking a caller-provided implementation -
+and in-flight state should reach the `Ctx` the same way: through a
+trait the consumer satisfies, addressed by `(PipelineId, StageId)`.
+Whether a consumer backs it with an ECS, a map, or anything else is its
+business and is invisible here.
+
+**Correcting an earlier draft of this section**, which said in-flight work
+lives "in the world the `Ctx` carries". That baked an ECS into the
+engine, which is the opposite of what the seam exists for. The `Ctx`
+carries ACCESS TO A STORE; it does not carry a world.
 
 That collapses the design to one rule - **a stage is a function, and
 everything it touches comes through `Ctx`**:
@@ -300,11 +314,14 @@ serial changes, so nothing leaks across. Same instance and same stage
 resumes. That is the load/unload rule one layer down, and it needs no new
 vocabulary.
 
-**Note the addressing differs from `EcsMemoStore`'s deliberately.** That
-store addresses by CONTENT hash; this one addresses by IDENTITY. Same
-world, same borrow discipline, different question - so it is a sibling of
-that store rather than a reuse of it, and any implementation should say
-which of the two a given store is.
+**Note the addressing question is separate from the store's backing.** A
+memo store is addressed by a `MemoKey` - stage id plus content keys, a
+CONTENT address. In-flight state is addressed by IDENTITY,
+`(PipelineId, StageId)`. Two different questions over possibly the same
+backing, and an implementation should say which of the two any given
+store answers. That the backing might be one an implementor already has
+(an ECS world, say) is a consumer's convenience and not a fact this crate
+knows.
 
 ## What the builder cannot yet express (findings, in priority order)
 
