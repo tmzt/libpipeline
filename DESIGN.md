@@ -10,9 +10,12 @@ and remember its answers.
 ## How to read this
 
 A section that describes code which DOES NOT EXIST carries a marker on a
-line of its own, directly beneath the heading:
+line of its own, directly beneath the heading, exactly as written here and
+with no leading whitespace:
 
-    !!! PROPOSED
+```
+!!! PROPOSED
+```
 
 The marker scopes to that entire section, subsections included. Everything
 not so marked describes the crate as it is today.
