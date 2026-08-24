@@ -533,6 +533,58 @@ fn the_memo_serves_the_second_poll_without_re_running_the_stage() {
 }
 
 #[test]
+fn one_memo_serves_both_drivers_and_the_stage_runs_once() {
+    // The two drives of section 5 over ONE registered stage, which
+    // `both_drivers_give_the_same_answer_for_the_same_graph` does not cover: it
+    // builds a graph per driver, so each has its own store and neither hits on
+    // the other's work. Here the offline drive fills the store and the frame
+    // drive is served by it - "a CLI run against an unchanged tree is all cache
+    // hits, because the memo keys are the same ones the IDE used" (section 5),
+    // measured rather than asserted about.
+    //
+    // **This is the public-API expression of what `src/track.rs`'s
+    // `the_ledger_scope_changes_speed_and_not_answers` measured** (DESIGN.md,
+    // finding 1's note). That test wrapped the same shape in a `Ledger` scope
+    // over a stage that read no tracked state, and mutation testing showed the
+    // scope was inert in it: the known-bad `Memo::new(Tracked::new(..), ..)`
+    // order passed it, and so did deleting the tracking outright. What it
+    // actually held is below, and the builder can say all of it.
+    let input = Source("props.title");
+    let runs = Runs::default();
+    let stage = lowering(runs.clone(), true);
+
+    let first = stage.run_pure(&input).expect("a pure stage answers");
+    let second = stage
+        .poll_frame(&input)
+        .ready()
+        .expect("a pure stage answers on the first poll");
+    assert!(
+        !stage.take_stale(),
+        "the stage answered without waiting, so nothing should have asked for a \
+         redraw",
+    );
+
+    assert_eq!(
+        runs.get(),
+        1,
+        "the frame drive was served by what the offline drive recorded - one \
+         store, one key, either driver",
+    );
+    assert_eq!(first, second, "and the driver must not change what a stage answers");
+
+    // The control run: same answer with every store off. A pipeline whose
+    // ANSWERS move when the cache is removed has a bug the cache was hiding.
+    let control_runs = Runs::default();
+    let control = lowering(control_runs.clone(), false);
+    assert_eq!(
+        control.run_pure(&input).expect("a pure stage answers"),
+        first,
+        "nor may the memo differ from what the uncached stage says",
+    );
+    assert_eq!(control_runs.get(), 1, "the control ran, rather than hitting");
+}
+
+#[test]
 fn the_memo_changes_speed_and_not_answers() {
     // `uncached` is the control case (DESIGN.md): if the answers move when the
     // cache is removed, the cache was part of the semantics.

@@ -115,6 +115,34 @@ exported as that report's vocabulary. The tests that read a per-poll path are
 `poll_watched`'s, and they are unit tests in `src/watch.rs` for exactly that
 reason - see finding 6.
 
+### Where a consumer works, and what it may never name
+
+**A consumer of this crate implements `Stage` and assembles nothing.** `Stage`
+and its contract types live in `libpipelinedata`, which exists precisely so a
+consumer can DECLARE a step - an id, a version, an input, an output, a memo key
+- without linking the engine that runs it. That crate's own module doc says so:
+"the pipeline's traits and types: the stage contract, the key types and the
+storage seam", with `Stage` as "one step of a lowering pipeline". It is the
+port; this crate is the implementation behind it.
+
+Everything on the composition side - `Tracked`, `Memo`, `Chain`, the ledger,
+the drivers - belongs to whoever LINKS the engine, and reaches a consumer's
+stage only by that assembler registering it. A consumer that names
+`Tracked::new(&ledger, label, Memo::new(stage, store))` is not merely reaching
+past the builder; it is working at a layer it has no business at, and under the
+correct split it cannot spell those types at all, since it does not depend on
+this crate. That is the rule, and it is what makes the ledger test's old home
+in `highbay_data` wrong independently of whether the test itself was any good:
+
+* A consumer-level test that hand-composes the stage graph is testing the wrong
+  LAYER, whether or not it passes.
+* The remedy is never to re-export a type so such a test compiles. If a
+  consumer-level property is genuinely wanted, it is expressible through the
+  builder or it is a finding here.
+* Where such a property is held over a stand-in stage inside this crate, that
+  is the RIGHT shape rather than a lesser substitute for the real stage: the
+  engine is generic, so a stand-in exercises exactly what a real stage would.
+
 ### What tests may touch
 
 Only the above. A test that needs anything from the internals section is a
@@ -122,9 +150,11 @@ FINDING that the builder cannot express something a consumer will need; record
 it here, do not re-export.
 
 **Which makes the count of tests in `tests/` the measurement.** It is what the
-public API can reach: 29 tests in 4 binaries as of the flip, against 72 unit
-tests in `src/` that admit it cannot. When a finding closes, its tests migrate
-OUTWARD and that first number goes up. A test moved inward is placed in the
+public API can reach: **30 tests in 4 binaries** (29 at the flip), against **71
+unit tests** in `src/` that admit it cannot. When a finding closes, its tests
+migrate OUTWARD and that first number goes up. The first such migration was not
+a finding closing but a test being measured and found empty - see "The ledger
+test, measured" below. A test moved inward is placed in the
 MODULE THAT OWNS THE INTERNAL it reaches for - not in one collecting `mod
 tests` at the crate root - so it moves with that module when the module is
 reshaped, and so that reaching an internal stays local and visible rather than
@@ -176,8 +206,27 @@ builder becomes the caller.
    to own, and it is not in the builder yet. Sketch: `.tracked_input(label,
    value)` and a `stage` variant taking a ledger label, with the builder
    owning the ledger and the wrap order so the known-bad composition becomes
-   unwritable. Until then `Ledger` et al stay exported and the five tests
-   over them stay on internals.
+   unwritable. Until then the tracked layer stays private and the 45 tests
+   over it stay on internals (`invalidation_marks_dependents`,
+   `an_equal_recompute_stops_at_its_node`, `reads_become_edges`,
+   `a_fallback_is_not_a_revalidation`, `the_schedule_polls_each_node_once`).
+
+   The exact expression a consumer cannot write today, and its error:
+
+   ```text
+   error[E0432]: unresolved imports `libpipeline::Ledger`, `libpipeline::Memo`,
+                 `libpipeline::Tracked`
+   ```
+
+   **When this finding lands, the wrap order stops being testable, and that is
+   the point.** A builder that owns the order makes `Memo::new(Tracked::new(..),
+   store)` unspellable; a test asserting the order is then asserting about a
+   composition nobody can construct, which is worse than no test because it
+   implies the mistake is still reachable. `Memo`'s known-bad twin
+   `a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach` is
+   therefore scheduled for DELETION with this finding, not migration - it is
+   the record of why the builder owns the order, and the builder will be that
+   record.
 2. **Error boundaries.** `Guarded` placement ("outside the tracking") and the
    substitution tally are caller assembly today. Sketch: `.guarded_stage(name,
    version, handler, make)` plus `Pipeline::substitutions()`.
@@ -196,16 +245,25 @@ builder becomes the caller.
    is named by no public signature, and the six tests that read one are
    `src/watch.rs`'s. Sketch: `Pipeline::poll_frame_watched(&input) ->
    (EffectPoll<..>, Option<WakePath>)`.
-7. **A consumer's stage cannot be registered from the crate that declares it.**
-   `highbay_elements` deliberately does not link `libpipeline`, in
-   dependencies OR dev-dependencies (its `Cargo.toml` states the rule and the
-   reason). So `ExpandStage` and `ExpandDefinitionStage` have no
-   `PipelineBuilder::stage` call site anywhere in the workspace, and their
-   tests construct them with `StageId::new(NAME, version)` at the call site
-   instead - the same shape and the same placement of the version, without the
-   builder's registration check behind it. Not a defect in the builder; a note
-   that "the version lives at the registration site" is only as strong as
-   there BEING one.
+7. **Nothing in the workspace assembles a pipeline from two of the three
+   stages.** `ExpandStage` and `ExpandDefinitionStage` have no
+   `PipelineBuilder::stage` call site anywhere, so their tests construct them
+   with `StageId::new(NAME, version)` at the call site instead - the same shape
+   and the same placement of the version, without the builder's registration
+   check behind it. The version-at-the-registration-site guarantee is
+   unenforced for them until an assembler exists.
+
+   **The crate boundary is CORRECT and is not what this finding names.**
+   `highbay_elements` links `libpipelinedata` and deliberately never
+   `libpipeline`, stating the rule in its own manifest ("NO engine -
+   `libpipeline` is deliberately not named here, and a stage that needed it
+   would be evidence the data/engine cut is in the wrong place"). That is the
+   port/adapter split working as designed, per "Where a consumer works" above:
+   the consumer declares its stage against the port and does not assemble.
+   A reader who takes this finding as "the boundary is wrong" will fix it by
+   adding the dependency edge that crate refuses on purpose. The gap is in what
+   has been BUILT - an assembly site on the authoring side - not in how the
+   crates are split.
 
 ## Migration plan and test disposition
 
@@ -252,11 +310,83 @@ relocated in from a consumer), and no assertion dropped:
   `a_build_can_ask_whether_it_stood_on_a_fallback.rs` (7) - MOVED to
   `src/boundary.rs` (finding 2).
 * `the_ledger_scope_changes_speed_and_not_answers` (1) - RELOCATED IN from
-  `highbay_data`'s `tests/assemble_under_the_driver.rs`, into `src/track.rs`.
-  It composed `Tracked::new(&ledger, label, Memo::new(stage, store))` by hand,
-  which finding 1 makes unwritable from a consumer. The property is held here
-  over a stand-in; what is parked is holding it over a REAL stage, and the
-  consumer file carries a note saying so.
+  `highbay_data`'s `tests/assemble_under_the_driver.rs`, into `src/track.rs`,
+  and RETIRED on 2026-08-24 after being measured. See "The ledger test,
+  measured" below: the ledger scope was inert in it, and what it actually held
+  is now `tests/two_drivers_one_graph.rs`'s
+  `one_memo_serves_both_drivers_and_the_stage_runs_once`, through the public
+  builder. Net test count unchanged at 101; the split moved one test outward
+  (30 in `tests/`, 71 in `src/`).
+
+## The ledger test, measured (2026-08-24)
+
+`the_ledger_scope_changes_speed_and_not_answers` was the one test the flip
+relocated INTO this crate rather than moving between directories, and finding 1
+was recorded as the reason it could not be written through the public API. It
+was re-examined by asking, of each of its four assertions, what defect would
+make it fail. The method was mutation: break one thing, run the suite, see who
+notices.
+
+```rust
+let ledger = Ledger::new();
+let tracked = Tracked::new(&ledger, "test.pure", Memo::new(Pure::new(), MemoMap::new()));
+let first = offline(&tracked, &input);
+let second = per_frame(&tracked, &input);
+assert_eq!(tracked.stage().stage().runs(), 1);   // 1
+assert_eq!(first, second);                       // 2
+assert_eq!(first, offline(&Pure::new(), &input));// 3
+assert!(!ledger.is_stale(tracked.node()));       // 4
+```
+
+| mutation | subject test | who else notices |
+|---|---|---|
+| `Memo::new(Tracked::new(..), store)` - the KNOWN-BAD order | **passes** | `a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach` |
+| delete the `Tracked` wrapper outright | **passes** | nothing - it was inert |
+| delete `Memo`'s `!revalidating()` gate | **passes** | 2 tests |
+| `revalidating()` true whenever a scope is open | fails (1) | 4 tests, 3 with a real edge |
+| `Tracked` marks stale after a `Ready` poll | fails (4) | 20 tests |
+
+What that establishes:
+
+* **The test contains nothing about the ledger.** Deleting the tracking layer
+  from it changes no assertion, so the `Ledger` in its name and the "scope" in
+  its comment were never observed. Its comment on assertion 1 - "the lookup
+  sits inside the node's scope" - names the wrap order, and the inverted,
+  known-bad order passes all four assertions.
+* **The SPEED half is the memo's, not the ledger's.** With no `TrackedInput` in
+  the test, nothing can go stale, so `revalidating()` is false either way and
+  the scope cannot change a lookup's outcome. Deleting the gate the assertion
+  appeals to leaves the test green.
+* **Assertions 2 and 3 cannot fail here.** `Tracked` returns its inner poll
+  verbatim; the only route by which tracking changes an ANSWER is a stale value
+  served from a store, which needs a tracked input to move.
+* **Assertion 4 is close to tautological** and owned elsewhere:
+  `polling_a_node_clears_its_staleness_and_a_pending_poll_does_not` is the test
+  for it, over a node that was actually stale first.
+* **What the ledger is FOR is tested elsewhere and well** - dependency edges and
+  selective invalidation live in `reads_become_edges`,
+  `invalidation_marks_dependents` and `an_equal_recompute_stops_at_its_node`.
+  This test was never part of that.
+
+**Outcome: a defect in the TEST, not in the builder** - and the reproduction
+that remains after the empty half is removed DOES build through the public
+door, as `one_memo_serves_both_drivers_and_the_stage_runs_once`. It reuses the
+file's existing stand-ins, so the cost was zero new machinery. It also covers a
+gap: `both_drivers_give_the_same_answer_for_the_same_graph` builds one graph per
+driver, so until now nothing measured ONE store serving both.
+
+The test is therefore deleted rather than parked, and should not return when
+finding 1 lands. Two independent reasons, either of which is sufficient:
+
+1. It asserts a property the builder is meant to make UNWRITABLE (the wrap
+   order) - and does not even assert it successfully. A test that survives its
+   own fix by testing the now-unconstructible case implies the mistake is still
+   reachable.
+2. Its consumer-level form should not come back to `highbay_data` either, per
+   "Where a consumer works": a consumer does not assemble the stage graph, so
+   the "parked half" the flip recorded - holding the property over a REAL stage
+   from the consumer - was never a thing to restore. A stand-in inside this
+   crate is the right shape, not a substitute for one.
 
 ## State of the implementation
 
@@ -266,4 +396,9 @@ the CONSUMER CONVERSION and the VISIBILITY FLIP, with every internals-reaching
 test moved into the module that owns the internal it reaches for.
 
 NOT done: findings 1-7. Each one is a test in `src/` that wants to be a test in
-`tests/`.
+`tests/` - with the correction that finding 1's tests want to move outward as
+INVALIDATION tests, and one of them (`a_cache_outside_the_tracking_..`) wants to
+be deleted instead, because the builder will be the thing that holds what it
+holds. `the_ledger_scope_changes_speed_and_not_answers` was never evidence for
+finding 1 and is gone; the finding stands on the 45 tests that do exercise a
+ledger.
