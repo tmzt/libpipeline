@@ -1,10 +1,23 @@
 //! Memoization (`PIPELINE_PLAN.md` §3).
 
+// **Dead in the shipped library, alive in the test build - and that is the
+// flip's honest arithmetic rather than an oversight.**
+//
+// With the flat exports gone (`DESIGN.md`, "Migration plan") nothing outside
+// this crate can name what is below, and the builder has no spelling for it
+// yet, so the only callers are this module's own `#[cfg(test)]` tests. The
+// allow is `not(test)` ON PURPOSE: under `cargo test` the lint stays fully
+// armed, so code that becomes genuinely unused still fails the gate. It comes
+// off the day the builder grows the spelling the findings name, because the
+// builder will then be the caller.
+#![cfg_attr(not(test), allow(dead_code))]
+
+
 use std::task::Context;
 
 use libpipelinedata::{EffectPoll, MemoKey, MemoStore, Stage, StageId};
 
-use crate::revalidating;
+use crate::track::revalidating;
 
 /// A stage with a memo in front of it.
 ///
@@ -17,7 +30,7 @@ use crate::revalidating;
 /// **The ledger outranks the store.** A key built from the input describes the
 /// stage's ARGUMENTS; a stage that also reads tracked state has an ambient input
 /// no such key can see, and a store consulted on the key alone will answer with
-/// a value [`Ledger`](crate::Ledger) has already marked stale. So the lookup is
+/// a value [`Ledger`](crate::track::Ledger) has already marked stale. So the lookup is
 /// skipped entirely while [`revalidating`] is true - while this poll is running
 /// inside the scope of a node the ledger ruled out - and the stage runs, which
 /// is what a poll of a stale node is FOR.
@@ -65,7 +78,7 @@ use crate::revalidating;
 ///   **The exclusion is defeatable from outside**, and by the one construct
 ///   §7 adds: an error boundary turns that `Failed` into a `Ready`, so a memo
 ///   above one is offered a fallback with the exclusion already spent. That is
-///   why [`Guarded`](crate::Guarded) - the stage-level boundary - answers
+///   why [`Guarded`](crate::boundary::Guarded) - the stage-level boundary - answers
 ///   `memo_key -> None`, and why the composition rule it states matters even
 ///   though breaking it now costs only speed.
 /// * An input the stage refuses to key (`memo_key` says `None`) is neither
@@ -77,24 +90,24 @@ use crate::revalidating;
 /// This type is `libpipeline`'s and not `libpipelinedata`'s because it is
 /// machinery: a crate that only implements a stage should not link it
 /// (`PIPELINE_PLAN.md`:517-531).
-pub struct Memo<S, St> {
+pub(crate) struct Memo<S, St> {
     stage: S,
     store: St,
 }
 
 impl<S, St> Memo<S, St> {
     /// Put `store` in front of `stage`.
-    pub fn new(stage: S, store: St) -> Self {
+    pub(crate) fn new(stage: S, store: St) -> Self {
         Self { stage, store }
     }
 
     /// The stage behind the memo.
-    pub fn stage(&self) -> &S {
+    pub(crate) fn stage(&self) -> &S {
         &self.stage
     }
 
     /// The store behind the memo.
-    pub fn store(&self) -> &St {
+    pub(crate) fn store(&self) -> &St {
         &self.store
     }
 }

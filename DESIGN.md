@@ -1,6 +1,7 @@
 # libpipeline: the builder is the only door
 
-Status: design landed 2026-08-24; implementation partial (see "State of the
+Status: design landed 2026-08-24; **the flip landed 2026-08-24** - the flat
+exports are gone and the builder is the only door (see "State of the
 implementation" at the bottom). This document separates the DESIRED PUBLIC API
 from the INTERNALS on purpose: the public section is the contract consumers
 and tests are allowed to touch; everything in the internals section is
@@ -107,13 +108,37 @@ modes of PIPELINE_PLAN.md section 5 - same graph, same keys:
   such graphs - is internal.)
 * **`WakePath` / `WakeReport`** - the watched drive's findings.
 
+`WakePath` is the one item on that list no public signature names, and it is
+worth saying so rather than letting a reader assume otherwise: the runner's
+watched door is `run_watched`, which reports a `WakeReport` (counts). It stays
+exported as that report's vocabulary. The tests that read a per-poll path are
+`poll_watched`'s, and they are unit tests in `src/watch.rs` for exactly that
+reason - see finding 6.
+
 ### What tests may touch
 
 Only the above. A test that needs anything from the internals section is a
 FINDING that the builder cannot express something a consumer will need; record
 it here, do not re-export.
 
+**Which makes the count of tests in `tests/` the measurement.** It is what the
+public API can reach: 29 tests in 4 binaries as of the flip, against 72 unit
+tests in `src/` that admit it cannot. When a finding closes, its tests migrate
+OUTWARD and that first number goes up. A test moved inward is placed in the
+MODULE THAT OWNS THE INTERNAL it reaches for - not in one collecting `mod
+tests` at the crate root - so it moves with that module when the module is
+reshaped, and so that reaching an internal stays local and visible rather than
+having a sanctioned home.
+
 ## Internals (assembled by the builder, never exported)
+
+All of the below is `pub(crate)` as of the flip. `boundary.rs`, `schedule.rs`,
+`track.rs`, `chain.rs` and `memo.rs` each carry
+`#![cfg_attr(not(test), allow(dead_code))]`: with the exports gone, the parts
+the builder has no spelling for have no caller but their own tests, and the
+`not(test)` form keeps the lint fully armed under `cargo test` so anything that
+becomes genuinely unused still fails the gate. The allow comes off when the
+builder becomes the caller.
 
 * **`Chain`** (`src/chain.rs`) - two stages composed, itself a `Stage`. The
   builder nests these; the composite id is a fixed internal `StageId` because
@@ -132,10 +157,16 @@ it here, do not re-export.
   each stage: owned map / caller-given / off (the `.uncached()` control).
 * **The tracked layer** (`src/track.rs`: `Ledger`, `Tracked`, `TrackedInput`,
   `Backdated`, `NodeId`, `revalidating`) and **`Schedule`/`Cycle`**
-  (`src/schedule.rs`) - internal IN INTENT, but still exported today because
-  the builder cannot yet express them (see findings).
+  (`src/schedule.rs`) - internal, and now private, even though the builder
+  cannot yet express them (findings 1 and 4). The flip was not held hostage to
+  the findings: the tests over these layers moved into `src/track.rs` and
+  `src/schedule.rs` instead.
 * **`Guarded`/`Substitutions`/`run_to_completion_counted`**
-  (`src/boundary.rs`) - same status as the tracked layer.
+  (`src/boundary.rs`) - same, with their tests in `src/boundary.rs`
+  (finding 2).
+* **`poll_watched`** (`src/watch.rs`) - the watched SINGLE poll. `run_watched`
+  is the public watched drive; there is no public single-poll counterpart
+  (finding 6).
 
 ## What the builder cannot yet express (findings, in priority order)
 
@@ -159,44 +190,80 @@ it here, do not re-export.
    no whole-pipeline store policy (a single backend serving every stage needs
    per-output-type stores; the seam is per-stage on purpose, but a factory
    hook may be wanted).
+6. **A watched single poll.** `Pipeline::run_watched` reports a `WakeReport`
+   over a whole DRIVE; `Pipeline::poll_frame` is unwatched. Nothing public
+   answers "what did THIS poll leave behind", so `WakePath` - a public type -
+   is named by no public signature, and the six tests that read one are
+   `src/watch.rs`'s. Sketch: `Pipeline::poll_frame_watched(&input) ->
+   (EffectPoll<..>, Option<WakePath>)`.
+7. **A consumer's stage cannot be registered from the crate that declares it.**
+   `highbay_elements` deliberately does not link `libpipeline`, in
+   dependencies OR dev-dependencies (its `Cargo.toml` states the rule and the
+   reason). So `ExpandStage` and `ExpandDefinitionStage` have no
+   `PipelineBuilder::stage` call site anywhere in the workspace, and their
+   tests construct them with `StageId::new(NAME, version)` at the call site
+   instead - the same shape and the same placement of the version, without the
+   builder's registration check behind it. Not a defect in the builder; a note
+   that "the version lives at the registration site" is only as strong as
+   there BEING one.
 
 ## Migration plan and test disposition
 
-This wave lands the builder beside the flat exports; the flip that deletes the
-flat exports happens together with the consumer conversion (a separate wave,
-per instruction). The workspace consumers to convert then: `charter.rs`'s
-hand-rolled expansion memo and `highbay_data::elements::ReduceMemo`, both of
-which are linear memoized chains the builder already expresses.
+**Done.** The consumer conversion and the flip landed together, as planned.
 
-Existing tests, one line each (all still pass; "internals" means it imports
-soon-internal items and must be converted or its property re-held before the
-flip):
+The three workspace `Stage` implementors now carry the id the builder mints and
+answer it from `Stage::id`; their module-level `StageId` consts are gone,
+replaced by `*_STAGE_NAME: &str` (the name half, which is not a version and
+cannot go stale), and the version is written at the construction call site:
 
-* `two_drivers_one_graph.rs` - internals (`Chain`, `Memo`, drivers). Its
-  headline property (a pending stage that registers no waker is a value lost
-  rather than late) is RE-HELD through the builder in
-  `tests/builder_is_the_only_door.rs`; the rest is convertible with `.stage`
-  + `run`/`poll_frame`.
-* `invalidation_marks_dependents.rs`,
-  `an_equal_recompute_stops_at_its_node.rs`, `reads_become_edges.rs`,
-  `the_schedule_polls_each_node_once.rs`, `a_fallback_is_not_a_revalidation.rs`
-  - BLOCKED on finding 1 (tracked layer has no builder spelling).
-* `a_boundary_is_not_a_cacheable_answer.rs`,
-  `a_stage_boundary_catches_what_its_stage_raises.rs`,
-  `a_build_can_ask_whether_it_stood_on_a_fallback.rs` - BLOCKED on finding 2
-  (boundaries have no builder spelling).
-* `an_unwakeable_poll_is_visible_offline.rs` - convertible (`run_watched`
-  exists on the runner); not yet converted.
-* `engine_stays_generic.rs` - manifest walk, touches no API; keep as is.
+| stage | file | where its version now lives |
+|---|---|---|
+| `AssembleStage` | `crates/highbay_data/src/pipeline.rs` | `assemble_pipeline` in `crates/highbay_data/tests/assemble_under_the_driver.rs` - a real `PipelineBuilder::stage` call |
+| `ExpandStage` | `crates/highbay_elements/src/pipeline.rs` | `expand_stage()` in that crate's two stage tests - see finding 7 |
+| `ExpandDefinitionStage` | same | `definition_stage()`, likewise |
+
+The keys did not move: each `memo_key` now reads `self.id`, which is the same
+`StageId` the deleted const held, so a converted consumer hits exactly where it
+hit before (`one_memo_serves_both_drivers_and_the_stage_runs_once` still
+measures one poll across two drives).
+
+Test disposition, as it landed - 100 tests before, 101 after (the extra is one
+relocated in from a consumer), and no assertion dropped:
+
+* `builder_is_the_only_door.rs` (8) - unchanged, in `tests/`.
+* `engine_stays_generic.rs` (7) - unchanged, in `tests/`.
+* `two_drivers_one_graph.rs` (11) - CONVERTED to the builder, in `tests/`.
+  `Chain`/`Memo`/the drivers are gone from it; `MapStore` reaches the graph
+  through `.stage_in`, so the "a store is implementable from outside" seam is
+  still exercised through the public door. The two-stage failure tag is
+  `ChainError`, which is why that type stays public.
+* `an_unwakeable_poll_is_visible_offline.rs` (9) - SPLIT. The three drive-level
+  tests converted to `Pipeline::run_watched` and stayed in `tests/`; the six
+  that read a per-poll `WakePath` moved to `src/watch.rs` (finding 6).
+* `invalidation_marks_dependents.rs` (13), `an_equal_recompute_stops_at_its_node.rs`
+  (7), `reads_become_edges.rs` (9), `a_fallback_is_not_a_revalidation.rs` (8) -
+  MOVED to `src/track.rs` (finding 1). The last is placed there rather than in
+  `boundary.rs` because what it pins is `Tracked`'s handling of a `Failed`
+  poll; the boundary is the thing that makes that state reachable.
+* `the_schedule_polls_each_node_once.rs` (8) - MOVED to `src/schedule.rs`
+  (findings 1 and 4).
+* `a_boundary_is_not_a_cacheable_answer.rs` (5),
+  `a_stage_boundary_catches_what_its_stage_raises.rs` (8),
+  `a_build_can_ask_whether_it_stood_on_a_fallback.rs` (7) - MOVED to
+  `src/boundary.rs` (finding 2).
+* `the_ledger_scope_changes_speed_and_not_answers` (1) - RELOCATED IN from
+  `highbay_data`'s `tests/assemble_under_the_driver.rs`, into `src/track.rs`.
+  It composed `Tracked::new(&ledger, label, Memo::new(stage, store))` by hand,
+  which finding 1 makes unwritable from a consumer. The property is held here
+  over a stand-in; what is parked is holding it over a REAL stage, and the
+  consumer file carries a note saying so.
 
 ## State of the implementation
 
-DONE this wave: `src/builder.rs` (builder, runner, id check at registration,
-intrinsic memoization with owned/given/off stores), exported from `lib.rs`;
-`tests/builder_is_the_only_door.rs` exercising composition, first-level memo
-hits, the version-bump-cold-cache rule via a shared store, the registration
-panic, the uncached control, and the two-drivers/lost-value property - through
-the public builder API only.
+DONE: `src/builder.rs` (builder, runner, id check at registration, intrinsic
+memoization with owned/given/off stores); `tests/builder_is_the_only_door.rs`;
+the CONSUMER CONVERSION and the VISIBILITY FLIP, with every internals-reaching
+test moved into the module that owns the internal it reaches for.
 
-NOT done: the visibility flip (flat exports still present so the existing
-suite passes); conversion of the convertible tests; findings 1-5.
+NOT done: findings 1-7. Each one is a test in `src/` that wants to be a test in
+`tests/`.

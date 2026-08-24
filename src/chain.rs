@@ -1,5 +1,18 @@
 //! Composing stages into a graph (`PIPELINE_PLAN.md` §2's four levels, §4's table).
 
+// **Dead in the shipped library, alive in the test build - and that is the
+// flip's honest arithmetic rather than an oversight.**
+//
+// With the flat exports gone (`DESIGN.md`, "Migration plan") nothing outside
+// this crate can name what is below, and the builder has no spelling for it
+// yet, so the only callers are this module's own `#[cfg(test)]` tests. The
+// allow is `not(test)` ON PURPOSE: under `cargo test` the lint stays fully
+// armed, so code that becomes genuinely unused still fails the gate. It comes
+// off the day the builder grows the spelling the findings name, because the
+// builder will then be the caller.
+#![cfg_attr(not(test), allow(dead_code))]
+
+
 use std::task::Context;
 
 use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
@@ -16,7 +29,7 @@ use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
 /// since both are handed the SAME [`Context`], the waker the first registered
 /// is the one that wakes the whole chain. There is no edge bookkeeping in this
 /// type, which is the point: the wake path is the poll path run backwards.
-pub struct Chain<A, B> {
+pub(crate) struct Chain<A, B> {
     first: A,
     second: B,
     id: StageId,
@@ -30,17 +43,17 @@ impl<A, B> Chain<A, B> {
     /// confusable. It is unused while [`Chain::memo_key`] refuses to key -
     /// see there - but the id belongs to the composite either way, and asking
     /// for it now is cheaper than adding a required argument later.
-    pub fn new(id: StageId, first: A, second: B) -> Self {
+    pub(crate) fn new(id: StageId, first: A, second: B) -> Self {
         Self { first, second, id }
     }
 
     /// The first stage.
-    pub fn first(&self) -> &A {
+    pub(crate) fn first(&self) -> &A {
         &self.first
     }
 
     /// The second stage.
-    pub fn second(&self) -> &B {
+    pub(crate) fn second(&self) -> &B {
         &self.second
     }
 }
@@ -80,7 +93,7 @@ where
     /// honest answer is the one [`Stage::memo_key`] documents: refuse to key
     /// rather than invent one. Nothing is lost meanwhile, because §3's cheapness
     /// argument is about hitting at the FIRST level - wrap the halves in
-    /// [`Memo`](crate::Memo) and an unchanged input never reaches the second.
+    /// [`Memo`](crate::memo::Memo) and an unchanged input never reaches the second.
     fn memo_key(&self, _input: &Self::Input) -> Option<MemoKey> {
         None
     }

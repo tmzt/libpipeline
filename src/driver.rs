@@ -68,7 +68,7 @@ impl PendingWork for NoPendingWork {
 ///
 /// A CLI run against an unchanged tree is all cache hits, because the memo keys
 /// are the same ones the IDE used (§5).
-pub fn run_to_completion<S, W>(
+pub(crate) fn run_to_completion<S, W>(
     stage: &S,
     input: &S::Input,
     work: &W,
@@ -107,7 +107,7 @@ where
 /// records staleness without knowing how a redraw is requested - so the wasm
 /// version is this driver plus a proxy send beside the flag, not a different
 /// driver.
-pub struct FrameDriver {
+pub(crate) struct FrameDriver {
     stale: Arc<WakeFlag>,
 }
 
@@ -119,7 +119,7 @@ impl Default for FrameDriver {
 
 impl FrameDriver {
     /// A driver with a fresh, unstale flag.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             stale: WakeFlag::new(),
         }
@@ -127,18 +127,18 @@ impl FrameDriver {
 
     /// The waker this driver hands to every poll. Exposed so whatever lands a
     /// value out of band can wake the frame loop directly.
-    pub fn waker(&self) -> Waker {
+    pub(crate) fn waker(&self) -> Waker {
         self.stale.waker()
     }
 
     /// Whether a wake has arrived since this was last called - "stale, poll
     /// again" (§3). Reading clears it.
-    pub fn take_stale(&self) -> bool {
+    pub(crate) fn take_stale(&self) -> bool {
         self.stale.take_stale()
     }
 
     /// Poll the graph once. Returns immediately, whatever the answer.
-    pub fn poll_frame<S: Stage>(
+    pub(crate) fn poll_frame<S: Stage>(
         &self,
         stage: &S,
         input: &S::Input,
