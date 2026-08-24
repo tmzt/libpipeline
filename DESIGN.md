@@ -7,21 +7,39 @@ frame or blocking to completion. The engine is generic over every payload
 type - it never learns what a stage computes, only how to poll it, key it,
 and remember its answers.
 
-**`!!! PROPOSED` marks a section that describes code which DOES NOT EXIST.**
-The marker sits on its own line under a heading and scopes to that whole
-section, subsections included. Everything not so marked describes the crate
-as it is. The distinction matters more here than in most designs, because
-this document is read as a specification: an unmarked paragraph is a claim
-you can check against the source, and a marked one is a claim about intent.
+## How to read this
 
-This document has three parts. THE MODEL is the set of ideas the engine
-embodies; source comments cite its section names. THE CURRENT DESIGN is the
-builder-only public API and why it is shaped that way. The rest is the
-ledger: what is proposed, what the builder cannot yet express, and one
-lesson about testing that was expensive to learn. The public-API section is
-the contract consumers and tests are allowed to touch; everything in the
-internals section is machinery the builder assembles and may reorganize
-without notice.
+A section that describes code which DOES NOT EXIST carries a marker on a
+line of its own, directly beneath the heading:
+
+    !!! PROPOSED
+
+The marker scopes to that entire section, subsections included. Everything
+not so marked describes the crate as it is today.
+
+The distinction carries more weight here than in most design documents,
+because this one is read as a specification: an unmarked paragraph is a
+claim you can check against the source, and a marked one is a claim about
+intent. Confusing the two sends a reader looking in `src/` for something
+nobody has written.
+
+Two further conventions worth knowing before the first section:
+
+* **Every claim about the code names the file that carries it.** A claim
+  with no path is a claim about design rather than about this
+  implementation.
+* **"Public" and "internal" are drawn strictly.** The public-API section is
+  the whole contract a consumer or a test may touch. The internals section
+  is machinery the builder assembles, which may be reorganized without
+  notice and is named there only so this crate can discuss itself.
+
+## What is in it
+
+Three parts. THE MODEL is the set of ideas the engine embodies; source
+comments cite its section names rather than restating them. THE CURRENT
+DESIGN is the builder-only public API and why it is shaped that way. The
+rest is the LEDGER: what is proposed, what the builder cannot yet express,
+and one lesson about testing that was expensive to learn.
 
 ## The model
 
