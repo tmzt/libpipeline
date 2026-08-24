@@ -66,6 +66,7 @@
 #![forbid(unsafe_code)]
 
 mod boundary;
+mod builder;
 mod chain;
 mod driver;
 mod memo;
@@ -73,10 +74,26 @@ mod schedule;
 mod track;
 mod watch;
 
+/// The public door. See `DESIGN.md`: composition, memoization and driving go
+/// through the builder; `Stage` stays public to IMPLEMENT (via
+/// `libpipelinedata`) but not to assemble by hand.
+pub use builder::{Pipeline, PipelineBuilder, StagedPipelineBuilder};
+
+// Result and report vocabulary - named in the runner's signatures, so a
+// caller matching on them needs the names (DESIGN.md, "What else stays
+// public").
+pub use chain::ChainError;
+pub use driver::{DriveError, NoPendingWork, PendingWork};
+pub use watch::{WakePath, WakeReport};
+
+// SCHEDULED FOR REMOVAL (DESIGN.md, "Migration plan"): the flat assembly
+// surface, kept exported only until the tracked/boundary layers have builder
+// spellings and the consumers plus the tests over them are converted. New
+// code composes through `Pipeline::builder()`, never through these.
 pub use boundary::{Guarded, Substitutions, run_to_completion_counted};
-pub use chain::{Chain, ChainError};
-pub use driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
+pub use chain::Chain;
+pub use driver::{FrameDriver, run_to_completion};
 pub use memo::Memo;
 pub use schedule::{Cycle, Schedule};
 pub use track::{Backdated, Ledger, NodeId, Tracked, TrackedInput, revalidating};
-pub use watch::{WakePath, WakeReport, poll_watched, run_to_completion_watched};
+pub use watch::{poll_watched, run_to_completion_watched};
