@@ -198,6 +198,114 @@ builder becomes the caller.
   is the public watched drive; there is no public single-poll counterpart
   (finding 6).
 
+## The intended stage shape: a function, with everything through Ctx (PROPOSED)
+
+None of this section is built. It is the shape the API is heading for,
+recorded so the next wave does not re-derive it and so the trait-taking
+doors are not widened by habit first.
+
+### A stage is a FUNCTION, and Rust can enforce that
+
+The default registration door takes a `fn` pointer, not `impl Fn` and not
+a trait object:
+
+```
+stage_fn(name, version, f: fn(&I, &mut Ctx) -> O)
+```
+
+A non-capturing closure coerces to `fn`; a capturing one does not. So the
+type REFUSES captured state at compile time - no lint, no convention, no
+review. `impl Fn` would permit capture and a trait would permit fields;
+`fn` permits neither.
+
+Two forms, split by what they are for:
+
+| form | holds | keyed by | for |
+|---|---|---|---|
+| `stage_fn(name, version, fn)` | nothing, provably | `StageId` alone | wrappers - a `Component` expansion, most steps |
+| `stage(name, version, make)` | per-build config | `StageId` + a `ContentKey` of that config | the minority, e.g. `ExpandStage`'s `environment` |
+
+**Losing the content key on the first form is the POINT, not a cost.** A
+stage with no captured state has exactly one input; if the source's
+version already covers it, hashing it is paying `O(input)` to discover
+what the write path recorded. Those stages belong at the cheapest tier of
+invalidation, which is where measurement already put them.
+
+### Why the trait-taking door must not become the default
+
+Tim, 2026-08-24: *"if we did have an add_tracked_stage taking the full
+trait that might cause problems later on with local state getting added to
+the structs."*
+
+A door typed on the trait hands back a struct, and structs accrete: today
+`{ id }`, later `{ id, cache, last_seen, config }`, each new field a
+candidate input that moves the output without moving the key, and none of
+it arriving as a visible decision. An exhaustive destructure in
+`memo_key` catches that only if someone remembers to write it that way. A
+`fn`-typed door makes the field IMPOSSIBLE rather than reviewable, which
+is the difference this crate keeps choosing.
+
+So when a tracked variant lands (finding 1), `tracked_stage_fn` comes
+first and the trait-taking form exists only where per-build config
+genuinely does.
+
+### In-flight state lives in `Ctx`, addressed - not in a field
+
+The objection to the `fn` form is that a stage which polls `Pending` then
+`Ready` needs somewhere to keep its work between polls, and that somewhere
+looks like a field.
+
+It is not. Tim, 2026-08-24: *"it feels more like that's the role of
+ctx/cx, and we already have the concept with ecs keyed on widget (in this
+case, stageid and pipelineid)."* The precedent is in
+`libpipelinedata`: `EcsMemoStore` keeps values in a `SharedWorld` and
+holds only the address, with its address map private so *"every entity
+named here is one this store put there"*. The same shape one level over:
+a stage's in-flight work lives in the world the `Ctx` carries, addressed
+by `(PipelineId, StageId)`.
+
+That collapses the design to one rule - **a stage is a function, and
+everything it touches comes through `Ctx`**:
+
+* reads through `Ctx::observe_read`, so they enter the read-set and
+  invalidation stays precise;
+* in-flight state in `Ctx`, addressed, so a pending poll resumes without
+  a field;
+* writes through the same door, so nothing escapes the log.
+
+Purity stops being a convention and becomes structural: there is nowhere
+else to reach. No captured environment (the type forbids it), no fields
+(there is no struct), and the only handle in scope is the one that logs.
+
+### `PipelineId` (PROPOSED): a shape hash plus a serial
+
+Tim, 2026-08-24: *"I think it's a quick hash over the stageids in order,
+along with a serial when the pipeline is constructed via the builder."*
+
+Two halves answering two questions:
+
+* **The hash over the `StageId`s IN ORDER** identifies the pipeline's
+  SHAPE - which stages, in which order. Because a `StageId` is
+  `(name, version)`, a version bump changes the shape hash automatically,
+  so state keyed on a pipeline cannot survive a stage's behaviour
+  changing underneath it. That property is free and worth naming.
+* **The serial, minted by the builder at construction**, distinguishes
+  INSTANCES. Two pipelines of identical shape built separately are
+  different instances - which is exactly the authoring/runtime case: same
+  stages, same shape hash, different serial, different memo stores, and
+  both correct while holding different cached answers.
+
+Keyed state therefore dies with its instance: rebuild the pipeline and the
+serial changes, so nothing leaks across. Same instance and same stage
+resumes. That is the load/unload rule one layer down, and it needs no new
+vocabulary.
+
+**Note the addressing differs from `EcsMemoStore`'s deliberately.** That
+store addresses by CONTENT hash; this one addresses by IDENTITY. Same
+world, same borrow discipline, different question - so it is a sibling of
+that store rather than a reuse of it, and any implementation should say
+which of the two a given store is.
+
 ## What the builder cannot yet express (findings, in priority order)
 
 1. **Tracked state graphs.** `Ledger`/`Tracked`/`TrackedInput` composition -
