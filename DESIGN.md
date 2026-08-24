@@ -7,6 +7,13 @@ frame or blocking to completion. The engine is generic over every payload
 type - it never learns what a stage computes, only how to poll it, key it,
 and remember its answers.
 
+**`!!! PROPOSED` marks a section that describes code which DOES NOT EXIST.**
+The marker sits on its own line under a heading and scopes to that whole
+section, subsections included. Everything not so marked describes the crate
+as it is. The distinction matters more here than in most designs, because
+this document is read as a specification: an unmarked paragraph is a claim
+you can check against the source, and a marked one is a claim about intent.
+
 This document has three parts. THE MODEL is the set of ideas the engine
 embodies; source comments cite its section names. THE CURRENT DESIGN is the
 builder-only public API and why it is shaped that way. The rest is the
@@ -370,15 +377,19 @@ family - a boundary belongs outside the MEMO - is closed structurally by
   the address costs a traversal of the output, and a chain that backdates at
   every level pays for it at every level.
 
-## The intended stage shape: a function, with everything through Ctx (PROPOSED)
+## The intended stage shape: a function, with everything through Ctx
 
-None of this section is built. It is the shape the API is heading for,
-recorded so the next wave does not re-derive it - and so that the
-trait-taking door the builder has TODAY (`stage`/`stage_in`, taking
-`S: Stage`) is understood as the thing being replaced rather than as the
-general case with a convenience beside it.
+!!! PROPOSED
 
-### PROPOSED: a stage WOULD BE a pure closure taking `Ctx`, with no other form
+None of this section is built, INCLUDING ITS SUBSECTIONS - the `!!!` marker
+above scopes to the whole section, so nothing inside it describes code that
+exists. It is the shape the API is heading for, recorded so the next wave
+does not re-derive it, and so that the trait-taking door the builder has
+TODAY (`stage`/`stage_in`, taking `S: Stage`) is understood as the thing
+being replaced rather than as the general case with a convenience beside
+it.
+
+### A stage is a pure closure taking `Ctx`, and there is no other form
 
 The registration door takes a `fn` pointer - not `impl Fn`, not a trait:
 
@@ -440,7 +451,7 @@ decision. The point of the `fn` door is that the field is IMPOSSIBLE
 rather than reviewable, and a second door typed on the trait would give
 that back for whichever stage was written through it.
 
-### PROPOSED: in-flight state would live in `Ctx`, addressed - not in a field
+### In-flight state lives in `Ctx`, addressed - not in a field
 
 The objection to the `fn` form is that a stage which polls `Pending` then
 `Ready` needs somewhere to keep its work between polls, and that somewhere
@@ -481,7 +492,7 @@ Purity stops being a convention and becomes structural: there is nowhere
 else to reach. No captured environment (the type forbids it), no fields
 (there is no struct), and the only handle in scope is the one that logs.
 
-### `PipelineId` (PROPOSED): a shape hash plus a serial
+### `PipelineId`: a shape hash plus a serial
 
 Tim, 2026-08-24: *"I think it's a quick hash over the stageids in order,
 along with a serial when the pipeline is constructed via the builder."*
