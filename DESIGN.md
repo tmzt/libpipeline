@@ -265,6 +265,13 @@ exactly that reason - see finding 6.
 ### Where a consumer works, and what it may never name
 
 **A consumer of this crate implements `Stage` and assembles nothing.**
+
+`Stage` is a TRAIT, today and in every shipped version of this crate. It
+lives in `libpipelinedata` (`src/stage.rs`), a consumer implements it on a
+type of its own, and the builder takes `S: Stage`. The closure form
+described later in this document is PROPOSED and does not exist; where the
+two disagree, the trait is what is true now. Nothing below should be read
+as saying a stage is already a function.
 `Stage` and its contract types live in `libpipelinedata`, which exists
 precisely so a consumer can DECLARE a step - an id, a version, an input, an
 output, a memo key - without linking the engine that runs it. It is the
@@ -371,7 +378,7 @@ trait-taking door the builder has TODAY (`stage`/`stage_in`, taking
 `S: Stage`) is understood as the thing being replaced rather than as the
 general case with a convenience beside it.
 
-### A stage is a PURE CLOSURE taking `Ctx`. There is no other form.
+### PROPOSED: a stage WOULD BE a pure closure taking `Ctx`, with no other form
 
 The registration door takes a `fn` pointer - not `impl Fn`, not a trait:
 
@@ -433,7 +440,7 @@ decision. The point of the `fn` door is that the field is IMPOSSIBLE
 rather than reviewable, and a second door typed on the trait would give
 that back for whichever stage was written through it.
 
-### In-flight state lives in `Ctx`, addressed - not in a field
+### PROPOSED: in-flight state would live in `Ctx`, addressed - not in a field
 
 The objection to the `fn` form is that a stage which polls `Pending` then
 `Ready` needs somewhere to keep its work between polls, and that somewhere
@@ -505,6 +512,71 @@ backing, and an implementation should say which of the two any given
 store answers. That the backing might be one an implementor already has
 (an ECS world, say) is a consumer's convenience and not a fact this crate
 knows.
+
+## What a run answers, and what each answer means
+
+Three result types, at three different scopes. A consumer meets all of
+them, and their meanings are not guessable from their names.
+
+### `EffectPoll<A, E>` - what ONE poll answers
+
+This is what `poll_frame` returns and what a stage's own poll produces.
+
+| variant | meaning |
+|---|---|
+| `Ready(A)` | a value |
+| `Pending` | an upstream effect has not landed; a waker was registered, so expect a wake |
+| `Failed(E)` | the stage's typed error channel |
+
+**Neither `Ready` nor `Failed` is terminal**, and that is the part worth
+saying out loud because it differs from `Result`. A pipeline is a standing
+derivation over inputs that change, so a later poll over changed inputs
+can move `Failed` back to `Ready` - and can move `Ready` to a different
+value. A `Failed` is this poll's answer, not the pipeline's verdict. Only
+`Pending` carries an obligation: the poll that returned it MUST have
+registered a waker, or the value is lost rather than late.
+
+### `DriveError<E>` - how a BLOCKING run ends badly
+
+`run` and its variants return `Result<Output, DriveError<E>>`.
+
+| variant | meaning |
+|---|---|
+| `Failed(E)` | a stage's own typed error, surfaced from its poll |
+| `Stalled` | the graph answered `Pending` with no outstanding work left to run, so re-polling could only answer `Pending` again |
+
+**`Stalled` is not a timeout**, and it means opposite things in the two
+drives - which is the single most useful thing to know about this API.
+Something registered a waker for an input nothing was ever going to land.
+Under a BLOCKING drive that is a bug in the graph: nothing else was coming.
+Under a FRAME drive the identical situation is normal - the frame keeps
+its stand-in and a later user action lands the value. So the same state is
+a defect offline and expected behaviour in an interactive host, and that
+asymmetry is exactly why `run_watched` exists: it lets an offline run
+report the unwakeable polls that a frame drive would silently lose.
+
+### `ChainError<A, B>` - WHICH stage failed
+
+A pipeline of two or more stages returns
+`Result<_, DriveError<ChainError<..>>>`, nesting one `ChainError` per join.
+
+| variant | meaning |
+|---|---|
+| `First(A)` | the first stage failed; the second never ran |
+| `Second(B)` | the first produced a value and the second failed on it |
+
+The types are the answer to "where did this break", so the error channel
+stays typed all the way out rather than collapsing to a string. A
+three-stage pipeline nests them - `ChainError<ChainError<A, B>, C>` - which
+is verbose to name and precise to match on; a consumer usually matches the
+outermost and only destructures further when it must.
+
+### `PendingWork` and `NoPendingWork`
+
+`run` takes something to pump while polls answer `Pending`: that is
+`PendingWork`. `NoPendingWork` is the implementation for a graph of pure
+stages, where nothing can be pumped because nothing is waiting on the
+outside world. `run_pure` is `run` with it supplied.
 
 ## What the builder cannot yet express (findings, in priority order)
 
