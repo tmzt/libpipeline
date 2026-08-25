@@ -1,32 +1,34 @@
 # libpipeline
 
-An incremental pipeline engine. You register pure, poll-driven stages with a
-builder; the engine memoizes every stage under keys computed before the work,
-chains the stages into one graph, and runs it through one door - `poll(version,
-&input)`, which polls once and returns immediately, whatever the answer.
-Blocking to completion (a build tool) and one poll per frame (an interactive
-host) are things a CALLER does with that one call: the same stages, the same
-cache, either caller.
+`libpipeline` provides an incremental pipeline engine. It executes pipelines composed of pure, poll-driven stages. The engine implements automatic memoization for all stages by computing cache keys prior to execution, assembles the stages into a unified execution graph, and drives computation through a single, non-blocking entry point: `poll(version, &input)`.
 
-**A stage is two functions, and the builder takes them as `fn` pointers.** A
-key function that says what this input is, and a poll function that produces
-the output. Neither may capture - a non-capturing closure coerces to `fn` and a
-capturing one does not compile - so a stage cannot carry hidden state that
-moves its output without moving its key. Everything the engine gives a stage
-arrives through one argument, `Ctx`.
+Execution is decoupled from polling strategies. The pipeline architecture supports arbitrary polling intervals - from blocking execution within a build tool to frame-synchronous polling in interactive applications - utilizing identical stage definitions, cache semantics, and API boundaries.
 
-`libpipeline` is the engine half of a pair. Its companion `libpipelinedata`
-holds the shared vocabulary the two sides speak: the key types, the content
-hash, and the `MemoStore` seam. The examples below use both.
+## Architecture and Core Concepts
 
-Every example on this page is a doctest: `cargo test` compiles and runs them.
+### Architectural Design Invariants
 
-## The smallest working pipeline
+To guarantee correct cache semantics and deterministic execution, the architecture relies on several strict design invariants:
 
-A stage is a `(key, poll)` pair. The key is computable from the input alone -
-before the stage runs - which is what lets a lookup precede the work. The
-builder is the only way to compose, memoize, or drive; you assemble nothing by
-hand.
+#### Compilation-Enforced Statelessness
+
+A stage is defined strictly by two function pointers: a key function for input identification and a poll function for output generation. The API enforces statelessness at compile time by requiring raw `fn` pointers; capturing closures fail to compile. This statically prevents hidden state mutations from invalidating cache guarantees. All ambient context is passed explicitly via the `Ctx` parameter.
+
+#### Cache-Lookup Preemption
+
+Keys are computed purely from inputs prior to stage execution. This enables the engine to preempt execution entirely upon a cache hit.
+
+#### Poll-Driven Execution & Wakers
+
+The engine never blocks. Stages performing asynchronous operations yield a pending state and register a waker. When out-of-band data arrives, the waker signals the engine, prompting the caller's next poll to retrieve the finalized value.
+
+`libpipeline` handles execution logic, while its companion crate, `libpipelinedata`, defines the shared data structures, including key types, content hashes, and the `MemoStore` interface.
+
+Every example provided is an executable doctest.
+
+## Constructing the Pipeline
+
+A pipeline stage fundamentally pairs a key function with a poll function. The builder interface is the exclusive mechanism for composition, implicit memoization, and pipeline execution.
 
 ```rust
 use libpipeline::{Ctx, PipelineBuilder, Run};
@@ -64,37 +66,18 @@ let Ok(Run::Computed(segments)) = pipeline.poll(1, &"doc.title".to_string()) els
 assert_eq!(*segments, vec!["doc".to_string(), "title".to_string()]);
 ```
 
-`Run::Computed` hands back an `Arc` of the output, because the memo still
-holds the value it just answered with - that is what a memo is. It also means
-a large output costs a refcount bump per cache hit and nothing else, without
-any stage author remembering to wrap anything: the engine wraps once, where the
-value enters the graph.
+When a stage completes, `Run::Computed` returns an `Arc` containing the output. The cache retains this exact value. Subsequent cache hits incur only a reference count increment, avoiding large data copies. The engine handles all value wrapping implicitly at the graph boundary.
 
-Three things to notice at the registration call site:
+### Key Registration Behavior
 
-* **The builder mints the identity, and the identity is a position.** The
-  `StageId` inside the `Ctx` is this registration's index and nothing else; a
-  stage never declares one, so there is no second id it could answer with and
-  nothing to check. `"split"` beside it is a diagnostic label: it enters no
-  key, nothing is looked up or compared by it, and a second stage may carry the
-  same one with no consequence.
-* **The functions are `fn` pointers, not closures the builder boxes.** Free
-  functions like these coerce, and so does a non-capturing closure written
-  inline. A closure that captured a counter, a handle or a config would not,
-  and that refusal is the design: a captured field is an input that moves the
-  output without moving the key, and no review catches every one.
-* There is no separate "memoize" step. **Registering a stage memoizes it**;
-  there is no un-memoized registration to reach for.
-* **A `Ready` says which answer.** `StageAnswer::computed(value)` is the
-  ordinary one. The other is `StageAnswer::unchanged()`, below.
+* **Positional Identity:** The engine assigns a `StageId` internally based on registration order. Stages do not declare intrinsic IDs. Diagnostic string labels (e.g., `"split"`) are excluded from cache keys and identity comparisons.
+* **Stateless Pointers:** Registration accepts only `fn` pointers or non-capturing closures. Preventing environment capture guarantees that outputs cannot shift independently of the input key, preserving cache integrity.
+* **Implicit Memoization:** Registration and memoization are inseparable. There is no un-memoized execution path.
+* **Explicit State Returns:** A stage signals new output via `StageAnswer::computed(value)`, or signals an unchanged state via `StageAnswer::unchanged()`.
 
-## Adding stages
+## Stage Chaining
 
-Chain another `.stage_fn(..)` call; the new stage's input must be the previous
-stage's output - the value, not the share the graph carries it in; unwrapping
-between stages is the engine's job too - and its error is the pipeline's one
-error type, which every stage of one pipeline shares. A failure comes back
-carrying the POSITION of the stage that raised it.
+Pipelines scale by chaining subsequent `.stage_fn(..)` calls. Downstream stages consume the unwrapped output of their immediate predecessors. The pipeline enforces a single, unified error type across all stages. When an error occurs, the pipeline surfaces the failure alongside the numerical position of the originating stage.
 
 ```rust
 use libpipeline::{Ctx, PipelineBuilder, Run};
@@ -145,25 +128,17 @@ assert_eq!(failure.at(), 0);
 assert_eq!(*failure.error(), "nothing to split");
 ```
 
-(The `#`-prefixed lines in this and later examples are hidden doctest lines
-repeating a definition from an earlier example.)
+*(Note: `#`-prefixed lines within doctests duplicate earlier definitions to satisfy compilation requirements.)*
 
-## What memoization does for you
+## Incremental Memoization
 
-Every registered stage is looked up before it is polled: the key is
-`(stage id, content keys of the inputs)`, so it costs no run to compute.
-An unchanged input is a cache hit that never enters the stage at all.
+The engine executes a cache lookup for every registered stage prior to polling. The cache key combines the internal `stage id` and the content keys of the provided inputs. If the input remains unchanged, the cache lookup succeeds, and stage execution is entirely bypassed.
 
-The versions below MOVE while the content stays the same, which is how a poll
-reaches the graph at all: the version gate above it answers first when the
-version repeats (the next section is about that), so a test of the memo has to
-hand the pipeline a state it has not computed for yet.
+In the following example, advancing the version while maintaining identical content forces the poll past the fast-path version gate, engaging the memo cache.
 
-**Note where the run counter lives**, because it is the one thing a `fn` door
-changes about writing a stage: a stage cannot hold a field, so anything ambient
-it needs - a counter here, a font atlas or a module runtime in earnest - is
-reached through a `static`. `Ctx` is where such a route belongs and does not
-carry one yet; `DESIGN.md`'s "The intended stage shape" is the record of that.
+### State Management Considerations
+
+Because stages are raw `fn` pointers without internal fields, required external state (e.g., metrics counters, texture atlases) must reside in static memory. Future revisions of the API intend to expose such ambient context natively through the `Ctx` parameter (refer to `DESIGN.md`).
 
 ```rust
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,21 +185,15 @@ assert_eq!(control.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))))
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 3); // the control ran every time
 ```
 
-**Opting out.** A stage whose answer is not a cacheable fact - an effect, a
-read of something no key can address - answers `None` from its key function. It
-is then neither looked up nor recorded, and everything else about it is
-unchanged. Failures are never cached regardless: a transient failure served
-back from a memo would outlive its cause.
+### Uncacheable Operations
 
-## A stage that rewrote nothing says so
+Stages performing side effects or reading state that cannot be keyed must return `None` from the key function. The engine bypasses cache lookups and storage for these stages without affecting the rest of the pipeline. Failures are never cached; storing a transient error would indefinitely mask recovery.
 
-A pass that walked its input and changed none of it knows that at its return -
-and can say so, with `StageAnswer::unchanged()` instead of a value.
+## State Unchanged Optimization
 
-**It carries nothing, and that is the point.** The value is already in the slot
-this position last answered from, so the stage AFTER it has no new input, its
-own answer over that input already stands, and it is never entered at all. The
-saving is the rest of the chain rather than a refcount:
+Stages that process input without enacting modifications can return `StageAnswer::unchanged()`.
+
+This signal carries no payload. The engine retains the output from the stage's previous execution. Downstream stages perceive no input changes, validate against their own cached states, and are completely preempted. This optimizes away execution for the entire downstream chain.
 
 ```rust
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -281,42 +250,24 @@ assert_eq!(UPPER_RUNS.load(Ordering::Relaxed), 2);
 assert_eq!(SHOUT_RUNS.load(Ordering::Relaxed), 1);
 ```
 
-**A stage may only say it where it has answered before.** `unchanged` refers to
-the answer this position last gave, so a position that has given none is
-claiming something that does not exist - and the engine panics naming the
-position rather than telling you to keep a value you were never given.
+### Usage Constraints
 
-**Nothing checks that it is TRUE.** A stage that says `unchanged` while its
-output moved makes the pipeline serve a stale value for ever, and no test sees
-it: the answers do not change, only which answer is served does. It is the same
-class of promise as the wake a `Pending` owes, and it is kept the same way - by
-the stage.
+`unchanged` fundamentally references a prior output. Emitting `unchanged` during a stage's initial execution triggers a panic, as no previous value exists to reference.
 
-## One door, and what it answers
+### Contractual Trust
 
-`poll(version, &readable)` polls once and returns immediately, whatever the
-answer. Nothing inside it waits, ever. There are four answers:
+The engine does not verify the accuracy of `unchanged`. If a stage mutates data but emits `unchanged`, the pipeline permanently serves stale data. This contract, similar to a `Pending` future promising a subsequent wake, must be upheld by the stage logic.
 
-* **`Run::Computed(value)`** - work happened; take the new value. The pipeline
-  records the version it answered for.
-* **`Run::Unchanged`** - the value you already hold derives from exactly this
-  state; keep it. Read it as *the value is finished*: not a report that nothing
-  happened, but a statement that nothing needs to. Two things answer it: the
-  version gate, when the version is the one it last recorded and no wake is
-  pending, in which case the readable is not dereferenced, no memo key is
-  computed and no stage is polled; and the graph, when a stage that WAS entered
-  answered `unchanged` (above). Either way the obligation is the same.
-* **`Run::Delayed`** - not ready; a wake is coming. The poll arranged for the
-  pipeline's waker to be woken when the answer becomes possible, so wait to be
-  woken rather than re-polling in a spin.
-* **`Err(Failure)`** - the poll did not happen. `at()` names the stage, and the
-  error rides beside it. Nothing is recorded, so a later poll with the same
-  version retries.
+## Execution and the Polling Interface
 
-The `version` argument says WHICH STATE the readable is; it is the only version
-in the API, and the pipeline never computes one - it compares the ones it is
-handed. That pairing is the point: the version costs a comparison, and the
-readable may be a large snapshot that a matching version never touches.
+The `poll(version, &readable)` method executes a single, non-blocking pipeline iteration. It yields one of four variants:
+
+* **`Run::Computed(value)`:** Execution occurred; returns the newly computed value and records the processed version.
+* **`Run::Unchanged`:** The existing output is accurate and up-to-date. This variant asserts that no work is necessary. It occurs either when the input version matches the recorded version (preempting key computation and stage polling entirely) or when a stage explicitly returns `unchanged`.
+* **`Run::Delayed`:** The pipeline is blocked on pending asynchronous operations. A waker has been registered. The caller must await waking rather than spin-polling.
+* **`Err(Failure)`:** Pipeline execution failed. The error payload identifies the originating stage. Failures are uncached, permitting immediate retry on subsequent polls.
+
+The `version` parameter defines the input state. The pipeline compares the provided version against its internal record to bypass heavy snapshot dereferencing on unmodified inputs.
 
 ```rust
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -354,36 +305,18 @@ assert_eq!(pipeline.poll(2, &"hi".to_string()), Ok(Run::Computed(Arc::new(2))));
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 2);
 ```
 
-**A wake counts as much as a version, and the gate knows it.** Two different
-things mean "something happened": the input version moves when the source
-changes, and a wake arrives when a value some stage was waiting on has landed.
-A landed effect does not move the input version, so the gate answers
-`Unchanged` only when the version matches AND no wake is pending. Without that
-half, a pipeline sitting on `Delayed` would receive its wake, poll again,
-short-circuit on the unchanged version and answer `Unchanged` forever, with the
-caller holding a value one step stale and nothing reporting it.
+### Waker Preemption
 
-**There is no "has a wake arrived" accessor.** The flag clears when it is read,
-so a second reader is a second claimant on one wake, and the gate is the reader
-that must not lose. `waker()` hands out the wake target for landing values out
-of band; a caller with nothing else to ask polls every frame and lets
-`Unchanged` be the cheap answer, which is what that variant is for.
+The pipeline must execute if either the input version advances or an asynchronous waker signals a pending effect. Because effects resolve asynchronously, the early-exit version gate returns `Unchanged` only if the version matches *and* no wakes are pending.
 
-## Two caller patterns
+The internal wake flag clears immediately upon read. Exposing this flag via a public API would steal the signal from the version gate, causing deadlocks. Out-of-band resolutions obtain wakers via `Ctx::waker()`. For frame-continuous applications, frequent polling handles these updates optimally, as `Unchanged` returns incur negligible overhead.
 
-Blocking and frame driving are things a caller does with `poll`, not doors the
-pipeline provides. A stage cannot tell which is asking.
+## Polling Strategies
 
-* **A frame caller** polls once per frame. A `Delayed` poll draws its stand-in;
-  the waker the stage registered wakes the pipeline when the value lands, and
-  the next frame's poll picks it up.
-* **A blocking caller** loops on `Delayed`, pumping its own executor between
-  polls. `run_blocking` is that loop, shipped as a free function whose body is
-  a loop over `poll` and nothing else. `Delayed` when the caller has nothing
-  left to run means something waited for an input nothing was going to land -
-  and that is the CALLER's condition, because only the caller can see that its
-  queue is empty, so `run_blocking` hands back the plain `Delayed` rather than
-  deciding.
+The pipeline exposes only `poll`. It remains agnostic to the caller's execution strategy.
+
+* **Frame-Synchronous:** The caller polls exactly once per frame. A `Delayed` result typically prompts rendering a placeholder. Asynchronous completion triggers the waker, allowing the subsequent frame's poll to retrieve the finalized data.
+* **Executor-Blocked:** The caller loops on `poll` within an asynchronous executor. The provided `run_blocking` utility implements this loop, yielding to a custom executor pump. If the pump exhausts its queue while the pipeline remains `Delayed`, a permanent deadlock has occurred, and `run_blocking` surfaces the `Delayed` variant.
 
 ```rust
 use std::sync::{Arc, LazyLock, Mutex};
@@ -458,37 +391,19 @@ let outcome = run_blocking(&pipeline, 1, &(), || {
 assert_eq!(outcome, Ok(Run::Computed(Arc::new(7))));
 ```
 
-**A `Delayed` that owes a wake and leaves none is a value LOST rather than
-late.** It is invisible to a blocking caller, which polls again without being
-asked, and fatal to a frame caller, which never learns there is anything to ask
-for. Answering `Pending` makes registering an obligation for that reason, and
-what the defect looks like from outside is a pipeline answering `Unchanged`
-forever over a value that has already moved.
+### Waker Obligations
 
-## The storage seam
+Emitting a `Delayed` response without registering a corresponding waker constitutes a critical defect. It silently deadlocks frame-driven callers and induces infinite loops in blocking callers. Stages returning `Pending` are strictly obligated to register a waker.
 
-Where answers are remembered is a separate decision from the engine, and it is
-ONE decision about the whole pipeline, taken once, at the builder. By default
-the pipeline remembers into a map it owns; `.store(..)` takes any `MemoStore`
-implementation you provide instead. The store is handed over at the builder and
-lives exactly as long as the pipeline does.
+## Storage Interface Seam
 
-**The seam accepts and returns `Arc`, on both sides, always.** A store holds a
-stage's output for as long as it is worth remembering, and a lookup hands back a
-SHARE of it - so a miss costs one allocation and every hit after it is a refcount
-bump. It is unconditional on purpose: a contract that shared large outputs and
-copied small ones would put that judgement on the stage author, it would get made
-once at the moment the output was small, and the copy per hit it left behind would
-outlive the output growing without any test being able to see it (answers do not
-change; only speed does).
+Computation is structurally decoupled from storage. The cache backend is configured globally during builder initialization. While the pipeline defaults to an internal hash map, custom `MemoStore` implementations (e.g., for LRU eviction policies or disk persistence) can be injected via `.store(..)`. The pipeline assumes ownership of the store for its lifecycle.
 
-One store serves every stage, whatever their outputs are, because the rows are
-erased: the store the builder holds is instantiated at `dyn Any + Send + Sync`,
-so what it records is the share the stage already answered with, unsized -
-nothing is wrapped twice - and a lookup is `Arc::downcast`. `V: ?Sized` on the
-store below is what that costs an implementation generic over its value type; a
-store written for this builder alone would name the erased type directly and
-need nothing generic at all.
+### Shared Reference Mandate
+
+The storage interface exclusively handles `Arc` pointers. Cache misses allocate once; cache hits incur only a reference count increment. This strictly prevents stage authors from inadvertently duplicating large structures on cache hits.
+
+A unified store manages all stages despite disparate return types. Output types are erased to `dyn Any + Send + Sync`. Retrieving a value requires a lightweight `Arc::downcast`. Generic store implementations require a `V: ?Sized` bound.
 
 ```rust
 use std::any::Any;
@@ -566,27 +481,20 @@ assert_eq!(
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 1);
 ```
 
-## Where to look next
+## Further Documentation
 
-* `DESIGN.md` - the design: the model the engine embodies, why the builder is
-  the only public door, why registration takes `fn` pointers rather than a
-  trait, why there is one door onto running rather than two, why identity is a
-  position, and where the one store and the one error type come from. Its
-  "Ruled, not yet built" section is the shortest route to what is about to
-  change.
-* `libpipelinedata` - the shared vocabulary: `StageId`, `MemoKey`/`ContentKey`,
-  the `ContentHash` streaming hasher and derive, and the `MemoStore` seam.
-* The tests in `tests/` are written exclusively against the public API shown
-  on this page, and are a good second read.
+* `DESIGN.md` -  Architectural deep-dive covering builder exclusivity, pointer enforcement, positional identity, and single-store philosophies.
+* `libpipelinedata` -  Documentation for shared primitives: `StageId`, `MemoKey`, `ContentHash`, and `MemoStore`.
+* `tests/` -  Test suites validating the public API behaviors described herein.
 
 ## License
 
 Licensed under either of
 
- * Apache License, Version 2.0
-   ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license
-   ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+* Apache License, Version 2.0
+  ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license
+  ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
 
