@@ -1,18 +1,5 @@
 //! Memoization: the lookup precedes the work.
 
-// **Dead in the shipped library, alive in the test build - and that is the
-// flip's honest arithmetic rather than an oversight.**
-//
-// With the flat exports gone (`DESIGN.md`, "Migration plan") nothing outside
-// this crate can name what is below, and the builder has no spelling for it
-// yet, so the only callers are this module's own `#[cfg(test)]` tests. The
-// allow is `not(test)` ON PURPOSE: under `cargo test` the lint stays fully
-// armed, so code that becomes genuinely unused still fails the gate. It comes
-// off the day the builder grows the spelling the findings name, because the
-// builder will then be the caller.
-#![cfg_attr(not(test), allow(dead_code))]
-
-
 use std::task::Context;
 
 use libpipelinedata::{EffectPoll, MemoKey, MemoStore, Stage, StageId};
@@ -89,25 +76,25 @@ use crate::track::revalidating;
 ///
 /// This type is `libpipeline`'s and not `libpipelinedata`'s because it is
 /// machinery: a crate that only implements a stage should not link it
-/// (`DESIGN.md`, "Where a consumer works").
-pub(crate) struct Memo<S, St> {
+/// (`PLAN.md`, "Where a consumer works").
+pub struct Memo<S, St> {
     stage: S,
     store: St,
 }
 
 impl<S, St> Memo<S, St> {
     /// Put `store` in front of `stage`.
-    pub(crate) fn new(stage: S, store: St) -> Self {
+    pub fn new(stage: S, store: St) -> Self {
         Self { stage, store }
     }
 
     /// The stage behind the memo.
-    pub(crate) fn stage(&self) -> &S {
+    pub fn stage(&self) -> &S {
         &self.stage
     }
 
     /// The store behind the memo.
-    pub(crate) fn store(&self) -> &St {
+    pub fn store(&self) -> &St {
         &self.store
     }
 }

@@ -64,24 +64,17 @@
 //! key at all.
 //!
 //! **Read the list above as an inventory, not as an API.** Every item named in
-//! it is `pub(crate)`: the only things this crate exports are
-//! [`PipelineBuilder`], [`Pipeline`] and the result/report vocabulary their
-//! signatures name ([`DriveError`], [`ChainError`],
-//! [`PendingWork`]/[`NoPendingWork`], [`WakePath`]/[`WakeReport`]). `DESIGN.md`
-//! says why, and says what to do when a consumer needs one of the internals:
-//! that is a FINDING about the builder's reach, recorded there, not a
-//! re-export.
+//! it lives in `libpipeline-internals` and is reached only by this crate: the
+//! only things this crate exports are [`PipelineBuilder`], [`Pipeline`] and the
+//! result/report vocabulary their signatures name ([`DriveError`],
+//! [`ChainError`], [`PendingWork`]/[`NoPendingWork`],
+//! [`WakePath`]/[`WakeReport`]). `DESIGN.md` says why, and `PLAN.md` says what
+//! to do when a consumer needs one of the internals: that is a FINDING about
+//! the builder's reach, recorded there, not a re-export.
 
 #![forbid(unsafe_code)]
 
-mod boundary;
 mod builder;
-mod chain;
-mod driver;
-mod memo;
-mod schedule;
-mod track;
-mod watch;
 
 /// **The public door, and the whole of it.** See `DESIGN.md`: composition,
 /// memoization and driving go through the builder; `Stage` stays public to
@@ -89,27 +82,34 @@ mod watch;
 ///
 /// Everything the builder assembles - the chain, the memo layer, the frame
 /// driver, the drive functions, the tracked layer, the boundary layer, the
-/// scheduler and the builder's own store - is `pub(crate)` and cannot be named
-/// from outside this crate. A consumer that needs one is not missing an export;
-/// it has found something the builder cannot express, which `DESIGN.md` records
-/// as a finding.
+/// scheduler and the builder's own store - is `libpipeline-internals`', and a
+/// consumer that takes only this crate's manifest edge cannot name it. A
+/// consumer that needs one is not missing an export; it has found something the
+/// builder cannot express, which `PLAN.md` records as a finding.
 pub use builder::{Pipeline, PipelineBuilder, StagedPipelineBuilder};
 
 // Result and report vocabulary - named in the runner's signatures, so a
-// caller matching on them needs the names (DESIGN.md, "What else stays
+// caller matching on them needs the names (PLAN.md, "What else stays
 // public").
+//
+// A TEMPORARY LIST, and named one by one for that reason rather than glob-ed
+// out of the internals crate: all six leave over PLAN.md's steps 4 and 5.
+// `ChainError` goes with the nesting when the flat `Failure` lands, and
+// `DriveError`, `PendingWork`, `NoPendingWork`, `WakePath` and `WakeReport` go
+// with the four doors. What is re-exported here is exactly what today's
+// signatures oblige, so each removal is a signature change and nothing else.
 //
 // `ChainError` is here for that reason and not by inheritance: a pipeline of
 // two or more registered stages has `Error = ChainError<..>` in
 // `Pipeline::run`'s return type, so a caller matching on WHICH stage failed
 // must be able to name it. `Chain` - the type that builds such graphs - is not
-// public.
+// re-exported.
 //
 // `WakePath` is the exception worth stating: after the flip no public signature
 // names it, because the runner's watched door is `run_watched`, which reports a
 // `WakeReport` (counts) rather than per-poll paths. It is kept exported as the
 // report's vocabulary; the tests that read a path are `poll_watched`'s, and
-// they are unit tests in `src/watch.rs` for exactly that reason.
-pub use chain::ChainError;
-pub use driver::{DriveError, NoPendingWork, PendingWork};
-pub use watch::{WakePath, WakeReport};
+// they are `libpipeline-internals`' tests for exactly that reason.
+pub use libpipeline_internals::chain::ChainError;
+pub use libpipeline_internals::driver::{DriveError, NoPendingWork, PendingWork};
+pub use libpipeline_internals::watch::{WakePath, WakeReport};

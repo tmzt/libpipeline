@@ -1,6 +1,6 @@
 //! Gate: **the same two-stage graph runs under both drivers.**
 //!
-//! The two-driver rule (`DESIGN.md`, "Two drivers, one graph") claims "same
+//! The two-driver rule (`PLAN.md`, "Two drivers, one graph") claims "same
 //! stages, same keys, different driver". The graph below is
 //! built once, from stages that know nothing about who polls them, and is
 //! driven twice: to completion by the offline driver, and one frame at a time
@@ -543,7 +543,7 @@ fn one_memo_serves_both_drivers_and_the_stage_runs_once() {
     // used - measured rather than asserted about.
     //
     // **This is the public-API expression of what the retired ledger test
-    // measured** (DESIGN.md, "The ledger test, measured").
+    // measured** (PLAN.md, "The ledger test, measured").
     // That test wrapped the same shape in a `Ledger` scope
     // over a stage that read no tracked state, and mutation testing showed the
     // scope was inert in it: the known-bad `Memo::new(Tracked::new(..), ..)`

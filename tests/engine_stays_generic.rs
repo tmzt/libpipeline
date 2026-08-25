@@ -41,7 +41,12 @@
 
 /// The stack itself: the only crates a path dependency may point at, and the
 /// only path-reachable names permitted in a dependency table.
-const THE_STACK: &[&str] = &["libeffects", "libpipelinedata", "libpipelinedata-macros"];
+const THE_STACK: &[&str] = &[
+    "libeffects",
+    "libpipeline-internals",
+    "libpipelinedata",
+    "libpipelinedata-macros",
+];
 
 /// Registry crates the stack has decided to use, anywhere in its tree
 /// (dependencies and dev-dependencies alike). Adding a dependency to any stack

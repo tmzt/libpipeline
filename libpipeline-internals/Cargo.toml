@@ -1,0 +1,36 @@
+# The MACHINERY of the pipeline engine: the memo layer, the chain composite,
+# the two drivers and the watched drive, the error boundary, the read-tracking
+# ledger and the schedule. `libpipeline` is the facade over it, and the door a
+# consumer uses.
+#
+# WHY IT IS A CRATE OF ITS OWN (PLAN.md, step 1). The facade's claim is that
+# the builder is the only door; a `pub(crate)` boundary made that claim
+# unmeasurable, because a test inside the crate could reach past the builder
+# without leaving the source tree. With the machinery in a crate of its own the
+# facade's exports are the whole of what a consumer can name, and every test
+# that has to reach further is visibly a test of THIS crate - which is the
+# ratio PLAN.md set out to make visible.
+#
+# The shape is the workspace's own precedent, `libpipelinedata` beside
+# `libpipelinedata/libpipelinedata-macros`: nested inside the parent rather
+# than a sibling, because this submodule already has its crate at its root.
+# Cargo treats a directory with its own manifest as a separate package, and a
+# path dependency inside the workspace directory becomes a workspace member on
+# its own.
+#
+# THE DEPENDENCY LIST BELOW IS A PROOF, NOT A CONVENIENCE, for the reason the
+# parent manifest states: the engine may never learn a consumer's types, and
+# `libpipeline/tests/engine_stays_generic.rs` walks this manifest too - it is
+# reached by following the parent's path dependencies - and fails if a crate
+# outside the stack's own closed allowlist appears anywhere in the tree.
+[package]
+name = "libpipeline-internals"
+version = "0.1.0"
+edition = "2024"
+description = "The libpipeline engine's machinery: memo, chain, drivers, boundary, tracking ledger and schedule - the crate the builder facade is built over"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+libeffects = { path = "../../libeffects" }
+libpipelinedata = { path = "../../libpipelinedata" }

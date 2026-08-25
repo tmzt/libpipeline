@@ -1,7 +1,7 @@
 //! The two drivers.
 //!
 //! **Same stages, same keys, different driver** - that is the whole claim of
-//! the two-driver rule (`DESIGN.md`, "Two drivers, one graph"), and this
+//! the two-driver rule (`PLAN.md`, "Two drivers, one graph"), and this
 //! module is where it either holds or does not. Both drivers below
 //! take an arbitrary `S: Stage` and touch nothing else; neither has a method
 //! the other's stages would need. A stage cannot tell which one is polling it,
@@ -69,7 +69,7 @@ impl PendingWork for NoPendingWork {
 ///
 /// A batch run against an unchanged tree is all cache hits, because the memo
 /// keys are the same ones the interactive host used.
-pub(crate) fn run_to_completion<S, W>(
+pub fn run_to_completion<S, W>(
     stage: &S,
     input: &S::Input,
     work: &W,
@@ -107,7 +107,7 @@ where
 /// a [`WakeFlag`] instead, which records staleness without knowing how a
 /// redraw is requested - so such a host is this driver plus a proxy send
 /// beside the flag, not a different driver.
-pub(crate) struct FrameDriver {
+pub struct FrameDriver {
     stale: Arc<WakeFlag>,
 }
 
@@ -119,7 +119,7 @@ impl Default for FrameDriver {
 
 impl FrameDriver {
     /// A driver with a fresh, unstale flag.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             stale: WakeFlag::new(),
         }
@@ -127,18 +127,18 @@ impl FrameDriver {
 
     /// The waker this driver hands to every poll. Exposed so whatever lands a
     /// value out of band can wake the frame loop directly.
-    pub(crate) fn waker(&self) -> Waker {
+    pub fn waker(&self) -> Waker {
         self.stale.waker()
     }
 
     /// Whether a wake has arrived since this was last called - "stale, poll
     /// again". Reading clears it.
-    pub(crate) fn take_stale(&self) -> bool {
+    pub fn take_stale(&self) -> bool {
         self.stale.take_stale()
     }
 
     /// Poll the graph once. Returns immediately, whatever the answer.
-    pub(crate) fn poll_frame<S: Stage>(
+    pub fn poll_frame<S: Stage>(
         &self,
         stage: &S,
         input: &S::Input,

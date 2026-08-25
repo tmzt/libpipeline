@@ -17,10 +17,12 @@ use std::task::Waker;
 
 use libpipelinedata::{EffectPoll, MemoKey, MemoMap, MemoStore, Stage, StageId};
 
-use crate::chain::{Chain, ChainError};
-use crate::driver::{DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion};
-use crate::memo::Memo;
-use crate::watch::{WakeReport, run_to_completion_watched};
+use libpipeline_internals::chain::{Chain, ChainError};
+use libpipeline_internals::driver::{
+    DriveError, FrameDriver, NoPendingWork, PendingWork, run_to_completion,
+};
+use libpipeline_internals::memo::Memo;
+use libpipeline_internals::watch::{WakeReport, run_to_completion_watched};
 
 /// The store the builder wraps around each registered stage.
 ///
@@ -223,7 +225,7 @@ impl<S: Stage> StagedPipelineBuilder<S> {
 ///
 /// The graph parameter is opaque (`impl Stage` out of the builder); consumers
 /// hold a `Pipeline` by inference and cannot reach the machinery inside. Both
-/// drive modes are here (`DESIGN.md`, "Two drivers, one graph") - same graph,
+/// drive modes are here (`PLAN.md`, "Two drivers, one graph") - same graph,
 /// same keys, and a stage cannot tell which one is polling it.
 pub struct Pipeline<S> {
     graph: S,

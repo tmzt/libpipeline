@@ -22,3 +22,7 @@ publish = false
 [dependencies]
 libeffects = { path = "../libeffects" }
 libpipelinedata = { path = "../libpipelinedata" }
+# The machinery this crate is the facade over (PLAN.md, step 1). Nested inside
+# this crate rather than beside it, on `libpipelinedata-macros`' precedent;
+# `libpipeline-internals/Cargo.toml` says why it is a crate at all.
+libpipeline-internals = { path = "libpipeline-internals" }
