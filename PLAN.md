@@ -44,7 +44,7 @@ and `libpipelinedata` at `db3c1eb` (branch `highbay-clean`, clean), on
 | 4 - one flat error | `ac2299a` | `Failure<E>` with private fields and `at()` (`src/builder.rs:280`); `ChainError` and its two `map_err` arms gone |
 | 5 - the outcome and the one door | `7a20d63`, data half `402099c` | `Run`/`RunResult`, the version gate with its wake half; `MemoStore` is `Arc` on both sides with `V: ?Sized` |
 | the door flip | `790863b`, data half `db3c1eb` | `stage_fn(name, key, poll)` taking two `fn` pointers; `Ctx` carrying `StageId` and waker; `Stage` moved to `libpipeline-internals/src/stage.rs`; the graph boxed behind private fields (`src/builder.rs:86`); `poll` replacing `run`; `take_stale` off the API; `run_blocking` a free function; the `Arc` out of the associated type; `Shared` deleted |
-| 7 - the ladder | this commit, data half this commit | `StageAnswer` in `libpipelinedata` (`src/answer.rs`), inside `EffectPoll::Ready`; `Chain` skips its second half on an `Unchanged` first half and holds a `Joint` for what it owes; `Memo` holds the slot and asserts the cold-slot invariant; `Pipeline::poll` maps a root `Unchanged` and records the version for it |
+| 7 - the ladder | `0854a11`, data half `228db81` | `StageAnswer` in `libpipelinedata` (`src/answer.rs`), inside `EffectPoll::Ready`; `Chain` skips its second half on an `Unchanged` first half and holds a `Joint` for what it owes; `Memo` holds the slot and asserts the cold-slot invariant; `Pipeline::poll` maps a root `Unchanged` and records the version for it |
 
 The door flip is deliberately unnumbered: step 6's number is cited from
 source and could not be taken.
