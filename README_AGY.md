@@ -1,32 +1,58 @@
 # libpipeline
 
-`libpipeline` provides an incremental pipeline engine. It executes pipelines composed of pure, poll-driven stages. The engine implements automatic memoization for all stages by computing cache keys prior to execution, assembles the stages into a unified execution graph, and drives computation through a single, non-blocking entry point: `poll(version, &input)`.
+`libpipeline` is an engine for incremental computation. Complex software systems—such as compilers, interactive document editors, and real-time renderers—often process data through a lengthy sequence of dependent steps. When the source data changes incrementally over time, executing the entire sequence from scratch becomes prohibitively expensive.
 
-Execution is decoupled from polling strategies. The pipeline architecture supports arbitrary polling intervals—from blocking execution within a build tool to frame-synchronous polling in interactive applications—utilizing identical stage definitions, cache semantics, and API boundaries.
+To solve this, `libpipeline` allows developers to define computations as a sequence of independent stages. The engine automatically manages the dependency graph between these stages. Before executing any computational work, the engine calculates a unique identity key for the pending input. If the engine recognizes this key from a previous execution, it immediately retrieves the cached output, preempting redundant computation entirely.
 
-## Concept-Heavy
+The engine exposes a single, unified entry point to drive this process: `poll(version, &input)`. Execution is strictly non-blocking and completely decoupled from any specific polling strategy. Whether you are blocking a background thread to completion for a batch build tool, or polling once per frame in an interactive host application, you rely on the exact same stage definitions, cache semantics, and API boundaries.
+
+## Core Design Philosophy
+
+The primary objective of `libpipeline` is to make incremental, memoized computation reliable and deterministic. Doing so requires strict guarantees about how data flows and how state is preserved. If intermediate computational steps hide mutable state, or if side effects go untracked, the cache logic fails and the pipeline serves stale data.
+
+To guarantee cache correctness across the dependency graph, the architecture enforces several strict design invariants:
 
 ### Architectural Design Invariants
-
-To guarantee correct cache semantics and deterministic execution, the architecture relies on several strict design invariants:
 
 #### Compilation-Enforced Statelessness
 
 A stage is defined strictly by two function pointers: a key function for input identification and a poll function for output generation. The API enforces statelessness at compile time by requiring raw `fn` pointers; capturing closures fail to compile. This statically prevents hidden state mutations from invalidating cache guarantees. All ambient context is passed explicitly via the `Ctx` parameter.
 
+```rust,ignore
+// Valid: Non-capturing closures coerce safely to raw `fn` pointers.
+builder.stage_fn(
+    "scale",
+    /* Key Function: identifies the input */
+    |input: &i32, ctx| Some(ctx.key([ContentKey::of(input)])),
+    /* Compute / Poll Function: produces the output strictly from the input */
+    |input: &i32, _ctx| StageAnswer::computed(input * 2)
+);
+
+let ambient_multiplier = 3;
+
+// Invalid: Capturing closures fail to compile.
+// The compiler rejects this because it cannot coerce a closure that captures
+// `ambient_multiplier` into a raw `fn` pointer.
+builder.stage_fn(
+    "scale_dynamic",
+    |input: &i32, ctx| Some(ctx.key([ContentKey::of(input)])),
+    |input: &i32, _ctx| StageAnswer::computed(input * ambient_multiplier) // Compilation Error!
+);
+```
+
 #### Cache-Lookup Preemption
 
-Keys are computed purely from inputs prior to stage execution. This enables the engine to preempt execution entirely upon a cache hit.
+Keys are computed purely from inputs prior to stage execution. This enables the engine to preempt execution entirely upon a cache hit, avoiding even the setup cost of the stage.
 
 #### Poll-Driven Execution & Wakers
 
 The engine never blocks. Stages performing asynchronous operations yield a pending state and register a waker. When out-of-band data arrives, the waker signals the engine, prompting the caller's next poll to retrieve the finalized value.
 
-`libpipeline` handles execution logic, while its companion crate, `libpipelinedata`, defines the shared data structures, including key types, content hashes, and the `MemoStore` interface.
+`libpipeline` handles the core execution and memoization logic, while its companion crate, `libpipelinedata`, defines the shared data structures, including key types, content hashes, and the `MemoStore` interface.
 
-## Implementation-Heavy
+## Developer Integration Guide
 
-Every example provided is an executable doctest.
+Every example provided below is an executable doctest.
 
 ### Constructing the Pipeline
 
@@ -256,7 +282,51 @@ assert_eq!(SHOUT_RUNS.load(Ordering::Relaxed), 1);
 
 `unchanged` fundamentally references a prior output. Emitting `unchanged` during a stage's initial execution triggers a panic, as no previous value exists to reference.
 
-#### Contractual Trust
+The correct sequence requires executing a compute pass before returning `unchanged`:
+
+```rust
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer};
+
+let unkeyed = |_input: &String, _ctx: &Ctx<'_>| -> Option<MemoKey> { None };
+let upper = |input: &String, _ctx: &Ctx<'_>| -> EffectPoll<StageAnswer<String>, &'static str> {
+    match input.chars().any(|c| c.is_lowercase()) {
+        true => StageAnswer::computed(input.to_uppercase()),
+        false => StageAnswer::unchanged(),
+    }
+};
+
+let pipeline = PipelineBuilder::new()
+    .stage_fn("upper", unkeyed, upper)
+    .build();
+
+// Initial poll performs computation
+assert!(pipeline.poll(1, &"hi".to_string()).is_ok());
+
+// Subsequent poll can now safely return Unchanged
+assert_eq!(pipeline.poll(2, &"HI".to_string()), Ok(Run::Unchanged));
+```
+
+Triggering `unchanged` on a cold pipeline without a prior cached value results in a panic:
+
+```rust,should_panic
+use libpipeline::{Ctx, PipelineBuilder};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer};
+
+let unkeyed = |_input: &String, _ctx: &Ctx<'_>| -> Option<MemoKey> { None };
+let premature = |_input: &String, _ctx: &Ctx<'_>| -> EffectPoll<StageAnswer<String>, &'static str> {
+    StageAnswer::unchanged()
+};
+
+let pipeline = PipelineBuilder::new()
+    .stage_fn("premature", unkeyed, premature)
+    .build();
+
+// Panics: stage at position 0 answered Unchanged before it had answered at all
+let _ = pipeline.poll(1, &"hi".to_string());
+```
+
+### Contractual Trust
 
 The engine does not verify the accuracy of `unchanged`. If a stage mutates data but emits `unchanged`, the pipeline permanently serves stale data. This contract, similar to a `Pending` future promising a subsequent wake, must be upheld by the stage logic.
 
