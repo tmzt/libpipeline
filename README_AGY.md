@@ -4,7 +4,7 @@
 
 Execution is decoupled from polling strategies. The pipeline architecture supports arbitrary polling intervals—from blocking execution within a build tool to frame-synchronous polling in interactive applications—utilizing identical stage definitions, cache semantics, and API boundaries.
 
-## Architecture and Core Concepts
+## Concept-Heavy
 
 ### Architectural Design Invariants
 
@@ -24,9 +24,11 @@ The engine never blocks. Stages performing asynchronous operations yield a pendi
 
 `libpipeline` handles execution logic, while its companion crate, `libpipelinedata`, defines the shared data structures, including key types, content hashes, and the `MemoStore` interface.
 
+## Implementation-Heavy
+
 Every example provided is an executable doctest.
 
-## Constructing the Pipeline
+### Constructing the Pipeline
 
 A pipeline stage fundamentally pairs a key function with a poll function. The builder interface is the exclusive mechanism for composition, implicit memoization, and pipeline execution.
 
@@ -75,7 +77,7 @@ When a stage completes, `Run::Computed` returns an `Arc` containing the output. 
 * **Implicit Memoization:** Registration and memoization are inseparable. There is no un-memoized execution path.
 * **Explicit State Returns:** A stage signals new output via `StageAnswer::computed(value)`, or signals an unchanged state via `StageAnswer::unchanged()`.
 
-## Stage Chaining
+### Stage Chaining
 
 Pipelines scale by chaining subsequent `.stage_fn(..)` calls. Downstream stages consume the unwrapped output of their immediate predecessors. The pipeline enforces a single, unified error type across all stages. When an error occurs, the pipeline surfaces the failure alongside the numerical position of the originating stage.
 
@@ -130,13 +132,13 @@ assert_eq!(*failure.error(), "nothing to split");
 
 *(Note: `#`-prefixed lines within doctests duplicate earlier definitions to satisfy compilation requirements.)*
 
-## Incremental Memoization
+### Incremental Memoization
 
 The engine executes a cache lookup for every registered stage prior to polling. The cache key combines the internal `stage id` and the content keys of the provided inputs. If the input remains unchanged, the cache lookup succeeds, and stage execution is entirely bypassed.
 
 In the following example, advancing the version while maintaining identical content forces the poll past the fast-path version gate, engaging the memo cache.
 
-### State Management Considerations
+#### State Management Considerations
 
 Because stages are raw `fn` pointers without internal fields, required external state (e.g., metrics counters, texture atlases) must reside in static memory. Future revisions of the API intend to expose such ambient context natively through the `Ctx` parameter (refer to `DESIGN.md`).
 
@@ -185,11 +187,11 @@ assert_eq!(control.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))))
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 3); // the control ran every time
 ```
 
-### Uncacheable Operations
+#### Uncacheable Operations
 
 Stages performing side effects or reading state that cannot be keyed must return `None` from the key function. The engine bypasses cache lookups and storage for these stages without affecting the rest of the pipeline. Failures are never cached; storing a transient error would indefinitely mask recovery.
 
-## State Unchanged Optimization
+### State Unchanged Optimization
 
 Stages that process input without enacting modifications can return `StageAnswer::unchanged()`.
 
@@ -250,15 +252,15 @@ assert_eq!(UPPER_RUNS.load(Ordering::Relaxed), 2);
 assert_eq!(SHOUT_RUNS.load(Ordering::Relaxed), 1);
 ```
 
-### Usage Constraints
+#### Usage Constraints
 
 `unchanged` fundamentally references a prior output. Emitting `unchanged` during a stage's initial execution triggers a panic, as no previous value exists to reference.
 
-### Contractual Trust
+#### Contractual Trust
 
 The engine does not verify the accuracy of `unchanged`. If a stage mutates data but emits `unchanged`, the pipeline permanently serves stale data. This contract, similar to a `Pending` future promising a subsequent wake, must be upheld by the stage logic.
 
-## Execution and the Polling Interface
+### Execution and the Polling Interface
 
 The `poll(version, &readable)` method executes a single, non-blocking pipeline iteration. It yields one of four variants:
 
@@ -305,13 +307,13 @@ assert_eq!(pipeline.poll(2, &"hi".to_string()), Ok(Run::Computed(Arc::new(2))));
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 2);
 ```
 
-### Waker Preemption
+#### Waker Preemption
 
 The pipeline must execute if either the input version advances or an asynchronous waker signals a pending effect. Because effects resolve asynchronously, the early-exit version gate returns `Unchanged` only if the version matches *and* no wakes are pending.
 
 The internal wake flag clears immediately upon read. Exposing this flag via a public API would steal the signal from the version gate, causing deadlocks. Out-of-band resolutions obtain wakers via `Ctx::waker()`. For frame-continuous applications, frequent polling handles these updates optimally, as `Unchanged` returns incur negligible overhead.
 
-## Polling Strategies
+### Polling Strategies
 
 The pipeline exposes only `poll`. It remains agnostic to the caller's execution strategy.
 
@@ -391,15 +393,15 @@ let outcome = run_blocking(&pipeline, 1, &(), || {
 assert_eq!(outcome, Ok(Run::Computed(Arc::new(7))));
 ```
 
-### Waker Obligations
+#### Waker Obligations
 
 Emitting a `Delayed` response without registering a corresponding waker constitutes a critical defect. It silently deadlocks frame-driven callers and induces infinite loops in blocking callers. Stages returning `Pending` are strictly obligated to register a waker.
 
-## Storage Interface Seam
+### Storage Interface Seam
 
 Computation is structurally decoupled from storage. The cache backend is configured globally during builder initialization. While the pipeline defaults to an internal hash map, custom `MemoStore` implementations (e.g., for LRU eviction policies or disk persistence) can be injected via `.store(..)`. The pipeline assumes ownership of the store for its lifecycle.
 
-### Shared Reference Mandate
+#### Shared Reference Mandate
 
 The storage interface exclusively handles `Arc` pointers. Cache misses allocate once; cache hits incur only a reference count increment. This strictly prevents stage authors from inadvertently duplicating large structures on cache hits.
 
@@ -483,9 +485,9 @@ assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 1);
 
 ## Further Documentation
 
-* `DESIGN.md` -  Architectural deep-dive covering builder exclusivity, pointer enforcement, positional identity, and single-store philosophies.
-* `libpipelinedata` -  Documentation for shared primitives: `StageId`, `MemoKey`, `ContentHash`, and `MemoStore`.
-* `tests/` -  Test suites validating the public API behaviors described herein.
+* `DESIGN.md` — Architectural deep-dive covering builder exclusivity, pointer enforcement, positional identity, and single-store philosophies.
+* `libpipelinedata` — Documentation for shared primitives: `StageId`, `MemoKey`, `ContentHash`, and `MemoStore`.
+* `tests/` — Test suites validating the public API behaviors described herein.
 
 ## License
 
