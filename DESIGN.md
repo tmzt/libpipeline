@@ -16,11 +16,12 @@ an input that moves a step's output without moving its key.
 
 !!! MOSTLY BUILT
 
-The public API below, the version gate, the one store, the flat error and the
-`fn` registration door are built. What is not is collected in **"Ruled, not
-yet built"**, at the end of Internals - read that section before acting on
-anything here, because several of its entries change what a memo key IS. The
-companion `PLAN.md` records the migration that got the crate here.
+The public API below, the version gate, the one store, the flat error, the
+`fn` registration door and the stage-level `Unchanged` are built. What is not
+is collected in **"Ruled, not yet built"**, at the end of Internals - read that
+section before acting on anything here, because several of its entries change
+what a memo key IS. The companion `PLAN.md` records the migration that got the
+crate here.
 
 ## How to read this
 
@@ -102,14 +103,14 @@ matters only when the default store is wrong.
 
 ```rust,ignore
 use libpipeline::{Ctx, PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
 fn parse_key(input: &Source, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([ContentKey::of(input)]))
 }
 
-fn parse(input: &Source, _ctx: &Ctx<'_>) -> EffectPoll<Parsed, Error> {
-    EffectPoll::Ready(Parsed::of(input))
+fn parse(input: &Source, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Parsed>, Error> {
+    StageAnswer::computed(Parsed::of(input))
 }
 
 let pipeline = PipelineBuilder::new()
@@ -124,8 +125,9 @@ let pipeline = PipelineBuilder::new()
   pointers**. `key` answers this input's memo key without running anything,
   which is what lets a lookup precede the work; `None` there means the input
   cannot be honestly addressed, and the step is then neither looked up nor
-  recorded. `poll` answers `EffectPoll` - `Ready` with the value, `Pending`
-  having arranged a wake, or `Failed`. Both receive a `Ctx`, which carries
+  recorded. `poll` answers `EffectPoll` - `Ready` with a `StageAnswer` (see
+  "What a stage's `Ready` says", below), `Pending` having arranged a wake, or
+  `Failed`. Both receive a `Ctx`, which carries
   the identity the builder **mints** for this registration - its position and
   nothing else; the `name` beside it is a diagnostic label, not an identity
   (see "Identity is a position"). Steps chain: each consumes what the
@@ -148,6 +150,44 @@ let pipeline = PipelineBuilder::new()
   assembled graph is erased behind a private field, so nothing about the
   machinery is spellable from a pipeline's type.
 
+### What a stage's `Ready` says
+
+A `Ready` carries a `StageAnswer`, which is two things:
+
+* `StageAnswer::computed(value)` - work happened, here is the value. The
+  ordinary answer, and what a stage with nothing clever to say always writes.
+* `StageAnswer::unchanged()` - the answer this stage last gave still stands.
+
+**`Unchanged` carries nothing, and that is what makes it worth having.** It is
+not "the same value, here it is again". The value is already in the slot this
+position last answered from, so the variant has nothing to carry - and a stage
+answering it hands the stage AFTER it no input to be polled over, so that stage
+is never entered at all. The saving is the rest of the chain, not a refcount.
+The answer walks to the root and the caller is told `Run::Unchanged`, which
+asks it to keep what it holds.
+
+Early cutoff is then OBSERVED rather than reconstructed. A domain pass that
+walked a tree and rewrote nothing knows so at its return; before this, both
+paths returned the same type and the distinction was discarded, to be
+rediscovered afterwards by addressing the output - a traversal per node per
+poll to learn a fact the node already had.
+
+**A stage may answer it only where it has answered before.** `Unchanged` refers
+to an earlier answer at the same position; follow the references back and they
+end at a first stage on a cold pipeline, which has no upstream to have told it
+anything and must compute. So the engine asserts it and panics naming the
+position. It is an invariant to check rather than a type to encode, because the
+induction is what makes it true - and what the panic protects is the caller,
+who is being told to keep a value it was never given.
+
+**And a stage that answers it wrongly cannot be caught.** One that says
+`Unchanged` while its output moved makes the pipeline serve a stale value
+forever, invisibly: answers do not change, only which answer is served does.
+That is the same class as a forgotten waker. Where a stage has a key function
+the engine could catch it - compare the new key against the slot's when the
+stage answers `Computed`, and complain in debug when they are equal - which is
+a detector rather than a compensator, and it waits on the per-stage key.
+
 `.stage_fn()` hands back a `StagedPipelineBuilder`, which is not a further
 thing to learn: its fields are private and it has no constructor, so a
 consumer receives one, calls a method on it, and with method chaining never
@@ -166,7 +206,7 @@ which is what makes `Pending` an honest answer. "The intended stage shape"
 under Internals records what it does not carry yet.
 
 A consumer writes functions and assembles nothing. The vocabulary those
-functions name - `EffectPoll`, `MemoKey`, `ContentKey` - is
+functions name - `EffectPoll`, `StageAnswer`, `MemoKey`, `ContentKey` - is
 `libpipelinedata`'s. The stage CONTRACT is not: it is
 `libpipeline-internals`', because with registration taking functions nothing
 outside the engine implements it.
@@ -217,11 +257,19 @@ remembering to wrap one: the engine wraps once, where a poll function's value
 enters the graph, and every hit after that is a refcount bump.
 
 `Run::Unchanged` - the value already held derives from exactly this state;
-keep it. The pipeline compares the version it is handed against the one it
-last computed for, and on a match answers without reading the readable at
-all. Read it as **the value is finished**: not a report that nothing
+keep it. Read it as **the value is finished**: not a report that nothing
 happened, but a statement that nothing needs to, which is what lets a
 caller draw the value it holds and stop.
+
+Two things answer it. The VERSION GATE does, when the version it is handed
+is the one it last recorded and no wake is pending - on that path the
+readable is not dereferenced, no memo key is computed and no stage is
+polled. And the GRAPH does, when a stage that WAS entered answered
+`StageAnswer::unchanged()`: the stages after it are never entered, the
+answer reaches the root, and the door records the version for it exactly as
+it does for a computed one. Which of the two happened is the pipeline's own
+business; a caller that could tell them apart would have nothing different
+to do about it.
 
 `Run::Delayed` - not ready; a wake is coming. The poll has arranged for the
 pipeline's waker to be woken when the answer becomes possible, so wait to
@@ -327,8 +375,8 @@ parameter `?Sized` and is otherwise unchanged.
 The whole public surface: `PipelineBuilder`, `Pipeline`, `Run`, `Failure`,
 the `RunResult` alias, `Ctx`, the `run_blocking` function, and the
 `MemoStore` seam. The vocabulary a step's functions name (`StageId`,
-`MemoKey`, `ContentKey`, `EffectPoll`, `MemoStore`, `MemoMap`, `NoMemo`)
-lives in `libpipelinedata`. `StageId` is held, never constructed - the
+`MemoKey`, `ContentKey`, `EffectPoll`, `StageAnswer`, `MemoStore`, `MemoMap`,
+`NoMemo`) lives in `libpipelinedata`. `StageId` is held, never constructed - the
 builder mints one per registration and hands it through `Ctx`.
 
 `Ctx` and `run_blocking` are additions to the count this section used to
@@ -519,13 +567,27 @@ Bottom-up, the machinery the builder assembles:
 * **Composition** (`src/chain.rs`) - two stages composed, itself a stage.
   Refuses to key (`memo_key -> None`); its parts are memoized instead. Both
   halves share the pipeline's one error type, so a join propagates the
-  error unchanged, and the failing position is stamped at registration.
+  error unchanged, and the failing position is stamped at registration. It
+  is where `Unchanged` is spent: an `Unchanged` first half means the second
+  is not polled and the composite answers `Unchanged` too. The one piece of
+  state a join holds is what it OWES - a second half that answered `Pending`
+  or failed has produced no answer to stand on, so the join remembers what it
+  last handed on and re-polls over it rather than skipping. Without that, a
+  value landing behind an unchanging upstream would be lost rather than late.
 * **Memoization** (`src/memo.rs`) - the memo layer: lookup precedes the
   work, only `Ready` recorded, and the store is skipped entirely while
   `revalidating()` (`src/track.rs`) is true - the thread-local channel by
   which read tracking outranks the store without any stage declaring
   anything. Merged into registration: every `.stage_fn()` call wraps its
   stage in one, each holding a shared handle to the builder's one store.
+
+  It also holds the SLOT: the single last share this POSITION answered with,
+  from the stage or from a store hit, which is what an `Unchanged` refers to
+  and what makes the cold-slot assertion possible. Beside the store rather
+  than in it, because the store is keyed by the INPUT and answers for any
+  input it has seen, while the slot is keyed by nothing and answers for the
+  consumer's held value. The two collapse into one when the store becomes a
+  slot per position.
 * **Read tracking** (`src/track.rs`) - read observation at the edges, the
   wake subscription that reaches the gate's stale flag, and the output-edge
   cutoff.
@@ -599,10 +661,15 @@ nothing.
 The version gate sits above the whole graph, outermost: it is the pipeline
 remembering what it last ran against, not a per-stage concern. Stage-level
 memoization still does its work on the version-mismatch path - an input
-that moved its version but not its content still hits at the first stage. A
-later wiring of read tracking to the gate would let `Unchanged` also fire
-when a recompute reaches the root with an unchanged content address
-(root-level backdating), through the same variant, with no API change.
+that moved its version but not its content still hits at the first stage.
+
+`Unchanged` also fires on the OTHER path, and it arrives through the same
+variant with no API change, as this section always said it would: a stage
+that rewrote nothing answers so, no stage after it is entered, and the
+answer reaches the root. What was anticipated here as root-level backdating
+- addressing the output at the root and comparing it - is not what does it.
+The stage says so itself, which is cheaper and truer, and it is why
+`Backdated` has a successor rather than a future.
 
 ### Read-state tracking at the edges
 
@@ -741,6 +808,22 @@ an alternative lives, in full.
   distinguishes nothing. The serial carries instance identity by itself,
   and a rebuild mints a new one, so keyed state already dies with the
   instance - everything the hash would have been belt-and-braces for.
+
+* **A fourth `EffectPoll` variant for `Unchanged`, or a flag beside the
+  answer.** Not the design: the distinction lives INSIDE `Ready`, as
+  `StageAnswer`. A fourth variant would put a pipeline concept into the effect
+  protocol, which is `libeffects`' and is spoken by every effect in the system,
+  for a distinction only a stage can draw. A flag - set on the `Ctx` the stage
+  is handed, read by the engine after the poll returns - cannot express the
+  shape at all: the poll function's return type demands a value on the `Ready`
+  path and a stage answering `Unchanged` has none, the value being in a slot
+  the stage cannot reach. The flag was costed while `Unchanged` still carried
+  the value, and with the value gone there is nothing for it to accompany.
+  Beyond that, it would be a side channel for an ANSWER, next to the answer.
+  Nesting inside `Ready` costs neither: `Ready` means "here is the current
+  answer" and "the answer you have still stands" is one, `Pending` and `Failed`
+  are untouched, and `BoundStage` still implements `Effect`, which is the
+  compiler's check that the stage contract IS the effect protocol.
 
 * **A trait-taking stage door.** Not the design: a door typed on a trait
   hands back a struct, and structs accrete fields - each one a candidate
@@ -887,25 +970,31 @@ each is a ruling.
   already takes a key function, so the variant is the DEFAULT changing rather
   than a new parameter appearing.
 
-* **A stage answering `Unchanged`.** Early cutoff can be OBSERVED from a
-  stage's own answer or RECONSTRUCTED by comparing outputs afterwards.
-  `Backdated` (`src/track.rs`) is the second: it addresses each `Ready`
-  output and retracts its consumers' staleness when the address repeats -
-  work after the fact, and work the domain has often already done. The first
-  is cheaper and is already present in the consumer's vocabulary: a domain
-  pass that rewrote nothing says so at its return, and the distinction is
-  then discarded because both paths return the same type.
+* **A stage answering `Unchanged`. BUILT** - see "What a stage's `Ready`
+  says" under Public API, which is now the description. Kept here for one
+  correction, because getting it wrong in this document is worth more written
+  down than quietly fixed.
 
-  A stage-level `Unchanged` is a different shape from the caller-facing one:
-  the caller's carries nothing, because the caller already holds the value; a
-  stage's must still carry the value, because its consumers need one either
-  way. "The same value, and I am telling you it is the same" - not "no
-  value".
+  This entry used to say: *"A stage-level `Unchanged` is a different shape
+  from the caller-facing one: the caller's carries nothing, because the caller
+  already holds the value; a stage's must still carry the value, because its
+  consumers need one either way."* **That is wrong, and it was the whole
+  difference between a saving worth building and one worth skipping.** A
+  stage's consumer does NOT need a value: if its input is the same one it was
+  handed last time, its own answer over that input already stands, so it is
+  not polled at all and there is nothing to hand it. Carrying the value would
+  have bought a refcount bump; carrying nothing buys the rest of the chain.
 
-  A stage that can answer it needs nothing the door does not already pass:
-  it has its input and, once the version is the key, the version. What it
-  needs is somewhere to PUT the answer, which is the outcome enum gaining a
-  variant.
+  The mistake is instructive rather than careless: it followed from asking
+  what the consumer needs IF IT RUNS, when the point is that it does not run.
+
+  What was right, and stands: early cutoff can be OBSERVED from a stage's own
+  answer or RECONSTRUCTED by comparing outputs afterwards; `Backdated`
+  (`src/track.rs`) is the second, addressing each `Ready` output and retracting
+  its consumers' staleness when the address repeats - work after the fact, and
+  work the domain has often already done. And a stage that can answer it needs
+  nothing the door does not already pass. What it needed was somewhere to PUT
+  the answer, which is `StageAnswer`, inside `Ready`.
 
 * **What `libpipelinedata` is for.** With `Stage` internal, the crate's
   stated purpose - author a stage without linking the engine - has no

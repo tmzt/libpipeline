@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
 use libpipeline::{Ctx, Failure, Pipeline, PipelineBuilder, Run, RunResult};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, StageAnswer};
 
 /// A deterministic content key for test inputs. What matters here is only
 /// that distinct inputs get distinct keys; real stages use the hash module.
@@ -84,9 +84,9 @@ fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([key_of_bytes(input.as_bytes())]))
 }
 
-fn len_poll(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+fn len_poll(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
     bump(&LEN_RUNS);
-    EffectPoll::Ready(input.len())
+    StageAnswer::computed(input.len())
 }
 
 /// Second stage: doubles, counting its runs. Its input is the previous stage's
@@ -95,9 +95,9 @@ fn double_key(input: &usize, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([ContentKey::from_u128(*input as u128)]))
 }
 
-fn double_poll(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+fn double_poll(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
     bump(&DOUBLE_RUNS);
-    EffectPoll::Ready(input * 2)
+    StageAnswer::computed(input * 2)
 }
 
 /// Third stage: renders the count, so a pipeline can hold two stages whose
@@ -106,9 +106,9 @@ fn render_key(input: &usize, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([ContentKey::from_u128(*input as u128)]))
 }
 
-fn render_poll(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<String, &'static str> {
+fn render_poll(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
     bump(&RENDER_RUNS);
-    EffectPoll::Ready(input.to_string())
+    StageAnswer::computed(input.to_string())
 }
 
 // ---------------------------------------------------------------------- gates
@@ -138,8 +138,8 @@ fn a_capturing_closure_is_not_a_stage() {
         .stage_fn(
             "len",
             |input: &String, ctx: &Ctx<'_>| Some(ctx.key([key_of_bytes(input.as_bytes())])),
-            |input: &String, _ctx: &Ctx<'_>| -> EffectPoll<usize, &'static str> {
-                EffectPoll::Ready(input.len())
+            |input: &String, _ctx: &Ctx<'_>| -> EffectPoll<StageAnswer<usize>, &'static str> {
+                StageAnswer::computed(input.len())
             },
         )
         .build();
@@ -276,7 +276,7 @@ fn reject_key(_input: &usize, _ctx: &Ctx<'_>) -> Option<MemoKey> {
     None
 }
 
-fn reject_poll(_input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+fn reject_poll(_input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
     EffectPoll::Failed("rejected")
 }
 
@@ -349,19 +349,19 @@ fn watches_key(_input: &(), _ctx: &Ctx<'_>) -> Option<MemoKey> {
 /// effect that lands more than once - and it is the shape that makes the wake
 /// half of the version gate observable, because the second landing moves the
 /// answer without moving the input version.
-fn watches_poll(_input: &(), ctx: &Ctx<'_>) -> EffectPoll<u64, &'static str> {
+fn watches_poll(_input: &(), ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<u64>, &'static str> {
     let slot = slot();
     *slot.waker.lock().unwrap() = Some(ctx.waker().clone());
     match *slot.value.lock().unwrap() {
-        Some(value) => EffectPoll::Ready(value),
+        Some(value) => StageAnswer::computed(value),
         None => EffectPoll::Pending,
     }
 }
 
 /// The same stage minus the one line that keeps the subscription.
-fn forgetful_poll(_input: &(), _ctx: &Ctx<'_>) -> EffectPoll<u64, &'static str> {
+fn forgetful_poll(_input: &(), _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<u64>, &'static str> {
     match *slot().value.lock().unwrap() {
-        Some(value) => EffectPoll::Ready(value),
+        Some(value) => StageAnswer::computed(value),
         None => EffectPoll::Pending,
     }
 }

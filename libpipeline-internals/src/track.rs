@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
 
-use libpipelinedata::{ContentHash, ContentKey, EffectPoll, MemoKey, StageId};
+use libpipelinedata::{ContentHash, ContentKey, EffectPoll, MemoKey, StageAnswer, StageId};
 
 use crate::Stage;
 
@@ -639,7 +639,7 @@ impl<S: Stage> Stage for Tracked<S> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         self.ledger.observe_read(self.node);
         let polled = self
             .ledger
@@ -750,26 +750,39 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         let polled = self.tracked.poll_stage(input, cx);
-        if let EffectPoll::Ready(value) = &polled {
-            // After the scope has closed, deliberately: `unchanged` walks this
-            // node's READERS, and doing it from inside the node's own run would
-            // retract a reason from a consumer that is at that moment part-way
-            // through the poll which pulled us.
-            // The share is dereferenced to address the VALUE: what a node's
-            // consumers care about is what it produced, not which allocation
-            // carried it.
-            let address = ContentKey::of(&**value);
-            let repeated = self
-                .last
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .replace(address)
-                == Some(address);
-            if repeated {
+        match &polled {
+            EffectPoll::Ready(StageAnswer::Computed(value)) => {
+                // After the scope has closed, deliberately: `unchanged` walks
+                // this node's READERS, and doing it from inside the node's own
+                // run would retract a reason from a consumer that is at that
+                // moment part-way through the poll which pulled us.
+                // The share is dereferenced to address the VALUE: what a node's
+                // consumers care about is what it produced, not which
+                // allocation carried it.
+                let address = ContentKey::of(&**value);
+                let repeated = self
+                    .last
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .replace(address)
+                    == Some(address);
+                if repeated {
+                    self.tracked.ledger().unchanged(self.tracked.node());
+                }
+            }
+            // **The stage said it itself, so there is nothing to address.**
+            // This node's output is the one it last produced - which is what
+            // the comparison above spends a traversal to discover - so the
+            // retraction happens and the recorded address stands unchanged.
+            // A `Backdated` over a stage that answers `Unchanged` is paying for
+            // a cutoff it is being handed; `PLAN.md`'s step 7 is why this type
+            // has a successor rather than a future.
+            EffectPoll::Ready(StageAnswer::Unchanged) => {
                 self.tracked.ledger().unchanged(self.tracked.node());
             }
+            EffectPoll::Pending | EffectPoll::Failed(_) => {}
         }
         polled
     }

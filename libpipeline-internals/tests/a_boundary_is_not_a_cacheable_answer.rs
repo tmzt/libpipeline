@@ -45,7 +45,7 @@ use std::task::{Context, Waker};
 use libeffects::{Fallback, Recover};
 use libpipeline_internals::boundary::Guarded;
 use libpipeline_internals::memo::Memo;
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, MemoStore, StageId};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, MemoStore, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -106,13 +106,13 @@ impl Stage for Flaky {
         Some(MemoKey::new(Self::ID, [ContentKey::of(&input.0)]))
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, Boom> {
         *self.polls.lock().unwrap() += 1;
         let Some(filled) = *self.slot.lock().unwrap() else {
             self.waiting.lock().unwrap().push(cx.waker().clone());
             return EffectPoll::Failed(Boom);
         };
-        EffectPoll::Ready(Arc::new(format!("{}:{filled}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}:{filled}", input.0)))
     }
 }
 
@@ -139,7 +139,7 @@ impl<S: Stage> Stage for Shared<S> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         self.0.poll_stage(input, cx)
     }
 }
@@ -175,7 +175,7 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         self.0.poll_stage(input, cx)
     }
 }
@@ -242,7 +242,8 @@ where
     S::Output: std::fmt::Display,
 {
     match stage.poll_stage(input, &mut Context::from_waker(Waker::noop())) {
-        EffectPoll::Ready(value) => value.to_string(),
+        EffectPoll::Ready(StageAnswer::Computed(value)) => value.to_string(),
+        EffectPoll::Ready(StageAnswer::Unchanged) => panic!("nothing here answers Unchanged"),
         EffectPoll::Pending => panic!("nothing here is pending"),
         EffectPoll::Failed(_) => panic!("this boundary catches everything"),
     }

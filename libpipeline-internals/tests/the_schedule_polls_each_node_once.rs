@@ -33,7 +33,7 @@ use libpipeline_internals::track::NodeId;
 use libpipeline_internals::schedule::Schedule;
 use libpipeline_internals::track::Tracked;
 use libpipeline_internals::track::TrackedInput;
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -62,9 +62,9 @@ impl Stage for Reads {
         None
     }
 
-    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
-        EffectPoll::Ready(Arc::new(format!("{}{}", self.tag, self.from.get())))
+        StageAnswer::computed(Arc::new(format!("{}{}", self.tag, self.from.get())))
     }
 }
 
@@ -96,17 +96,21 @@ where
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
         let left = match self.left.poll_stage(input, cx) {
-            EffectPoll::Ready(value) => value,
+            EffectPoll::Ready(StageAnswer::Computed(value)) => value,
+            // No stage in this file answers `Unchanged`, so forwarding
+            // whatever this was is exact.
             other => return other,
         };
         let right = match self.right.poll_stage(input, cx) {
-            EffectPoll::Ready(value) => value,
+            EffectPoll::Ready(StageAnswer::Computed(value)) => value,
+            // No stage in this file answers `Unchanged`, so forwarding
+            // whatever this was is exact.
             other => return other,
         };
-        EffectPoll::Ready(Arc::new(format!("{left}+{right}")))
+        StageAnswer::computed(Arc::new(format!("{left}+{right}")))
     }
 }
 
@@ -321,7 +325,7 @@ fn a_pending_node_stays_in_the_schedule_after_it_is_polled() {
             &self,
             _input: &Text,
             cx: &mut Context<'_>,
-        ) -> EffectPoll<Arc<String>, &'static str> {
+        ) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
             let _ = cx.waker().clone();
             EffectPoll::Pending
         }

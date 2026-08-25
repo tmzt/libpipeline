@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 
 use libeffects::WakeFlag;
-use libpipelinedata::EffectPoll;
+use libpipelinedata::{EffectPoll, StageAnswer};
 
 use crate::Stage;
 
@@ -71,11 +71,19 @@ impl PendingWork for NoPendingWork {
 ///
 /// A batch run against an unchanged tree is all cache hits, because the memo
 /// keys are the same ones the interactive host used.
+///
+/// **The answer may be [`StageAnswer::Unchanged`]**, which is what a graph says
+/// when its first stage rewrote nothing. A caller driving a graph for the first
+/// time cannot see one - a cold position has nothing to refer to and the engine
+/// says so - but a caller driving the same graph a second time can, and it
+/// means "the value the previous drive gave you". That is the same distinction
+/// `libpipeline`'s one door draws with `Run::Unchanged`, which is what this
+/// loop is the reference semantics for.
 pub fn run_to_completion<S, W>(
     stage: &S,
     input: &S::Input,
     work: &W,
-) -> Result<Arc<S::Output>, DriveError<S::Error>>
+) -> Result<StageAnswer<Arc<S::Output>>, DriveError<S::Error>>
 where
     S: Stage,
     W: PendingWork + ?Sized,
@@ -144,7 +152,7 @@ impl FrameDriver {
         &self,
         stage: &S,
         input: &S::Input,
-    ) -> EffectPoll<Arc<S::Output>, S::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<S::Output>>, S::Error> {
         let waker = self.stale.waker();
         stage.poll_stage(input, &mut Context::from_waker(&waker))
     }

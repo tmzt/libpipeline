@@ -62,7 +62,7 @@ use libpipeline_internals::boundary::Guarded;
 use libpipeline_internals::track::Ledger;
 use libpipeline_internals::track::Tracked;
 use libpipeline_internals::track::TrackedInput;
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -135,7 +135,7 @@ impl Stage for Flaky {
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, Boom> {
         *self.polls.lock().unwrap() += 1;
         let read = self.from.get();
         let Some(filled) = *self.slot.lock().unwrap() else {
@@ -145,14 +145,14 @@ impl Stage for Flaky {
                 WhileEmpty::Parked => EffectPoll::Pending,
             };
         };
-        EffectPoll::Ready(Arc::new(format!("{}:{read}:{filled}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}:{read}:{filled}", input.0)))
     }
 }
 
 const GUARD: StageId = StageId::at(1);
 
 /// Poll unconditionally, as both drivers do.
-fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<Arc<S::Output>, S::Error> {
+fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<StageAnswer<Arc<S::Output>>, S::Error> {
     stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
 }
 
@@ -166,7 +166,7 @@ fn frame_if_scheduled<S: Stage>(
     ledger: &Ledger,
     root: &S,
     input: &S::Input,
-) -> Option<EffectPoll<Arc<S::Output>, S::Error>> {
+) -> Option<EffectPoll<StageAnswer<Arc<S::Output>>, S::Error>> {
     let schedule = ledger.schedule().expect("no cycles in a one-node graph");
     if schedule.is_empty() {
         return None;
@@ -225,7 +225,7 @@ fn a_value_still_clears_the_debt() {
     node.stage().land("v1");
     assert_eq!(
         driven(&node, &Text("src".into())),
-        EffectPoll::Ready(Arc::new("src:a:v1".to_string())),
+        StageAnswer::computed(Arc::new("src:a:v1".to_string())),
     );
     assert!(
         !ledger.is_stale(node.node()),
@@ -250,7 +250,7 @@ fn a_boundary_outside_the_tracking_replaces_its_fallback_when_the_failure_clears
     let input = Text("src".into());
 
     // First frame: drawn with a stand-in, and the node still owes its answer.
-    assert_eq!(driven(&guarded, &input), EffectPoll::Ready(Arc::new("fallback".to_string())));
+    assert_eq!(driven(&guarded, &input), StageAnswer::computed(Arc::new("fallback".to_string())));
     assert_eq!(guarded.substitutions(), 1);
     assert!(
         ledger.is_stale(watched),
@@ -262,7 +262,7 @@ fn a_boundary_outside_the_tracking_replaces_its_fallback_when_the_failure_clears
     // The scheduled driver still has work, and still gets the fallback.
     assert_eq!(
         frame_if_scheduled(&ledger, &guarded, &input),
-        Some(EffectPoll::Ready(Arc::new("fallback".to_string()))),
+        Some(StageAnswer::computed(Arc::new("fallback".to_string()))),
     );
 
     // The failure clears out of band. Nothing marks anything stale - the
@@ -270,7 +270,7 @@ fn a_boundary_outside_the_tracking_replaces_its_fallback_when_the_failure_clears
     guarded.stage().stage().land("v1");
     assert_eq!(
         frame_if_scheduled(&ledger, &guarded, &input),
-        Some(EffectPoll::Ready(Arc::new("src:a:v1".to_string()))),
+        Some(StageAnswer::computed(Arc::new("src:a:v1".to_string()))),
         "the fallback is replaced by the real answer, by a driver that polls \
          only what the ledger names",
     );
@@ -300,7 +300,7 @@ fn a_boundary_inside_the_tracking_keeps_its_fallback_after_the_failure_clears() 
     );
     let input = Text("src".into());
 
-    assert_eq!(driven(&node, &input), EffectPoll::Ready(Arc::new("fallback".to_string())));
+    assert_eq!(driven(&node, &input), StageAnswer::computed(Arc::new("fallback".to_string())));
     assert!(
         !ledger.is_stale(node.node()),
         "the laundering: a substituted value cleared the node's debt, and the \
@@ -323,7 +323,7 @@ fn a_boundary_inside_the_tracking_keeps_its_fallback_after_the_failure_clears() 
     // instruction to go and get it.
     assert_eq!(
         driven(&node, &input),
-        EffectPoll::Ready(Arc::new("src:a:v1".to_string())),
+        StageAnswer::computed(Arc::new("src:a:v1".to_string())),
         "polled anyway, the graph answers correctly - which is why a driver \
          that re-polls unconditionally cannot see this defect at all",
     );
@@ -378,7 +378,7 @@ fn a_repeated_fallback_inside_backdating_retracts_what_its_consumers_owe() {
     assert!(ledger.is_stale(node.node()) && ledger.is_stale(consumer));
 
     // The node re-runs and substitutes the same fallback as last time.
-    assert_eq!(driven(&node, &input), EffectPoll::Ready(Arc::new("fallback".to_string())));
+    assert_eq!(driven(&node, &input), StageAnswer::computed(Arc::new("fallback".to_string())));
     assert!(
         !ledger.is_stale(consumer),
         "the fallback repeated, so backdating retracted the consumer's reason \
@@ -405,7 +405,7 @@ fn a_repeated_failure_outside_backdating_retracts_nothing() {
     assert!(src.set("b".to_string()));
     assert!(ledger.is_stale(watched) && ledger.is_stale(consumer));
 
-    assert_eq!(driven(&guarded, &input), EffectPoll::Ready(Arc::new("fallback".to_string())));
+    assert_eq!(driven(&guarded, &input), StageAnswer::computed(Arc::new("fallback".to_string())));
     assert!(
         ledger.is_stale(consumer),
         "no address was recorded for a failure, so nothing was retracted",

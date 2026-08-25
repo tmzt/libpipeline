@@ -30,7 +30,7 @@ hand.
 
 ```rust
 use libpipeline::{Ctx, PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
 /// What "doc.title" IS, as a key - computable without splitting anything.
 ///
@@ -41,11 +41,11 @@ fn split_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
 }
 
 /// Splits a dotted path like "doc.title" into its segments.
-fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<Vec<String>, &'static str> {
+fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Vec<String>>, &'static str> {
     if input.is_empty() {
         return EffectPoll::Failed("nothing to split");
     }
-    EffectPoll::Ready(input.split('.').map(str::to_string).collect())
+    StageAnswer::computed(input.split('.').map(str::to_string).collect())
 }
 
 let pipeline = PipelineBuilder::new()
@@ -81,6 +81,8 @@ Three things to notice at the registration call site:
   output without moving the key, and no review catches every one.
 * There is no separate "memoize" step. **Registering a stage memoizes it**;
   there is no un-memoized registration to reach for.
+* **A `Ready` says which answer.** `StageAnswer::computed(value)` is the
+  ordinary one. The other is `StageAnswer::unchanged()`, below.
 
 ## Adding stages
 
@@ -92,24 +94,24 @@ carrying the POSITION of the stage that raised it.
 
 ```rust
 use libpipeline::{Ctx, PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
 # fn split_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
 #     Some(ctx.key([ContentKey::of(input)]))
 # }
-# fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<Vec<String>, &'static str> {
+# fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Vec<String>>, &'static str> {
 #     if input.is_empty() {
 #         return EffectPoll::Failed("nothing to split");
 #     }
-#     EffectPoll::Ready(input.split('.').map(str::to_string).collect())
+#     StageAnswer::computed(input.split('.').map(str::to_string).collect())
 # }
 /// Counts the segments the first stage produced.
 fn count_key(input: &Vec<String>, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key(input.iter().map(ContentKey::of)))
 }
 
-fn count(input: &Vec<String>, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
-    EffectPoll::Ready(input.len())
+fn count(input: &Vec<String>, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
+    StageAnswer::computed(input.len())
 }
 
 let pipeline = PipelineBuilder::new()
@@ -156,7 +158,7 @@ carry one yet; `DESIGN.md`'s "The intended stage shape" is the record of that.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libpipeline::{Ctx, PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
 static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
 
@@ -165,9 +167,9 @@ fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
 }
 
 /// Measures a string, counting how many times it actually ran.
-fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
-    EffectPoll::Ready(input.len())
+    StageAnswer::computed(input.len())
 }
 
 let pipeline = PipelineBuilder::new()
@@ -198,6 +200,75 @@ is then neither looked up nor recorded, and everything else about it is
 unchanged. Failures are never cached regardless: a transient failure served
 back from a memo would outlive its cause.
 
+## A stage that rewrote nothing says so
+
+A pass that walked its input and changed none of it knows that at its return -
+and can say so, with `StageAnswer::unchanged()` instead of a value.
+
+**It carries nothing, and that is the point.** The value is already in the slot
+this position last answered from, so the stage AFTER it has no new input, its
+own answer over that input already stands, and it is never entered at all. The
+saving is the rest of the chain rather than a refcount:
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer};
+
+static UPPER_RUNS: AtomicUsize = AtomicUsize::new(0);
+static SHOUT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+// Neither stage keys, so neither is served from the store: each is entered and
+// answers for itself. That is what lets the first one say `unchanged`.
+fn unkeyed<I>(_input: &I, _ctx: &Ctx<'_>) -> Option<MemoKey> {
+    None
+}
+
+/// Upper-cases - and says so when there was nothing to upper-case.
+fn upper(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
+    UPPER_RUNS.fetch_add(1, Ordering::Relaxed);
+    match input.chars().any(|c| c.is_lowercase()) {
+        true => StageAnswer::computed(input.to_uppercase()),
+        false => StageAnswer::unchanged(),
+    }
+}
+
+fn shout(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
+    SHOUT_RUNS.fetch_add(1, Ordering::Relaxed);
+    StageAnswer::computed(format!("{input}!"))
+}
+
+let pipeline = PipelineBuilder::new()
+    .stage_fn("upper", unkeyed, upper)
+    .stage_fn("shout", unkeyed, shout)
+    .build();
+
+// Something to do: both stages run.
+assert_eq!(
+    pipeline.poll(1, &"hi".to_string()),
+    Ok(Run::Computed(Arc::new("HI!".to_string()))),
+);
+
+// A new version, and nothing to do. `upper` is entered - it is unkeyed, so
+// nothing answers ahead of it - and says `unchanged`. `shout` is not entered.
+assert_eq!(pipeline.poll(2, &"HI".to_string()), Ok(Run::Unchanged));
+assert_eq!(UPPER_RUNS.load(Ordering::Relaxed), 2);
+assert_eq!(SHOUT_RUNS.load(Ordering::Relaxed), 1);
+```
+
+**A stage may only say it where it has answered before.** `unchanged` refers to
+the answer this position last gave, so a position that has given none is
+claiming something that does not exist - and the engine panics naming the
+position rather than telling you to keep a value you were never given.
+
+**Nothing checks that it is TRUE.** A stage that says `unchanged` while its
+output moved makes the pipeline serve a stale value for ever, and no test sees
+it: the answers do not change, only which answer is served does. It is the same
+class of promise as the wake a `Pending` owes, and it is kept the same way - by
+the stage.
+
 ## One door, and what it answers
 
 `poll(version, &readable)` polls once and returns immediately, whatever the
@@ -207,8 +278,11 @@ answer. Nothing inside it waits, ever. There are four answers:
   records the version it answered for.
 * **`Run::Unchanged`** - the value you already hold derives from exactly this
   state; keep it. Read it as *the value is finished*: not a report that nothing
-  happened, but a statement that nothing needs to. The readable is not
-  dereferenced, no memo key is computed and no stage is polled.
+  happened, but a statement that nothing needs to. Two things answer it: the
+  version gate, when the version is the one it last recorded and no wake is
+  pending, in which case the readable is not dereferenced, no memo key is
+  computed and no stage is polled; and the graph, when a stage that WAS entered
+  answered `unchanged` (above). Either way the obligation is the same.
 * **`Run::Delayed`** - not ready; a wake is coming. The poll arranged for the
   pipeline's waker to be woken when the answer becomes possible, so wait to be
   woken rather than re-polling in a spin.
@@ -226,15 +300,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use libpipeline::{Ctx, PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
 # static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
 # fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
 #     Some(ctx.key([ContentKey::of(input)]))
 # }
-# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
 #     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
-#     EffectPoll::Ready(input.len())
+#     StageAnswer::computed(input.len())
 # }
 let pipeline = PipelineBuilder::new()
     .stage_fn("len", len_key, len)
@@ -290,7 +364,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::task::Waker;
 
 use libpipeline::{Ctx, PipelineBuilder, Run, run_blocking};
-use libpipelinedata::{EffectPoll, MemoKey};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer};
 
 /// Where a value lands out of band, and where a delayed poll leaves its waker.
 #[derive(Default)]
@@ -318,9 +392,9 @@ fn fetch_key(_input: &(), _ctx: &Ctx<'_>) -> Option<MemoKey> {
 }
 
 /// `Pending` until the slot is filled.
-fn fetch(_input: &(), ctx: &Ctx<'_>) -> EffectPoll<u32, &'static str> {
+fn fetch(_input: &(), ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<u32>, &'static str> {
     match *SLOT.value.lock().unwrap() {
-        Some(value) => EffectPoll::Ready(value),
+        Some(value) => StageAnswer::computed(value),
         None => {
             // Answering `Pending` obliges the stage to arrange a wake.
             *SLOT.waker.lock().unwrap() = Some(ctx.waker().clone());
@@ -394,7 +468,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libpipeline::{Ctx, PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, StageAnswer};
 
 /// A store of your own: any `lookup`/`record` pair over `MemoKey` will do.
 struct MapStore<V: ?Sized> {
@@ -415,9 +489,9 @@ impl<V: ?Sized> MemoStore<V> for MapStore<V> {
 # fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
 #     Some(ctx.key([ContentKey::of(input)]))
 # }
-# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
 #     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
-#     EffectPoll::Ready(input.len())
+#     StageAnswer::computed(input.len())
 # }
 /// Renders the count, so the pipeline below holds two stages whose outputs
 /// are different types - and still one store.
@@ -425,8 +499,8 @@ fn render_key(input: &usize, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([ContentKey::of(input)]))
 }
 
-fn render(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<String, &'static str> {
-    EffectPoll::Ready(input.to_string())
+fn render(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
+    StageAnswer::computed(input.to_string())
 }
 
 let store: Arc<MapStore<dyn Any + Send + Sync>> = Arc::new(MapStore {

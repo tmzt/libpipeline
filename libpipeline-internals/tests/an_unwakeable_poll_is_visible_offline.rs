@@ -40,7 +40,7 @@
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 use libpipeline_internals::driver::{DriveError, NoPendingWork, PendingWork};
@@ -104,7 +104,7 @@ impl Stage for Parks {
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         let Some(landed) = *self.slot.lock().unwrap() else {
             match self.on_park {
                 OnPark::Register => self.waiting.lock().unwrap().push(cx.waker().clone()),
@@ -112,7 +112,7 @@ impl Stage for Parks {
             }
             return EffectPoll::Pending;
         };
-        EffectPoll::Ready(Arc::new(format!("{}::{landed}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}::{landed}", input.0)))
     }
 }
 
@@ -157,7 +157,7 @@ fn the_blocking_drive_reports_the_defect_without_changing_its_answer() {
 
     assert_eq!(
         out,
-        Ok(Arc::new("hi::built".to_string())),
+        Ok(StageAnswer::Computed(Arc::new("hi::built".to_string()))),
         "the drive still completes, because it re-polls without being asked - \
          that is what made the defect invisible",
     );
@@ -186,7 +186,7 @@ fn a_graph_that_registers_reports_clean() {
         &Text("hi".to_string()),
         &LandsOnFirstPump::for_stage(&stage),
     );
-    assert_eq!(out, Ok(Arc::new("hi::built".to_string())));
+    assert_eq!(out, Ok(StageAnswer::Computed(Arc::new("hi::built".to_string()))));
     assert_eq!(report.pending_polls(), 1, "it did park once");
     assert!(report.is_clean(), "and left a wake path when it did");
 }

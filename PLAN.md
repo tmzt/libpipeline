@@ -44,6 +44,7 @@ and `libpipelinedata` at `db3c1eb` (branch `highbay-clean`, clean), on
 | 4 - one flat error | `ac2299a` | `Failure<E>` with private fields and `at()` (`src/builder.rs:280`); `ChainError` and its two `map_err` arms gone |
 | 5 - the outcome and the one door | `7a20d63`, data half `402099c` | `Run`/`RunResult`, the version gate with its wake half; `MemoStore` is `Arc` on both sides with `V: ?Sized` |
 | the door flip | `790863b`, data half `db3c1eb` | `stage_fn(name, key, poll)` taking two `fn` pointers; `Ctx` carrying `StageId` and waker; `Stage` moved to `libpipeline-internals/src/stage.rs`; the graph boxed behind private fields (`src/builder.rs:86`); `poll` replacing `run`; `take_stale` off the API; `run_blocking` a free function; the `Arc` out of the associated type; `Shared` deleted |
+| 7 - the ladder | this commit, data half this commit | `StageAnswer` in `libpipelinedata` (`src/answer.rs`), inside `EffectPoll::Ready`; `Chain` skips its second half on an `Unchanged` first half and holds a `Joint` for what it owes; `Memo` holds the slot and asserts the cold-slot invariant; `Pipeline::poll` maps a root `Unchanged` and records the version for it |
 
 The door flip is deliberately unnumbered: step 6's number is cited from
 source and could not be taken.
@@ -52,9 +53,11 @@ source and could not be taken.
 
 Run at this revision, all green:
 
-* facade: **30 tests + 6 doctests** - `builder_is_the_only_door.rs` 11,
-  `engine_stays_generic.rs` 7, `one_door_two_patterns.rs` 12; one doctest
-  ignored (`src/builder.rs:711`, `run_blocking`'s `rust,ignore` sketch).
+* facade: **35 tests + 7 doctests** - `builder_is_the_only_door.rs` 11,
+  `engine_stays_generic.rs` 7, `one_door_two_patterns.rs` 12,
+  `a_stage_that_rewrote_nothing_says_so.rs` 5 (step 7); one doctest ignored
+  (`run_blocking`'s `rust,ignore` sketch). The seventh doctest is the
+  README's `unchanged` example, added with step 7.
 * internals: **77 tests** in 11 files -
   `a_boundary_is_not_a_cacheable_answer` 5,
   `a_build_can_ask_whether_it_stood_on_a_fallback` 7,
@@ -65,7 +68,8 @@ Run at this revision, all green:
   `invalidation_marks_dependents` 13, `reads_become_edges` 9, `tests` 6,
   `the_schedule_polls_each_node_once` 8,
   `the_stage_contract_is_the_engines` 3.
-* `libpipelinedata`: **39 tests + 1 doctest** (default features).
+* `libpipelinedata`: **39 tests + 1 doctest** (default features); three
+  doctests ignored, the third being `StageAnswer`'s `rust,ignore` sketch.
 
 `cargo doc --no-deps -p libpipeline` is NOT clean: 5 warnings, two of them
 real (see "Found stale at this revision"). No step below has taken rustdoc
@@ -109,10 +113,11 @@ unchanged by the flip; only who owns the loop moved.
   repeats, which needs the node to have run. Sparing a node's consumers
   before it runs at all is not here, and neither is a policy for which nodes
   are worth addressing per poll.
-* **Root-level backdating.** `DESIGN.md`'s "The version gate and the one
-  door" anticipates `Unchanged` also firing when a recompute reaches the root
-  with an unchanged content address. Nothing implements it, and step 9 may
-  displace it entirely.
+* ~~**Root-level backdating.**~~ **CLOSED by step 7, and not in the shape it
+  was written.** `Unchanged` does fire when a recompute reaches the root - but
+  not by addressing the output there and comparing. The STAGE says so, the
+  stages after it are never entered, and the answer travels to the root, where
+  `Pipeline::poll` records the version for it. No content address is taken.
 
 ## What the builder cannot yet express (findings, in priority order)
 
@@ -245,7 +250,13 @@ skip the check.
 The shape of the check is the same either way, so the step does not wait on
 it.
 
-### Step 7 - the ladder: a stage answers `Unchanged` or `Computed`
+### Step 7 - the ladder: a stage answers `Unchanged` or `Computed` - LANDED
+
+**Landed as described, with the variant in the `Ready` channel** (option 2
+done differently from how it was costed - see "Where the variant went",
+below) and with one mechanism the plan did not anticipate (see "What the
+join owes"). The rest of this section is kept as written, because the next
+steps cite it.
 
 **The spine of everything else.** Early cutoff is OBSERVED rather than
 reconstructed: `Expansion::untouched`
@@ -286,12 +297,41 @@ class as a forgotten waker. Where a stage has a `key_fn`, the engine CAN catch
 it: compare the new key against the slot's when the stage answers `Computed`
 and complain in debug if they are equal. A detector, not a compensator.
 
+**Where the variant went, and why not the recommended spelling.** Inside
+`EffectPoll::Ready`, as `libpipelinedata::StageAnswer<T>`. The `Ctx` flag was
+re-examined and is not merely inelegant - it CANNOT EXPRESS THIS SHAPE. The
+poll function's return type demands a value on the `Ready` path, and a stage
+answering `Unchanged` has none: the value is in a slot the stage cannot reach.
+The flag was costed while `Unchanged` still carried the value; with the value
+gone there is nothing for a flag to accompany. The engine-side enum was costed
+as one BESIDE `EffectPoll`, which is what would break the compiler-checked
+"the stage contract IS the effect protocol" claim. Nested inside `Ready` it
+breaks nothing: `BoundStage` still implements `Effect`, over
+`StageAnswer<Arc<S::Output>>`. `deps/libeffects` is untouched.
+
+**What the join owes - a mechanism this plan did not have.** "Upstream answered
+`Unchanged`, so the downstream is never entered" is UNSOUND on its own. A
+downstream that answered `Pending` last poll has produced nothing, so there is
+no answer for the chain to stand on: skipping it would answer `Unchanged` at a
+caller holding nothing, for ever, with the landed value never delivered - the
+"lost rather than late" class, arriving through the new variant. So `Chain`
+holds one piece of state, `Joint`: what it last handed on, and whether the
+second half settled over it. `Unchanged` skips only a settled join; an owing
+one is re-polled over what it was handed. `Failed` does not settle either, since
+a failure retries. This is reachable for any stage whose key function answers
+`None` - which step 10 makes the DEFAULT - so it is not a corner.
+
 *Depends on*: nothing.
 *Gate*: a two-stage pipeline where the second is never polled because the first
 answered `Unchanged`, asserted by a poll counter the second stage increments.
 Plus the cold-slot panic, asserted by message.
+**Met** by `tests/a_stage_that_rewrote_nothing_says_so.rs`, 5 tests: the poll
+counter, the `.uncached()` control (the slot is not the store), the cold-slot
+panic at position 0 and at position 1, and the owing join. Mutation-checked
+three ways - the skip removed, the assertion removed, the owing state removed -
+each failing exactly the tests that name it and nothing else.
 *Halt if*: the variant cannot be expressed without editing `deps/libeffects`.
-That is a third repo and a gitlink; stop and ask.
+That is a third repo and a gitlink; stop and ask. **Not reached.**
 
 ### Step 8 - the store becomes one slot per position
 
@@ -318,7 +358,10 @@ by position, `MemoStore`/`MemoMap`/`NoMemo` go with it, along with `.store()`,
 `BuilderStore::Given` and `Erased`. Read D2's cost list before deleting: four
 independent-implementation demonstrations go too.
 
-*Depends on*: step 7 (the slot's primary job is serving `Unchanged`).
+*Depends on*: step 7, which built the slot where it could live today - one
+`Option<Arc<S::Output>>` per `Memo`, filled by every answer that position gives
+including a store hit. This step moves it into the store and puts `K` beside
+it; nothing else about it changes.
 *Gate*: a stage's second poll at an unchanged input does not enter it; the
 store's memory does not grow across N polls of the same pipeline.
 *Halt if*: two pipelines must share a store. That is the dimension this step

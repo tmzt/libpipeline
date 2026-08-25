@@ -46,7 +46,7 @@ use libpipeline_internals::driver::NoPendingWork;
 use libpipeline_internals::watch::WakePath;
 use libpipeline_internals::watch::poll_watched;
 use libpipeline_internals::driver::run_to_completion;
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, NoMemo, StageId};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, NoMemo, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -136,7 +136,7 @@ impl Stage for Flaky {
         Some(MemoKey::new(Self::ID, [ContentKey::of(&input.0)]))
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, Boom> {
         *self.polls.lock().unwrap() += 1;
         let Some(filled) = *self.slot.lock().unwrap() else {
             self.waiting.lock().unwrap().push(cx.waker().clone());
@@ -145,7 +145,7 @@ impl Stage for Flaky {
                 WhileEmpty::Parked => EffectPoll::Pending,
             };
         };
-        EffectPoll::Ready(Arc::new(format!("{}:{filled}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}:{filled}", input.0)))
     }
 }
 
@@ -181,7 +181,7 @@ impl<S: Stage> Stage for Shared<S> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         self.0.poll_stage(input, cx)
     }
 }
@@ -190,7 +190,7 @@ const GUARD: StageId = StageId::at(1);
 
 /// Poll once with a waker of no consequence - the offline driver's shape
 /// (`driver.rs:80-81`). What this returns is what a driver sees.
-fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<Arc<S::Output>, S::Error> {
+fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<StageAnswer<Arc<S::Output>>, S::Error> {
     stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
 }
 
@@ -200,7 +200,10 @@ where
     S::Error: std::fmt::Debug,
 {
     match driven(stage, input) {
-        EffectPoll::Ready(value) => value,
+        EffectPoll::Ready(StageAnswer::Computed(value)) => value,
+        EffectPoll::Ready(StageAnswer::Unchanged) => {
+            panic!("expected a value, got Unchanged - nothing here answers it")
+        }
         EffectPoll::Pending => panic!("expected a value, got Pending"),
         EffectPoll::Failed(e) => panic!("expected a value, got {e:?}"),
     }
@@ -268,13 +271,14 @@ fn an_outermost_stage_boundary_makes_an_unhandled_failure_impossible_by_type() {
         Fallback::new(Arc::new("the last resort".to_string())),
     );
     let value = match driven(&guarded, &Text("src".into())) {
-        EffectPoll::Ready(value) => value,
+        EffectPoll::Ready(StageAnswer::Computed(value)) => value,
+        EffectPoll::Ready(StageAnswer::Unchanged) => panic!("nothing here answers Unchanged"),
         EffectPoll::Pending => panic!("nothing here is pending"),
         EffectPoll::Failed(never) => match never {},
     };
     assert_eq!(*value, "the last resort");
 
-    let _: Result<Arc<String>, DriveError<Infallible>> =
+    let _: Result<StageAnswer<Arc<String>>, DriveError<Infallible>> =
         run_to_completion(&guarded, &Text("src".into()), &NoPendingWork);
 }
 
@@ -346,11 +350,11 @@ fn both_drivers_see_the_same_answer_through_a_boundary() {
     let caught = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new(Arc::new("fallback".to_string())));
     assert_eq!(
         run_to_completion(&caught, &input, &NoPendingWork).map_err(|_| "failed"),
-        Ok(Arc::new("fallback".to_string())),
+        Ok(StageAnswer::Computed(Arc::new("fallback".to_string()))),
     );
     assert_eq!(
         FrameDriver::new().poll_frame(&caught, &input),
-        EffectPoll::Ready(Arc::new("fallback".to_string())),
+        StageAnswer::computed(Arc::new("fallback".to_string())),
     );
 
     // Declined: the failure reaches BOTH drivers, carrying the same path.

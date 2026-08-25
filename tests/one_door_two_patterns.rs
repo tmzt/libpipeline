@@ -68,7 +68,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
 use libpipeline::{Ctx, Pipeline, PipelineBuilder, Run, RunResult, run_blocking};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, StageAnswer};
 
 // ---------------------------------------------------------------- stand-ins
 
@@ -168,12 +168,12 @@ fn lower_key(input: &Source, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([content_key_of(input.0)]))
 }
 
-fn lower_poll(input: &Source, _ctx: &Ctx<'_>) -> EffectPoll<Lowered, &'static str> {
+fn lower_poll(input: &Source, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Lowered>, &'static str> {
     LOWER_RUNS.with(|c| c.set(c.get() + 1));
     if input.0.is_empty() {
         return EffectPoll::Failed("nothing to lower");
     }
-    EffectPoll::Ready(Lowered(input.0.split('.').map(str::to_string).collect()))
+    StageAnswer::computed(Lowered(input.0.split('.').map(str::to_string).collect()))
 }
 
 // ------------------------------------------------------------------- stage 2
@@ -207,7 +207,7 @@ fn emit_key(input: &Lowered, ctx: &Ctx<'_>) -> Option<MemoKey> {
     Some(ctx.key([content_key_of(&input.0.join("."))]))
 }
 
-fn emit_poll(input: &Lowered, ctx: &Ctx<'_>) -> EffectPoll<Emitted, &'static str> {
+fn emit_poll(input: &Lowered, ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Emitted>, &'static str> {
     let upstream = upstream();
     let Some(landed) = *upstream.value.lock().unwrap() else {
         // Answering `Pending` obliges the stage to arrange a wake, and
@@ -216,7 +216,7 @@ fn emit_poll(input: &Lowered, ctx: &Ctx<'_>) -> EffectPoll<Emitted, &'static str
         return EffectPoll::Pending;
     };
     EMIT_RUNS.with(|c| c.set(c.get() + 1));
-    EffectPoll::Ready(Emitted(format!("{landed}::{}", input.0.join("/"))))
+    StageAnswer::computed(Emitted(format!("{landed}::{}", input.0.join("/"))))
 }
 
 /// The same stage minus the one line that registers the waker.
@@ -231,11 +231,11 @@ fn forgetful_emit_key(_input: &Lowered, _ctx: &Ctx<'_>) -> Option<MemoKey> {
     None
 }
 
-fn forgetful_emit_poll(input: &Lowered, _ctx: &Ctx<'_>) -> EffectPoll<Emitted, &'static str> {
+fn forgetful_emit_poll(input: &Lowered, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Emitted>, &'static str> {
     let Some(landed) = *upstream().value.lock().unwrap() else {
         return EffectPoll::Pending;
     };
-    EffectPoll::Ready(Emitted(format!("{landed}::{}", input.0.join("/"))))
+    StageAnswer::computed(Emitted(format!("{landed}::{}", input.0.join("/"))))
 }
 
 /// Stand-in for a streaming content hash - FNV over the bytes. Not a content

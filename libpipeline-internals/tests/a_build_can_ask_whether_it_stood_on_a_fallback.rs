@@ -45,7 +45,7 @@ use libpipeline_internals::driver::NoPendingWork;
 use libpipeline_internals::boundary::Substitutions;
 use libpipeline_internals::driver::run_to_completion;
 use libpipeline_internals::boundary::run_to_completion_counted;
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -94,12 +94,12 @@ impl Stage for Flaky {
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, Boom> {
         let Some(filled) = *self.slot.lock().unwrap() else {
             self.waiting.lock().unwrap().push(cx.waker().clone());
             return EffectPoll::Failed(Boom);
         };
-        EffectPoll::Ready(Arc::new(format!("{}:{filled}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}:{filled}", input.0)))
     }
 }
 
@@ -133,9 +133,9 @@ impl Stage for Appends {
         None
     }
 
-    fn poll_stage(&self, input: &String, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
+    fn poll_stage(&self, input: &String, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, Boom> {
         match *self.slot.lock().unwrap() {
-            Some(filled) => EffectPoll::Ready(Arc::new(format!("{input}/{filled}"))),
+            Some(filled) => StageAnswer::computed(Arc::new(format!("{input}/{filled}"))),
             None => EffectPoll::Failed(Boom),
         }
     }
@@ -191,7 +191,7 @@ fn the_counted_drive_says_which_it_was_and_returns_the_same_result() {
     );
     let (driven, substitutions) =
         run_to_completion_counted(&real, &input, &NoPendingWork, &tally);
-    assert_eq!(driven.map_err(|_| "failed"), Ok(Arc::new("src:v1".to_string())));
+    assert_eq!(driven.map_err(|_| "failed"), Ok(StageAnswer::Computed(Arc::new("src:v1".to_string()))));
     assert_eq!(substitutions, 0, "nothing stood in for anything");
 
     let tally = Substitutions::new();
@@ -205,7 +205,7 @@ fn the_counted_drive_says_which_it_was_and_returns_the_same_result() {
         run_to_completion_counted(&substituted, &input, &NoPendingWork, &tally);
     assert_eq!(
         driven.map_err(|_| "failed"),
-        Ok(Arc::new("fallback".to_string())),
+        Ok(StageAnswer::Computed(Arc::new("fallback".to_string()))),
         "the RESULT is unchanged - a driver that failed a graph the plain one \
          completes would break the two-driver rule in order to report on it",
     );
@@ -244,7 +244,7 @@ fn one_tally_counts_every_boundary_in_the_graph() {
         run_to_completion_counted(&graph, &Text("src".into()), &NoPendingWork, &tally);
     assert_eq!(
         driven.map_err(|_| "failed"),
-        Ok(Arc::new("second fallback".to_string())),
+        Ok(StageAnswer::Computed(Arc::new("second fallback".to_string()))),
     );
     assert_eq!(
         substitutions, 2,
@@ -325,13 +325,13 @@ fn a_drive_that_recovers_between_passes_reports_the_change() {
 
     let (driven, substitutions) =
         run_to_completion_counted(&guarded, &input, &NoPendingWork, &tally);
-    assert_eq!(driven.map_err(|_| "failed"), Ok(Arc::new("fallback".to_string())));
+    assert_eq!(driven.map_err(|_| "failed"), Ok(StageAnswer::Computed(Arc::new("fallback".to_string()))));
     assert_eq!(substitutions, 1);
 
     *guarded.stage().slot.lock().unwrap() = Some("v1");
     let (driven, substitutions) =
         run_to_completion_counted(&guarded, &input, &NoPendingWork, &tally);
-    assert_eq!(driven.map_err(|_| "failed"), Ok(Arc::new("src:v1".to_string())));
+    assert_eq!(driven.map_err(|_| "failed"), Ok(StageAnswer::Computed(Arc::new("src:v1".to_string()))));
     assert_eq!(substitutions, 0, "this build is not standing on anything");
 }
 
@@ -359,7 +359,7 @@ fn a_frame_loop_takes_the_same_measurement_by_differencing_the_tally() {
     let before = tally.count();
     assert_eq!(
         driver.poll_frame(&guarded, &input),
-        EffectPoll::Ready(Arc::new("fallback".to_string())),
+        StageAnswer::computed(Arc::new("fallback".to_string())),
     );
     assert_eq!(
         tally.count() - before,

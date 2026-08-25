@@ -39,7 +39,7 @@ use libpipeline_internals::track::Ledger;
 use libpipeline_internals::track::NodeId;
 use libpipeline_internals::track::Tracked;
 use libpipeline_internals::track::TrackedInput;
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -81,9 +81,9 @@ impl Stage for Normalizes {
         None
     }
 
-    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
-        EffectPoll::Ready(Arc::new(self.from.get().trim().to_string()))
+        StageAnswer::computed(Arc::new(self.from.get().trim().to_string()))
     }
 }
 
@@ -120,7 +120,7 @@ impl<S: Stage<Input = Text, Output = String, Error = &'static str>> Stage for Re
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
         self.inner.poll_stage(input, cx)
     }
@@ -145,14 +145,14 @@ impl<S: Stage<Input = Text, Output = String, Error = &'static str>> Stage for Pa
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         let _ = self.inner.poll_stage(input, cx);
         let _ = cx.waker().clone();
         EffectPoll::Pending
     }
 }
 
-fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<Arc<S::Output>, S::Error> {
+fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<StageAnswer<Arc<S::Output>>, S::Error> {
     stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
 }
 
@@ -177,7 +177,7 @@ fn an_equal_recompute_leaves_every_consumer_above_it_fresh() {
     let b = Arc::new(Tracked::new(&ledger, "b", Relays::new(&a)));
     let c = Arc::new(Tracked::new(&ledger, "c", Relays::new(&b)));
 
-    assert_eq!(poll(&*c, &input()), EffectPoll::Ready(Arc::new("A".to_string())));
+    assert_eq!(poll(&*c, &input()), StageAnswer::computed(Arc::new("A".to_string())));
     assert!(ledger.stale_nodes().is_empty(), "a poll is not a change");
 
     assert!(source.set("  A  ".to_string()), "the source really moved");
@@ -191,7 +191,7 @@ fn an_equal_recompute_leaves_every_consumer_above_it_fresh() {
     // Revalidating the bottom of the stale set is all it takes. This is
     // `Schedule::order()`'s shape - "the order in which a node's inputs are
     // known fresh" - and the point is what happens to the rest of that order.
-    assert_eq!(poll(&*a, &input()), EffectPoll::Ready(Arc::new("A".to_string())));
+    assert_eq!(poll(&*a, &input()), StageAnswer::computed(Arc::new("A".to_string())));
 
     assert!(
         ledger.stale_nodes().is_empty(),
@@ -220,7 +220,7 @@ fn without_backdating_the_same_chain_recomputes_to_the_top() {
 
     poll(&*c, &input());
     source.set("  A  ".to_string());
-    assert_eq!(poll(&*a, &input()), EffectPoll::Ready(Arc::new("A".to_string())));
+    assert_eq!(poll(&*a, &input()), StageAnswer::computed(Arc::new("A".to_string())));
 
     assert_eq!(
         labels(&ledger, &ledger.stale_nodes()),
@@ -243,7 +243,7 @@ fn a_recompute_that_moves_the_value_still_marks_its_consumers() {
 
     poll(&*b, &input());
     source.set("B".to_string());
-    assert_eq!(poll(&*a, &input()), EffectPoll::Ready(Arc::new("B".to_string())));
+    assert_eq!(poll(&*a, &input()), StageAnswer::computed(Arc::new("B".to_string())));
     assert_eq!(
         labels(&ledger, &ledger.stale_nodes()),
         ["b"],
@@ -253,7 +253,7 @@ fn a_recompute_that_moves_the_value_still_marks_its_consumers() {
     // And the node it cut off from is remembered, so a LATER equal recompute
     // cuts off against `B` rather than against the value before it.
     source.set(" B ".to_string());
-    assert_eq!(poll(&*a, &input()), EffectPoll::Ready(Arc::new("B".to_string())));
+    assert_eq!(poll(&*a, &input()), StageAnswer::computed(Arc::new("B".to_string())));
     assert!(!ledger.is_stale(b.node()));
 }
 
@@ -296,7 +296,7 @@ fn a_consumer_reached_by_two_changed_paths_needs_both_to_cut_off() {
         },
     ));
 
-    assert_eq!(poll(&*both, &input()), EffectPoll::Ready(Arc::new("LR".to_string())));
+    assert_eq!(poll(&*both, &input()), StageAnswer::computed(Arc::new("LR".to_string())));
     left_source.set(" L ".to_string());
     right_source.set(" R ".to_string());
     assert_eq!(
@@ -345,15 +345,18 @@ impl Stage for Joins {
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
-        let (EffectPoll::Ready(left), EffectPoll::Ready(right)) = (
+        let (
+            EffectPoll::Ready(StageAnswer::Computed(left)),
+            EffectPoll::Ready(StageAnswer::Computed(right)),
+        ) = (
             self.left.poll_stage(input, cx),
             self.right.poll_stage(input, cx),
         ) else {
             return EffectPoll::Pending;
         };
-        EffectPoll::Ready(Arc::new(format!("{left}{right}")))
+        StageAnswer::computed(Arc::new(format!("{left}{right}")))
     }
 }
 

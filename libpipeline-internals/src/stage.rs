@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::task::Context;
 
 use libeffects::{Effect, EffectPoll};
-use libpipelinedata::{MemoKey, StageId};
+use libpipelinedata::{MemoKey, StageAnswer, StageId};
 
 /// One step of a pipeline.
 ///
@@ -41,6 +41,15 @@ use libpipelinedata::{MemoKey, StageId};
 /// `B: Stage<Input = A::Output>` instead of `A: Stage<Output = Arc<B::Input>>`,
 /// and it is why no adapter exists to unwrap between two stages: the chain
 /// dereferences the share it already holds.
+///
+/// **A `Ready` says WHICH answer** ([`StageAnswer`]): the new value, or that the
+/// one this position last gave still stands. `Unchanged` carries nothing, so a
+/// stage answering it hands its consumer no input to be polled over - which is
+/// the whole saving, and why the variant lives in the `Ready` channel rather
+/// than beside it. [`StageAnswer`]'s doc carries the two spellings that were
+/// rejected. `BoundStage` below still implements [`Effect`] over it, which is
+/// what keeps "the stage contract IS the effect protocol" a claim the compiler
+/// checks.
 ///
 /// **`&self`.** A stage is a description of work, shareable and re-pollable;
 /// anything it must remember across polls goes through safe interior mutability
@@ -79,7 +88,7 @@ pub trait Stage {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error>;
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error>;
 }
 
 /// A shared stage is still a stage.
@@ -110,7 +119,7 @@ impl<T: Stage + ?Sized> Stage for &T {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         (**self).poll_stage(input, cx)
     }
 }
@@ -133,7 +142,7 @@ impl<T: Stage + ?Sized> Stage for Arc<T> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         (**self).poll_stage(input, cx)
     }
 }
@@ -161,7 +170,7 @@ impl<T: Stage + ?Sized> Stage for Box<T> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         (**self).poll_stage(input, cx)
     }
 }
@@ -190,7 +199,7 @@ impl<'a, S: Stage> BoundStage<'a, S> {
 }
 
 impl<S: Stage> Effect for BoundStage<'_, S> {
-    type Output = Arc<S::Output>;
+    type Output = StageAnswer<Arc<S::Output>>;
     type Error = S::Error;
 
     fn poll_effect(&self, cx: &mut Context<'_>) -> EffectPoll<Self::Output, Self::Error> {

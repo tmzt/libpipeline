@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
 use libeffects::WakeFlag;
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 use libpipeline_internals::watch::{WakePath, poll_watched};
@@ -90,7 +90,7 @@ impl Stage for Parks {
         &self,
         input: &Text,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<String>, &'static str> {
+    ) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         let Some(landed) = *self.slot.lock().unwrap() else {
             match self.on_park {
                 OnPark::Register => self.waiting.lock().unwrap().push(cx.waker().clone()),
@@ -100,7 +100,7 @@ impl Stage for Parks {
             }
             return EffectPoll::Pending;
         };
-        EffectPoll::Ready(Arc::new(format!("{}::{landed}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}::{landed}", input.0)))
     }
 }
 
@@ -146,7 +146,7 @@ fn a_poll_that_produced_a_value_owes_no_wake() {
     let stage = Parks::new(OnPark::Forget);
     stage.land("built");
     let (polled, path) = poll_watched(&*stage, &Text("hi".to_string()), Waker::noop());
-    assert_eq!(polled, EffectPoll::Ready(Arc::new("hi::built".to_string())));
+    assert_eq!(polled, StageAnswer::computed(Arc::new("hi::built".to_string())));
     assert_eq!(path, None);
 }
 

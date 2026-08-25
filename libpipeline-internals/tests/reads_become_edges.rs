@@ -34,7 +34,7 @@ use libpipeline_internals::track::Ledger;
 use libpipeline_internals::track::NodeId;
 use libpipeline_internals::track::Tracked;
 use libpipeline_internals::track::TrackedInput;
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -65,8 +65,8 @@ impl Stage for Reads {
         None
     }
 
-    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<Shout>, &'static str> {
-        EffectPoll::Ready(Arc::new(Shout(format!("{}{}", input.0, self.from.get()))))
+    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<Shout>>, &'static str> {
+        StageAnswer::computed(Arc::new(Shout(format!("{}{}", input.0, self.from.get()))))
     }
 }
 
@@ -91,13 +91,13 @@ impl Stage for ReadsEither {
         None
     }
 
-    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<Shout>, &'static str> {
+    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<Shout>>, &'static str> {
         let read = if *self.take_left.lock().unwrap() {
             self.left.get()
         } else {
             self.right.get()
         };
-        EffectPoll::Ready(Arc::new(Shout(read)))
+        StageAnswer::computed(Arc::new(Shout(read)))
     }
 }
 
@@ -118,8 +118,8 @@ impl Stage for ReadsNothing {
         None
     }
 
-    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<Shout>, &'static str> {
-        EffectPoll::Ready(Arc::new(Shout(input.0.clone())))
+    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<Shout>>, &'static str> {
+        StageAnswer::computed(Arc::new(Shout(input.0.clone())))
     }
 }
 
@@ -142,12 +142,14 @@ impl<S: Stage<Input = Text, Output = Shout, Error = &'static str>> Stage for Pol
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<Shout>, &'static str> {
-        self.inner.poll_stage(input, cx).map(|s| Arc::new(Shout(s.0.clone())))
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<Shout>>, &'static str> {
+        self.inner
+            .poll_stage(input, cx)
+            .map(|answer| answer.map(|s| Arc::new(Shout(s.0.clone()))))
     }
 }
 
-fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<Arc<S::Output>, S::Error> {
+fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<StageAnswer<Arc<S::Output>>, S::Error> {
     stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
 }
 
@@ -171,7 +173,7 @@ fn a_stage_that_reads_an_input_records_that_edge() {
 
     assert_eq!(
         poll(&stage, &Text("hi".to_string())),
-        EffectPoll::Ready(Arc::new(Shout("hi!".to_string()))),
+        StageAnswer::computed(Arc::new(Shout("hi!".to_string()))),
     );
 
     assert_eq!(labels(&ledger, &ledger.reads_of(stage.node())), ["title"]);
@@ -193,7 +195,7 @@ fn the_same_read_without_a_run_scope_records_nothing() {
 
     assert_eq!(
         poll(&untracked, &Text("hi".to_string())),
-        EffectPoll::Ready(Arc::new(Shout("hi!".to_string()))),
+        StageAnswer::computed(Arc::new(Shout("hi!".to_string()))),
         "the answer is the same - only the observation is missing",
     );
     assert!(ledger.readers_of(title.node()).is_empty());

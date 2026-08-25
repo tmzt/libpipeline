@@ -53,7 +53,9 @@ use std::any::Any;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
 
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, MemoStore, StageId};
+use libpipelinedata::{
+    ContentKey, EffectPoll, MemoKey, MemoMap, MemoStore, StageAnswer, StageId,
+};
 
 use libpipeline_internals::Stage;
 use libpipeline_internals::chain::Chain;
@@ -317,7 +319,7 @@ struct StageFn<I, O, E> {
     at: usize,
     id: StageId,
     key: fn(&I, &Ctx<'_>) -> Option<MemoKey>,
-    poll: fn(&I, &Ctx<'_>) -> EffectPoll<O, E>,
+    poll: fn(&I, &Ctx<'_>) -> EffectPoll<StageAnswer<O>, E>,
 }
 
 impl<I, O, E> Stage for StageFn<I, O, E> {
@@ -337,11 +339,18 @@ impl<I, O, E> Stage for StageFn<I, O, E> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         match (self.poll)(input, &Ctx::new(self.id, cx.waker())) {
             // The one allocation a miss costs: what the memo records and what
             // the caller is eventually handed are this same share.
-            EffectPoll::Ready(value) => EffectPoll::Ready(Arc::new(value)),
+            EffectPoll::Ready(StageAnswer::Computed(value)) => {
+                EffectPoll::Ready(StageAnswer::Computed(Arc::new(value)))
+            }
+            // Nothing to wrap: the value this refers to is the one the memo
+            // layer's slot already holds, which is what makes the answer free.
+            EffectPoll::Ready(StageAnswer::Unchanged) => {
+                EffectPoll::Ready(StageAnswer::Unchanged)
+            }
             EffectPoll::Pending => EffectPoll::Pending,
             EffectPoll::Failed(error) => EffectPoll::Failed(Failure::new(self.at, error)),
         }
@@ -426,10 +435,18 @@ impl PipelineBuilder {
     ///   recorded, which is how a registered stage opts out of the memoization
     ///   registration applies. Build the key through [`Ctx::key`], which
     ///   supplies the identity half.
-    /// * `poll` answers [`EffectPoll`]: `Ready` with the value, `Pending` when
-    ///   an awaited input has not landed - having stashed a clone of
-    ///   [`Ctx::waker`] where it will be woken - or `Failed` with the stage's
-    ///   own error, which the pipeline positions.
+    /// * `poll` answers [`EffectPoll`]: `Ready` with a [`StageAnswer`],
+    ///   `Pending` when an awaited input has not landed - having stashed a
+    ///   clone of [`Ctx::waker`] where it will be woken - or `Failed` with the
+    ///   stage's own error, which the pipeline positions.
+    ///
+    ///   A `Ready` says WHICH answer. `StageAnswer::computed(value)` is the
+    ///   ordinary one. `StageAnswer::unchanged()` says the answer this stage
+    ///   last gave still stands - it carries no value, and the stages after
+    ///   this one are then never entered at all, which is the whole saving. A
+    ///   stage may only say it where it has answered before; on a cold
+    ///   position the engine panics rather than telling a caller to keep a
+    ///   value it was never given.
     ///
     /// **Both are `fn` and not `impl Fn`, and that is the design rather than a
     /// stylistic preference.** A non-capturing closure coerces to `fn` and a
@@ -445,7 +462,7 @@ impl PipelineBuilder {
         self,
         name: &'static str,
         key: fn(&I, &Ctx<'_>) -> Option<MemoKey>,
-        poll: fn(&I, &Ctx<'_>) -> EffectPoll<O, E>,
+        poll: fn(&I, &Ctx<'_>) -> EffectPoll<StageAnswer<O>, E>,
     ) -> StagedPipelineBuilder<I, O, E>
     where
         I: 'static,
@@ -506,7 +523,7 @@ where
         self,
         name: &'static str,
         key: fn(&O, &Ctx<'_>) -> Option<MemoKey>,
-        poll: fn(&O, &Ctx<'_>) -> EffectPoll<O2, E>,
+        poll: fn(&O, &Ctx<'_>) -> EffectPoll<StageAnswer<O2>, E>,
     ) -> StagedPipelineBuilder<I, O2, E>
     where
         O2: Send + Sync + 'static,
@@ -565,8 +582,17 @@ pub enum Run<Output> {
     /// The value already held derives from exactly this state; keep it.
     ///
     /// Read it as **the value is finished**: not a report that nothing
-    /// happened, but a statement that nothing needs to. The readable was not
-    /// dereferenced, no memo key was computed and no stage was polled.
+    /// happened, but a statement that nothing needs to.
+    ///
+    /// Two things answer it and the caller's obligation is identical for both.
+    /// The version gate answers it when the version it is handed is the one it
+    /// last recorded and no wake is pending - the readable is not dereferenced,
+    /// no memo key is computed and no stage is polled. And the GRAPH answers it
+    /// when a stage that was entered rewrote nothing: the stages after that one
+    /// are never entered, the answer travels to the root, and the door records
+    /// the version for it. Which of the two happened is the pipeline's own
+    /// business, and a caller that could tell them apart would have nothing
+    /// different to do about it.
     Unchanged,
     /// Not ready; a wake is coming.
     ///
@@ -679,9 +705,19 @@ where
             return Ok(Run::Unchanged);
         }
         match self.frame.poll_frame(&self.graph, input) {
-            EffectPoll::Ready(value) => {
+            EffectPoll::Ready(StageAnswer::Computed(value)) => {
                 *self.last() = Some(version);
                 Ok(Run::Computed(value))
+            }
+            // **The graph reached the root without rewriting anything**, which
+            // is the ladder's answer arriving at the door: the value the caller
+            // holds derives from exactly this state, so the version is recorded
+            // for it exactly as a computed one is. This is the second source of
+            // `Unchanged` the version gate has always anticipated, and it is
+            // the one that does not need the version to have stayed still.
+            EffectPoll::Ready(StageAnswer::Unchanged) => {
+                *self.last() = Some(version);
+                Ok(Run::Unchanged)
             }
             EffectPoll::Pending => Ok(Run::Delayed),
             // A re-wrap, not a construction: the position was stamped at

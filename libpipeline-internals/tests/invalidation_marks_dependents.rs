@@ -40,7 +40,7 @@ use libpipeline_internals::track::NodeId;
 use libpipeline_internals::track::Tracked;
 use libpipeline_internals::track::TrackedInput;
 use libpipeline_internals::track::revalidating;
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, NoMemo, StageId};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, NoMemo, StageAnswer, StageId};
 use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
@@ -85,14 +85,14 @@ impl Stage for Reads {
         None
     }
 
-    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
         let read = if self.observed {
             self.from.get()
         } else {
             self.from.peek()
         };
-        EffectPoll::Ready(Arc::new(format!("{}{read}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}{read}", input.0)))
     }
 }
 
@@ -117,13 +117,13 @@ impl Stage for ReadsEither {
         None
     }
 
-    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, _input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         let read = if *self.take_left.lock().unwrap() {
             self.left.get()
         } else {
             self.right.get()
         };
-        EffectPoll::Ready(Arc::new(read))
+        StageAnswer::computed(Arc::new(read))
     }
 }
 
@@ -145,7 +145,7 @@ impl<S: Stage<Input = Text, Output = String, Error = &'static str>> Stage for Re
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         self.inner.poll_stage(input, cx)
     }
 }
@@ -167,7 +167,7 @@ impl Stage for Parks {
         None
     }
 
-    fn poll_stage(&self, _input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, _input: &Text, cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         let _ = cx.waker().clone();
         EffectPoll::Pending
     }
@@ -241,7 +241,7 @@ impl Stage for Composes {
         Some(MemoKey::new(Self::ID, inputs))
     }
 
-    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, &'static str> {
+    fn poll_stage(&self, input: &Text, _cx: &mut Context<'_>) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
         *self.runs.lock().unwrap() += 1;
         self.saw_revalidating.lock().unwrap().push(revalidating());
         let read = if self.observes {
@@ -249,7 +249,7 @@ impl Stage for Composes {
         } else {
             self.from.peek()
         };
-        EffectPoll::Ready(Arc::new(format!("{}{read}", input.0)))
+        StageAnswer::computed(Arc::new(format!("{}{read}", input.0)))
     }
 }
 
@@ -294,11 +294,11 @@ impl<V> MapStore<V> {
 /// back and the row it kept are that one allocation, and every hit after it is
 /// a refcount bump. Every expectation in this file that is stated against a
 /// memoized stage goes through here.
-fn shared(text: &str) -> EffectPoll<Arc<String>, &'static str> {
-    EffectPoll::Ready(Arc::new(text.to_string()))
+fn shared(text: &str) -> EffectPoll<StageAnswer<Arc<String>>, &'static str> {
+    StageAnswer::computed(Arc::new(text.to_string()))
 }
 
-fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<Arc<S::Output>, S::Error> {
+fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<StageAnswer<Arc<S::Output>>, S::Error> {
     stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
 }
 
@@ -447,7 +447,7 @@ fn the_frame_driver_learns_of_a_change_because_the_read_was_observed() {
 
     assert_eq!(
         driver.poll_frame(&stage, &Text("hi".to_string())),
-        EffectPoll::Ready(Arc::new("hiA".to_string())),
+        StageAnswer::computed(Arc::new("hiA".to_string())),
     );
     assert!(!driver.take_stale(), "a poll is not a wake");
 
@@ -455,7 +455,7 @@ fn the_frame_driver_learns_of_a_change_because_the_read_was_observed() {
     assert!(driver.take_stale(), "the change reached the frame loop");
     assert_eq!(
         driver.poll_frame(&stage, &Text("hi".to_string())),
-        EffectPoll::Ready(Arc::new("hiB".to_string())),
+        StageAnswer::computed(Arc::new("hiB".to_string())),
     );
     assert_eq!(stage.stage().runs(), 2);
 }
@@ -473,7 +473,7 @@ fn the_same_stage_reading_unobserved_never_reaches_the_frame_loop() {
 
     assert_eq!(
         driver.poll_frame(&stage, &Text("hi".to_string())),
-        EffectPoll::Ready(Arc::new("hiA".to_string())),
+        StageAnswer::computed(Arc::new("hiA".to_string())),
     );
     title.set("B".to_string());
     assert!(
@@ -483,7 +483,7 @@ fn the_same_stage_reading_unobserved_never_reaches_the_frame_loop() {
     assert!(ledger.stale_nodes().is_empty());
     assert_eq!(
         driver.poll_frame(&stage, &Text("hi".to_string())),
-        EffectPoll::Ready(Arc::new("hiB".to_string())),
+        StageAnswer::computed(Arc::new("hiB".to_string())),
         "the new value was available all along - it is the TELLING that was lost",
     );
 }
@@ -694,7 +694,7 @@ fn drive_over_tracked_state<St: MemoStore<String>>(store: St) -> (Vec<Arc<String
         .map(|value| {
             from.set(value.to_string());
             match poll(&stage, &input) {
-                EffectPoll::Ready(value) => value,
+                EffectPoll::Ready(StageAnswer::Computed(value)) => value,
                 other => panic!("a pure stage answered {other:?}"),
             }
         })

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
 use libpipeline_internals::Stage;
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageId};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer, StageId};
 
 /// A stand-in for an authored expression.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -67,12 +67,12 @@ impl Stage for Lower {
         &self,
         input: &Source,
         _cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Lowered>, &'static str> {
+    ) -> EffectPoll<StageAnswer<Arc<Lowered>>, &'static str> {
         *self.polls.lock().unwrap() += 1;
         if input.0.is_empty() {
             return EffectPoll::Failed("nothing to lower");
         }
-        EffectPoll::Ready(Arc::new(Lowered(
+        StageAnswer::computed(Arc::new(Lowered(
             input.0.split('.').map(str::to_string).collect::<Vec<_>>(),
         )))
     }
@@ -87,7 +87,7 @@ fn a_stage_polls_to_a_share_of_its_output() {
     let out = stage.poll_stage(&Source("props.title"), &mut cx);
     assert_eq!(
         out,
-        EffectPoll::Ready(Arc::new(Lowered(vec![
+        StageAnswer::computed(Arc::new(Lowered(vec![
             "props".to_string(),
             "title".to_string()
         ]))),

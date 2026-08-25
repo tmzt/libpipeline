@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Context;
 
 use libeffects::{Boundary, Effect, Recover};
-use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageAnswer, StageId};
 
 use crate::{BoundStage, Stage};
 
@@ -268,7 +268,10 @@ pub fn run_to_completion_counted<S, W>(
     input: &S::Input,
     work: &W,
     substitutions: &Substitutions,
-) -> (Result<Arc<S::Output>, DriveError<S::Error>>, usize)
+) -> (
+    Result<StageAnswer<Arc<S::Output>>, DriveError<S::Error>>,
+    usize,
+)
 where
     S: Stage,
     W: PendingWork + ?Sized,
@@ -317,11 +320,14 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
+    ) -> EffectPoll<StageAnswer<Arc<Self::Output>>, Self::Error> {
         // `cx` goes through untouched, so a fallback that awaits registers on
         // the same waker the guarded stage would have - there is no second wake
         // path to keep in sync (`libeffects::Recover::recover`).
-        let boundary = Boundary::new(BoundStage::new(&self.stage, input), Borrowed(&self.handler));
+        let boundary = Boundary::new(
+            BoundStage::new(&self.stage, input),
+            Computes(Borrowed(&self.handler)),
+        );
         let polled = boundary.poll_effect(cx);
         self.substitutions.add(boundary.substitutions());
         polled
@@ -351,5 +357,36 @@ impl<E, H: Recover<E>> Recover<E> for Borrowed<'_, H> {
         cx: &mut Context<'_>,
     ) -> EffectPoll<Self::Value, Self::Escalated> {
         self.0.recover(failure, cx)
+    }
+}
+
+/// **A fallback is always a computed answer**, and this is where that is said
+/// once rather than in every handler.
+///
+/// A stage's `Ready` carries a [`StageAnswer`], and [`Boundary`] requires the
+/// handler's substitute to be the same type the guarded effect produces. A
+/// handler still substitutes a VALUE - it stands in for what the stage could
+/// not produce - so it cannot honestly answer [`StageAnswer::Unchanged`]: that
+/// would claim the position's last answer still stands, on a poll where the
+/// real answer failed. This newtype wraps what a handler hands back so the
+/// distinction stays out of the handler's vocabulary entirely.
+///
+/// Same reason as [`Borrowed`] for its being a local newtype: the blanket impl
+/// would belong beside the trait, in `libeffects`.
+struct Computes<H>(H);
+
+impl<E, H, T> Recover<E> for Computes<H>
+where
+    H: Recover<E, Value = T>,
+{
+    type Value = StageAnswer<T>;
+    type Escalated = H::Escalated;
+
+    fn recover(
+        &self,
+        failure: E,
+        cx: &mut Context<'_>,
+    ) -> EffectPoll<Self::Value, Self::Escalated> {
+        self.0.recover(failure, cx).map(StageAnswer::Computed)
     }
 }
