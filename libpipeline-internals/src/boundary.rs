@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Context;
 
 use libeffects::{Boundary, Effect, Recover};
-use libpipelinedata::{BoundStage, EffectPoll, MemoKey, Stage, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageId};
+
+use crate::{BoundStage, Stage};
 
 use crate::driver::{DriveError, PendingWork, run_to_completion};
 
@@ -266,7 +268,7 @@ pub fn run_to_completion_counted<S, W>(
     input: &S::Input,
     work: &W,
     substitutions: &Substitutions,
-) -> (Result<S::Output, DriveError<S::Error>>, usize)
+) -> (Result<Arc<S::Output>, DriveError<S::Error>>, usize)
 where
     S: Stage,
     W: PendingWork + ?Sized,
@@ -276,10 +278,14 @@ where
     (driven, substitutions.count() - before)
 }
 
+/// **The handler substitutes a SHARE.** A boundary stands in for the stage's
+/// own answer, and a stage answers `Arc<Output>` - so a fallback is an
+/// `Arc<S::Output>` too, made once where the handler decides rather than copied
+/// into the value channel afterwards.
 impl<S, H> Stage for Guarded<S, H>
 where
     S: Stage,
-    H: Recover<S::Error, Value = S::Output>,
+    H: Recover<S::Error, Value = Arc<S::Output>>,
 {
     type Input = S::Input;
     type Output = S::Output;
@@ -311,7 +317,7 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         // `cx` goes through untouched, so a fallback that awaits registers on
         // the same waker the guarded stage would have - there is no second wake
         // path to keep in sync (`libeffects::Recover::recover`).

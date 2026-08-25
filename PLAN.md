@@ -697,3 +697,113 @@ API to compose - and none of them blocks, or is blocked by, the one door.
 Also deliberately not in this plan: any deletion in `src/track.rs` or
 `src/schedule.rs` ("What the edge reduction displaces" says why the order
 is finding 1 first, deletion after).
+
+## The door flip, and what it left open (2026-08-25)
+
+The registration door became a `fn` door, `Stage` moved into
+`libpipeline-internals`, the share moved out of the memo's associated type, and
+`run` became `poll` with the stale flag internal and `run_blocking` a free
+function. `DESIGN.md` carries the design; what follows is the residue, which is
+this file's job.
+
+### What `libpipelinedata` has become
+
+Its stated purpose - so a crate can AUTHOR A STAGE without linking the engine -
+is gone, and not because consumers are few. **The role it was designed for does
+not exist in this system.** A domain crate implements its domain operation
+(`Component::expand`, `crates/highbay_elements/src/component.rs`); whoever
+ASSEMBLES the pipeline wraps that operation in a registration and links the
+engine. An element crate should name neither `libpipeline` nor
+`libpipelinedata`.
+
+What is left in the crate, by fate:
+
+* **Relocating, not dying: the hashing vocabulary.** `ContentKey`,
+  `ContentHash`, `ContentHasher`, `ContentAddressHasher`, `Fnv1a128`, the
+  `serde_hash` door and `libpipelinedata-macros`' derive. They stop being MEMO
+  KEYS for this engine - the version is the key - but they are exactly what a
+  domain crate needs to decide whether its own pass changed anything. Their
+  destination is `crates/libhbdata` in the outer workspace, the same move
+  `Erasure` made: a capability landing where the thing that needs it lives.
+  Describing them as dead code would be wrong.
+* **In doubt: the `MemoStore` seam.** `EcsMemoStore` has ZERO consumers
+  anywhere in the workspace. The only external implementations are `TreeMemo`
+  and `DefinitionMemo` in `crates/highbay_elements/tests/expand_stage_memo.rs`
+  and `expand_stage_corpus.rs` - test doubles that count lookups. So the trait
+  currently abstracts over one real backend (`MemoMap`) for the benefit of two
+  mocks. **What removing it would cost**: the builder's `.store()` override
+  and `BuilderStore::Given` go, `Erased` collapses into a direct `MemoMap`
+  view, and the four doctests/tests that demonstrate an independent
+  implementation lose their subject. What the doubles actually need is "count
+  the lookups", which a `MemoMap` with a counter beside it serves without a
+  trait at all. Not removed here; the decision is Tim's.
+* **Genuinely shared, and small: `StageId`, `ContentKey`, `MemoKey`.** The
+  engine mints and compares them; a store implementor, if the seam survives,
+  receives them. If both the seam and the hashing go, `StageId` and `MemoKey`
+  are engine-internal and the crate is empty.
+* **`libeffects` re-export and `EffectPoll`.** A registration's poll function
+  names `EffectPoll`, so this is the one thing a consumer still reaches for
+  through this crate. It could as easily be a direct `libeffects` edge or a
+  facade re-export.
+
+Verdict as asked: **nothing consumer-facing remains** that could not be served
+by `libpipeline` re-exporting three types. Nothing was deleted or moved.
+
+### Early cutoff: observed, or reconstructed
+
+`Backdated` (`libpipeline-internals/src/track.rs`) RECONSTRUCTS the fact that a
+stage changed nothing: it content-addresses each `Ready` output, compares
+against the last address, and retracts its consumers' staleness when they
+match. That is work after the fact, and - decisively - work the domain has
+usually already done. `Expansion::untouched`
+(`crates/highbay_elements/src/component.rs`) is documented as "what a pass
+answers for a tree that declared none of its element, which is most trees": the
+domain already decided, and the distinction is discarded at the return because
+both paths return an `Expansion`.
+
+So the code favours OBSERVING it. A stage answering `Unchanged` costs nothing
+to produce on the common path and needs nothing the door does not already pass
+- the stage has its input and, once the version is the key, the version.
+`Backdated` costs a traversal of the output per poll, per node, to learn the
+same thing later. The gap is not machinery, it is that the outcome enum has
+nowhere to put the answer.
+
+One shape note, because the two `Unchanged`s are not the same: the caller-facing
+`Run::Unchanged` carries nothing, because the caller already holds the value; a
+stage's must still carry the value, because its consumers need one either way.
+"The same value, and I am telling you it is the same" - not "no value".
+
+### The gate, and why it did not dissolve
+
+Asked whether the version gate could be dropped in favour of always polling,
+with `Unchanged` meaning "no stage ran": **not while the engine content-keys**.
+The gate's one irreplaceable property is answering without dereferencing the
+readable, and an always-polling design reaches `ContentKey::of(input)` at stage
+0 on every poll - `O(input)` per frame, which is exactly what the
+`(version, readable)` pair exists to avoid.
+
+That objection dissolves under the version-as-key ruling: with stage 0 keyed
+`(0, version)` the lookup hits without touching the readable, and the gate
+becomes stage 0's memo key rather than a separate mechanism. Two things would
+still be needed, and neither is built: an opt-out spelling so an effectful stage
+is not served a stale row on the wake path (today's `memo_key -> None` already
+is one), and a "did anything run" signal. The second is cheap and needs no new
+channel through `Stage` - every actual execution passes through the facade's own
+`StageFn::poll_stage`, so one shared counter there answers it.
+
+### Findings the door flip opened
+
+1. **`Ctx` has no route to ambient state, and a `static` is filling the gap.**
+   Every counter and every upstream in this crate's tests is a `thread_local`
+   because a `fn` cannot hold a field. For a test that is fine; for a stage that
+   needs a module runtime or an atlas it is not. `DESIGN.md`'s "The intended
+   stage shape" names the seam; it does not exist.
+2. **A compile-fail test for the capturing closure cannot be written here.**
+   `trybuild` is a dev-dependency, and `tests/engine_stays_generic.rs` fails on
+   any crate outside the stack's allowlist appearing anywhere in the tree. So
+   the refusal is recorded rather than measured;
+   `a_capturing_closure_is_not_a_stage` holds the half that compiles.
+3. **The key function's `Ctx` carries a no-op waker.** A key is computed before
+   the stage runs, so there is nothing to be woken about - but the type says a
+   waker is there. If `Ctx` ever grows something a key function must not touch,
+   this becomes two types rather than one.

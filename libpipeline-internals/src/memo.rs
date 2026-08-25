@@ -3,7 +3,9 @@
 use std::sync::Arc;
 use std::task::Context;
 
-use libpipelinedata::{EffectPoll, MemoKey, MemoStore, Stage, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, MemoStore, StageId};
+
+use crate::Stage;
 
 use crate::track::revalidating;
 
@@ -75,9 +77,9 @@ use crate::track::revalidating;
 ///   stage refuses: not that its input cannot be addressed, but that its
 ///   ANSWER may not be the one the input implies.
 ///
-/// This type is `libpipeline`'s and not `libpipelinedata`'s because it is
-/// machinery: a crate that only implements a stage should not link it
-/// (`PLAN.md`, "Where a consumer works").
+/// This type is the engine's machinery and not part of any consumer-facing
+/// vocabulary: the facade's builder wraps every registration in one, and
+/// nothing outside this crate can name it.
 pub struct Memo<S, St> {
     stage: S,
     store: St,
@@ -106,16 +108,17 @@ where
     St: MemoStore<S::Output>,
 {
     type Input = S::Input;
-    /// A SHARE of the stage's output, because that is what the store holds
-    /// (`MemoStore`'s "It accepts and returns `Arc`, on both sides, always").
-    /// The memo keeps the value after it answers - that is the whole of what a
-    /// memo is - so the caller does not own it exclusively, and the type says
-    /// so rather than a copy pretending otherwise.
+    /// **The stage's output, unchanged.** The share is in the poll's RETURN
+    /// (`Stage::poll_stage`), not in this type: a memo is transparent about
+    /// what a stage produces, and a `Stage<Output = Arc<T>>` would make every
+    /// consumer of a memoized stage spell the engine's storage decision in its
+    /// own constraint.
     ///
-    /// The wrapping happens HERE, once, on a miss, at the point the value is
-    /// recorded. No stage author writes `Arc` to be memoized cheaply and none
-    /// can forget to.
-    type Output = Arc<S::Output>;
+    /// What the memo holds and answers with is the share the stage below it
+    /// already made, recorded on a miss and refcount-bumped on every hit after.
+    /// No stage author writes `Arc` to be memoized cheaply and none can forget
+    /// to.
+    type Output = S::Output;
     type Error = S::Error;
 
     /// The inner stage's id. Memoization is transparent: it must not change
@@ -133,7 +136,7 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         let key = self.stage.memo_key(input);
         if let Some(key) = &key
             && !revalidating()
@@ -142,11 +145,12 @@ where
             return EffectPoll::Ready(hit);
         }
         match self.stage.poll_stage(input, cx) {
-            EffectPoll::Ready(value) => {
-                // One allocation, on the miss, and both the answer and the row
-                // are that same allocation: recording is a refcount bump, and
-                // so is every hit it serves afterwards.
-                let held = Arc::new(value);
+            EffectPoll::Ready(held) => {
+                // Nothing is wrapped here: the poll already answered with the
+                // share, so the row and the answer are one allocation and
+                // recording is a refcount bump - as is every hit it serves
+                // afterwards.
+                //
                 // Recorded even when the lookup was skipped, and under the same
                 // key: the store then holds the value the stage has just
                 // produced, so the next poll of an unstale node hits on

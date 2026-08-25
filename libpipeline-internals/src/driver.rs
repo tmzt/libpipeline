@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::task::{Context, Waker};
 
 use libeffects::WakeFlag;
-use libpipelinedata::{EffectPoll, Stage};
+use libpipelinedata::EffectPoll;
+
+use crate::Stage;
 
 /// How a blocking drive ended other than with a value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,7 +75,7 @@ pub fn run_to_completion<S, W>(
     stage: &S,
     input: &S::Input,
     work: &W,
-) -> Result<S::Output, DriveError<S::Error>>
+) -> Result<Arc<S::Output>, DriveError<S::Error>>
 where
     S: Stage,
     W: PendingWork + ?Sized,
@@ -142,7 +144,7 @@ impl FrameDriver {
         &self,
         stage: &S,
         input: &S::Input,
-    ) -> EffectPoll<S::Output, S::Error> {
+    ) -> EffectPoll<Arc<S::Output>, S::Error> {
         let waker = self.stale.waker();
         stage.poll_stage(input, &mut Context::from_waker(&waker))
     }

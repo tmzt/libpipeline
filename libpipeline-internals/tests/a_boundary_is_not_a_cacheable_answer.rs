@@ -45,7 +45,8 @@ use std::task::{Context, Waker};
 use libeffects::{Fallback, Recover};
 use libpipeline_internals::boundary::Guarded;
 use libpipeline_internals::memo::Memo;
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, MemoStore, Stage, StageId};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, MemoStore, StageId};
+use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
 
@@ -105,13 +106,13 @@ impl Stage for Flaky {
         Some(MemoKey::new(Self::ID, [ContentKey::of(&input.0)]))
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<String, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
         *self.polls.lock().unwrap() += 1;
         let Some(filled) = *self.slot.lock().unwrap() else {
             self.waiting.lock().unwrap().push(cx.waker().clone());
             return EffectPoll::Failed(Boom);
         };
-        EffectPoll::Ready(format!("{}:{filled}", input.0))
+        EffectPoll::Ready(Arc::new(format!("{}:{filled}", input.0)))
     }
 }
 
@@ -138,7 +139,7 @@ impl<S: Stage> Stage for Shared<S> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         self.0.poll_stage(input, cx)
     }
 }
@@ -155,7 +156,7 @@ struct Keyed<S, H>(Guarded<S, H>);
 impl<S, H> Stage for Keyed<S, H>
 where
     S: Stage,
-    H: Recover<S::Error, Value = S::Output>,
+    H: Recover<S::Error, Value = Arc<S::Output>>,
 {
     type Input = S::Input;
     type Output = S::Output;
@@ -174,7 +175,7 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         self.0.poll_stage(input, cx)
     }
 }
@@ -220,11 +221,11 @@ impl<V> MemoStore<V> for Watching<V> {
 
 const GUARD: StageId = StageId::at(1);
 
-fn guard(flaky: &Arc<Flaky>) -> Guarded<Shared<Flaky>, Fallback<String>> {
+fn guard(flaky: &Arc<Flaky>) -> Guarded<Shared<Flaky>, Fallback<Arc<String>>> {
     Guarded::new(
         GUARD,
         Shared(Arc::clone(flaky)),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
     )
 }
 

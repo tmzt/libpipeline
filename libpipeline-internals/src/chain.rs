@@ -1,8 +1,11 @@
 //! Composing stages into a graph.
 
+use std::sync::Arc;
 use std::task::Context;
 
-use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageId};
+
+use crate::Stage;
 
 /// Two stages, one after the other - and itself a [`Stage`].
 ///
@@ -54,6 +57,12 @@ impl<A, B> Chain<A, B> {
 /// position is stamped where it is known - at registration - and the tag is
 /// gone (`DESIGN.md`, "One error type, flat and positioned"): here a failure
 /// travels out unchanged, which is why this impl has no `map_err` in it.
+/// **The join is spelled on the VALUE, not on the share.** `B` consumes what
+/// `A` produces - `B::Input = A::Output` - even though what travels between
+/// them is an `Arc` of it, because the share lives in the poll's return type
+/// rather than in `Output` (`Stage`'s doc). The chain dereferences the share it
+/// is holding and hands the second stage the value; there is no adapter
+/// between two stages and nothing for a stage author to unwrap.
 impl<A, B> Stage for Chain<A, B>
 where
     A: Stage,
@@ -83,7 +92,7 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         match self.first.poll_stage(input, cx) {
             EffectPoll::Ready(intermediate) => self.second.poll_stage(&intermediate, cx),
             EffectPoll::Pending => EffectPoll::Pending,

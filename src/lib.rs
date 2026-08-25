@@ -2,6 +2,11 @@
 //!
 //! # Inside the crate (an inventory, not an API)
 //!
+//! * `Stage` - the contract every layer below composes, and the thing the
+//!   builder constructs from a registration's two functions. It moved here
+//!   from `libpipelinedata` when the door became a `fn` door: with nothing
+//!   outside the engine implementing it, it is machinery like the rest of this
+//!   list.
 //! * `Memo` - the memo layer. The lookup precedes the work, only `Ready` is
 //!   recorded, and the store is not consulted at all while `revalidating` -
 //!   so a key built from a stage's arguments cannot serve a value the ledger
@@ -67,13 +72,19 @@
 //! **Read the list above as an inventory, not as an API.** Every item named in
 //! it lives in `libpipeline-internals` and is reached only by this crate. The
 //! whole of what this crate exports is [`PipelineBuilder`], [`Pipeline`],
-//! [`Run`], [`Failure`] and the [`RunResult`] alias over the last two - four
-//! names and one alias, and nothing else. `DESIGN.md` says why, and `PLAN.md`
-//! says what to do when a consumer needs one of the internals: that is a
-//! FINDING about the builder's reach, recorded there, not a re-export.
+//! [`Run`], [`Failure`], the [`RunResult`] alias over the last two, [`Ctx`] and
+//! [`run_blocking`]. `DESIGN.md` says why, and `PLAN.md` says what to do when a
+//! consumer needs one of the internals: that is a FINDING about the builder's
+//! reach, recorded there, not a re-export.
 //!
-//! [`StagedPipelineBuilder`] is exported beside them and is not a fifth thing
-//! to learn: it is what `.stage()` hands back, its fields are private and it
+//! [`Ctx`] and [`run_blocking`] are the two additions the door flip forced. A
+//! `fn` door's signature must name what it hands the function, so `Ctx` is
+//! public because the registration types say so; `run_blocking` is the
+//! blocking caller's loop, which is the same few lines in every caller and is
+//! a loop over [`Pipeline::poll`] rather than a second way into the engine.
+//!
+//! [`StagedPipelineBuilder`] is exported beside them and is not a further thing
+//! to learn: it is what `.stage_fn()` hands back, its fields are private and it
 //! has no constructor, so a consumer receives one, calls a method on it, and
 //! with method chaining never writes its name. `Failure` is the same category -
 //! public type, private fields, private `new` - and the two are the pattern
@@ -84,8 +95,9 @@
 mod builder;
 
 /// **The public door, and the whole of it.** See `DESIGN.md`: composition,
-/// memoization and driving go through the builder; `Stage` stays public to
-/// IMPLEMENT (via `libpipelinedata`) but not to assemble by hand.
+/// memoization and driving go through the builder, and a stage is registered
+/// as two `fn` pointers rather than implemented as a trait - so there is no
+/// implement-side contract in this list either.
 ///
 /// Everything the builder assembles - the chain, the memo layer, the frame
 /// driver, the drive functions, the tracked layer, the boundary layer, the
@@ -101,4 +113,6 @@ mod builder;
 // no signature does. A consumer that finds itself needing one has found
 // something the builder cannot express (`PLAN.md`'s findings), not an export
 // this list forgot.
-pub use builder::{Failure, Pipeline, PipelineBuilder, Run, RunResult, StagedPipelineBuilder};
+pub use builder::{
+    Ctx, Failure, Pipeline, PipelineBuilder, Run, RunResult, StagedPipelineBuilder, run_blocking,
+};

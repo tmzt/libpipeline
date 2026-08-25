@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Waker};
 
-use libpipelinedata::{ContentHash, ContentKey, EffectPoll, MemoKey, Stage, StageId};
+use libpipelinedata::{ContentHash, ContentKey, EffectPoll, MemoKey, StageId};
+
+use crate::Stage;
 
 /// Distinguishes one [`Ledger`] from another, so a [`NodeId`] minted by one is
 /// refused by the other rather than silently addressing a different node.
@@ -637,7 +639,7 @@ impl<S: Stage> Stage for Tracked<S> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         self.ledger.observe_read(self.node);
         let polled = self
             .ledger
@@ -748,14 +750,17 @@ where
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         let polled = self.tracked.poll_stage(input, cx);
         if let EffectPoll::Ready(value) = &polled {
             // After the scope has closed, deliberately: `unchanged` walks this
             // node's READERS, and doing it from inside the node's own run would
             // retract a reason from a consumer that is at that moment part-way
             // through the poll which pulled us.
-            let address = ContentKey::of(value);
+            // The share is dereferenced to address the VALUE: what a node's
+            // consumers care about is what it produced, not which allocation
+            // carried it.
+            let address = ContentKey::of(&**value);
             let repeated = self
                 .last
                 .lock()

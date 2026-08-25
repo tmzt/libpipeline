@@ -32,6 +32,10 @@
 //!   cutoff above the leaf.
 //! * [`schedule`] - what a driver polls next given the stale set: the stale
 //!   nodes no stale node reads, since the pull revalidates the rest.
+//! * [`stage`] - the stage contract itself, re-exported at the root as
+//!   [`Stage`]. It moved here from `libpipelinedata` when registration became a
+//!   `fn` door: with no consumer implementing it, the trait is machinery like
+//!   everything else in this list.
 //!
 //! **The engine never learns a consumer's types, and the proof is the
 //! manifests.** Everything here is generic over `S: Stage`; nothing matches on
@@ -52,5 +56,10 @@ pub mod chain;
 pub mod driver;
 pub mod memo;
 pub mod schedule;
+pub mod stage;
 pub mod track;
 pub mod watch;
+
+/// The contract every layer in this crate composes, at the root because every
+/// one of them names it.
+pub use stage::{BoundStage, Stage};

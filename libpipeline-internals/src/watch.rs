@@ -29,7 +29,9 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Wake, Waker};
 
-use libpipelinedata::{EffectPoll, Stage};
+use libpipelinedata::EffectPoll;
+
+use crate::Stage;
 
 use crate::driver::{DriveError, PendingWork};
 
@@ -82,7 +84,7 @@ pub fn poll_watched<S: Stage>(
     stage: &S,
     input: &S::Input,
     wake: &Waker,
-) -> (EffectPoll<S::Output, S::Error>, Option<WakePath>) {
+) -> (EffectPoll<Arc<S::Output>, S::Error>, Option<WakePath>) {
     let probe = Arc::new(Probe {
         forward: wake.clone(),
         woken: Mutex::new(false),
@@ -155,7 +157,7 @@ pub fn run_to_completion_watched<S, W>(
     stage: &S,
     input: &S::Input,
     work: &W,
-) -> (Result<S::Output, DriveError<S::Error>>, WakeReport)
+) -> (Result<Arc<S::Output>, DriveError<S::Error>>, WakeReport)
 where
     S: Stage,
     W: PendingWork + ?Sized,

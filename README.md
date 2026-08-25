@@ -1,73 +1,61 @@
 # libpipeline
 
 An incremental pipeline engine. You register pure, poll-driven stages with a
-builder; the engine memoizes every stage under content-addressed keys, chains
-the stages into one graph, and runs it through one door - `run(version,
+builder; the engine memoizes every stage under keys computed before the work,
+chains the stages into one graph, and runs it through one door - `poll(version,
 &input)`, which polls once and returns immediately, whatever the answer.
-Blocking to completion (a build tool) and one run per frame (an interactive
+Blocking to completion (a build tool) and one poll per frame (an interactive
 host) are things a CALLER does with that one call: the same stages, the same
 cache, either caller.
 
-`libpipeline` is the engine half of a two-crate pair. Its companion
-`libpipelinedata` is the port: the `Stage` trait, the key types, and the
-storage seam. A crate that only *authors* stages depends on `libpipelinedata`
-alone and never links the engine; the crate that *assembles and drives* them
-adds `libpipeline`. The examples below are assembly-side code, so they use
-both.
+**A stage is two functions, and the builder takes them as `fn` pointers.** A
+key function that says what this input is, and a poll function that produces
+the output. Neither may capture - a non-capturing closure coerces to `fn` and a
+capturing one does not compile - so a stage cannot carry hidden state that
+moves its output without moving its key. Everything the engine gives a stage
+arrives through one argument, `Ctx`.
+
+`libpipeline` is the engine half of a pair. Its companion `libpipelinedata`
+holds the shared vocabulary the two sides speak: the key types, the content
+hash, and the `MemoStore` seam. The examples below use both.
 
 Every example on this page is a doctest: `cargo test` compiles and runs them.
 
 ## The smallest working pipeline
 
-A stage implements `Stage` from `libpipelinedata`: an identity, a memo key
-computable from the input alone, and a poll. The builder is the only way to
-compose, memoize, or drive - you assemble nothing by hand.
+A stage is a `(key, poll)` pair. The key is computable from the input alone -
+before the stage runs - which is what lets a lookup precede the work. The
+builder is the only way to compose, memoize, or drive; you assemble nothing by
+hand.
 
 ```rust
-use std::task::Context;
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
 
-use libpipeline::{PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, Stage, StageId};
-
-/// Splits a dotted path like "doc.title" into its segments.
-struct Split {
-    id: StageId,
+/// What "doc.title" IS, as a key - computable without splitting anything.
+///
+/// `Ctx::key` supplies the identity half: a key is `(stage id, input content
+/// keys)`, and the id is the half a stage has no business choosing.
+fn split_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+    Some(ctx.key([ContentKey::of(input)]))
 }
 
-impl Stage for Split {
-    type Input = String;
-    type Output = Vec<String>;
-    type Error = &'static str;
-
-    fn id(&self) -> StageId {
-        self.id
+/// Splits a dotted path like "doc.title" into its segments.
+fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<Vec<String>, &'static str> {
+    if input.is_empty() {
+        return EffectPoll::Failed("nothing to split");
     }
-
-    /// The memo key, computable from the input alone - before the stage runs.
-    fn memo_key(&self, input: &String) -> Option<MemoKey> {
-        Some(MemoKey::new(self.id, [ContentKey::of(input)]))
-    }
-
-    fn poll_stage(
-        &self,
-        input: &String,
-        _cx: &mut Context<'_>,
-    ) -> EffectPoll<Vec<String>, &'static str> {
-        if input.is_empty() {
-            return EffectPoll::Failed("nothing to split");
-        }
-        EffectPoll::Ready(input.split('.').map(str::to_string).collect())
-    }
+    EffectPoll::Ready(input.split('.').map(str::to_string).collect())
 }
 
 let pipeline = PipelineBuilder::new()
-    .stage("split", |id| Split { id })
+    .stage_fn("split", split_key, split)
     .build();
 
 // `1` is the run VERSION: which state the input is. Where it comes from is
 // yours - an edit store's cursor, a build number, a git sha.
-let Ok(Run::Computed(segments)) = pipeline.run(1, &"doc.title".to_string()) else {
-    panic!("a pure stage answers on the first run");
+let Ok(Run::Computed(segments)) = pipeline.poll(1, &"doc.title".to_string()) else {
+    panic!("a pure stage answers on the first poll");
 };
 assert_eq!(*segments, vec!["doc".to_string(), "title".to_string()]);
 ```
@@ -75,93 +63,69 @@ assert_eq!(*segments, vec!["doc".to_string(), "title".to_string()]);
 `Run::Computed` hands back an `Arc` of the output, because the memo still
 holds the value it just answered with - that is what a memo is. It also means
 a large output costs a refcount bump per cache hit and nothing else, without
-any stage author remembering to wrap anything: the engine wraps once, on a
-miss, where it records.
+any stage author remembering to wrap anything: the engine wraps once, where the
+value enters the graph.
 
-Two things to notice at the registration call site:
+Three things to notice at the registration call site:
 
 * **The builder mints the identity, and the identity is a position.** The
-  `StageId` handed to the closure is this registration's index and nothing
-  else; a stage never declares one, so there is no second id it could answer
-  with and nothing to check. `"split"` beside it is a diagnostic label: it
-  enters no key, nothing is looked up or compared by it, and a second stage
-  may carry the same one with no consequence.
+  `StageId` inside the `Ctx` is this registration's index and nothing else; a
+  stage never declares one, so there is no second id it could answer with and
+  nothing to check. `"split"` beside it is a diagnostic label: it enters no
+  key, nothing is looked up or compared by it, and a second stage may carry the
+  same one with no consequence.
+* **The functions are `fn` pointers, not closures the builder boxes.** Free
+  functions like these coerce, and so does a non-capturing closure written
+  inline. A closure that captured a counter, a handle or a config would not,
+  and that refusal is the design: a captured field is an input that moves the
+  output without moving the key, and no review catches every one.
 * There is no separate "memoize" step. **Registering a stage memoizes it**;
   there is no un-memoized registration to reach for.
 
 ## Adding stages
 
-Chain another `.stage(..)` call; the new stage's `Input` must equal the
-previous stage's `Output` - the value, not the share the graph carries it in;
-unwrapping between stages is the engine's job too - and its `Error` is the
-pipeline's one error type, which every stage of one pipeline shares. A failure
-comes back carrying the POSITION of the stage that raised it.
+Chain another `.stage_fn(..)` call; the new stage's input must be the previous
+stage's output - the value, not the share the graph carries it in; unwrapping
+between stages is the engine's job too - and its error is the pipeline's one
+error type, which every stage of one pipeline shares. A failure comes back
+carrying the POSITION of the stage that raised it.
 
 ```rust
-use std::task::Context;
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
 
-use libpipeline::{PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, Stage, StageId};
-
-# struct Split { id: StageId }
-# impl Stage for Split {
-#     type Input = String;
-#     type Output = Vec<String>;
-#     type Error = &'static str;
-#     fn id(&self) -> StageId { self.id }
-#     fn memo_key(&self, input: &String) -> Option<MemoKey> {
-#         Some(MemoKey::new(self.id, [ContentKey::of(input)]))
+# fn split_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+#     Some(ctx.key([ContentKey::of(input)]))
+# }
+# fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<Vec<String>, &'static str> {
+#     if input.is_empty() {
+#         return EffectPoll::Failed("nothing to split");
 #     }
-#     fn poll_stage(&self, input: &String, _cx: &mut Context<'_>)
-#         -> EffectPoll<Vec<String>, &'static str>
-#     {
-#         if input.is_empty() {
-#             return EffectPoll::Failed("nothing to split");
-#         }
-#         EffectPoll::Ready(input.split('.').map(str::to_string).collect())
-#     }
+#     EffectPoll::Ready(input.split('.').map(str::to_string).collect())
 # }
 /// Counts the segments the first stage produced.
-struct Count {
-    id: StageId,
+fn count_key(input: &Vec<String>, ctx: &Ctx<'_>) -> Option<MemoKey> {
+    Some(ctx.key(input.iter().map(ContentKey::of)))
 }
 
-impl Stage for Count {
-    type Input = Vec<String>;
-    type Output = usize;
-    type Error = &'static str;
-
-    fn id(&self) -> StageId {
-        self.id
-    }
-
-    fn memo_key(&self, input: &Vec<String>) -> Option<MemoKey> {
-        Some(MemoKey::new(self.id, input.iter().map(ContentKey::of)))
-    }
-
-    fn poll_stage(
-        &self,
-        input: &Vec<String>,
-        _cx: &mut Context<'_>,
-    ) -> EffectPoll<usize, &'static str> {
-        EffectPoll::Ready(input.len())
-    }
+fn count(input: &Vec<String>, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+    EffectPoll::Ready(input.len())
 }
 
 let pipeline = PipelineBuilder::new()
-    .stage("split", |id| Split { id })
-    .stage("count", |id| Count { id })
+    .stage_fn("split", split_key, split)
+    .stage_fn("count", count_key, count)
     .build();
 
-let Ok(Run::Computed(count)) = pipeline.run(1, &"doc.section.title".to_string()) else {
+let Ok(Run::Computed(count)) = pipeline.poll(1, &"doc.section.title".to_string()) else {
     panic!("both stages are pure");
 };
 assert_eq!(*count, 3);
 
 // A failure names the stage that raised it, as a position: stage 0 here,
-// because `Split` failed and `Count` never ran. One `at()` call answers that
+// because `split` failed and `count` never ran. One `at()` call answers that
 // at any length of chain.
-let Err(failure) = pipeline.run(2, &String::new()) else {
+let Err(failure) = pipeline.poll(2, &String::new()) else {
     panic!("an empty source cannot be split");
 };
 assert_eq!(failure.at(), 0);
@@ -177,81 +141,66 @@ Every registered stage is looked up before it is polled: the key is
 `(stage id, content keys of the inputs)`, so it costs no run to compute.
 An unchanged input is a cache hit that never enters the stage at all.
 
-The versions below MOVE while the content stays the same, which is how a run
+The versions below MOVE while the content stays the same, which is how a poll
 reaches the graph at all: the version gate above it answers first when the
 version repeats (the next section is about that), so a test of the memo has to
 hand the pipeline a state it has not computed for yet.
 
-```rust
-use std::sync::{Arc, Mutex};
-use std::task::Context;
+**Note where the run counter lives**, because it is the one thing a `fn` door
+changes about writing a stage: a stage cannot hold a field, so anything ambient
+it needs - a counter here, a font atlas or a module runtime in earnest - is
+reached through a `static`. `Ctx` is where such a route belongs and does not
+carry one yet; `DESIGN.md`'s "The intended stage shape" is the record of that.
 
-use libpipeline::{PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, Stage, StageId};
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+
+static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+    Some(ctx.key([ContentKey::of(input)]))
+}
 
 /// Measures a string, counting how many times it actually ran.
-struct Len {
-    id: StageId,
-    runs: Arc<Mutex<usize>>,
+fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+    LEN_RUNS.fetch_add(1, Ordering::Relaxed);
+    EffectPoll::Ready(input.len())
 }
 
-impl Stage for Len {
-    type Input = String;
-    type Output = usize;
-    type Error = &'static str;
-
-    fn id(&self) -> StageId {
-        self.id
-    }
-
-    fn memo_key(&self, input: &String) -> Option<MemoKey> {
-        Some(MemoKey::new(self.id, [ContentKey::of(input)]))
-    }
-
-    fn poll_stage(
-        &self,
-        input: &String,
-        _cx: &mut Context<'_>,
-    ) -> EffectPoll<usize, &'static str> {
-        *self.runs.lock().unwrap() += 1;
-        EffectPoll::Ready(input.len())
-    }
-}
-
-let runs = Arc::new(Mutex::new(0));
-let counted = Arc::clone(&runs);
 let pipeline = PipelineBuilder::new()
-    .stage("len", move |id| Len { id, runs: counted })
+    .stage_fn("len", len_key, len)
     .build();
 
-assert_eq!(pipeline.run(1, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
-assert_eq!(pipeline.run(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
-assert_eq!(*runs.lock().unwrap(), 1); // the repeat was served by the lookup
+assert_eq!(pipeline.poll(1, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
+assert_eq!(pipeline.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
+assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 1); // the repeat was served by the lookup
 
 // `.uncached()` turns the store off: the control run. Answers must not
 // change, only speed - a pipeline whose answers change when the cache is
 // disabled has a bug the cache was hiding.
-let runs = Arc::new(Mutex::new(0));
-let counted = Arc::clone(&runs);
 let control = PipelineBuilder::new()
     .uncached()
-    .stage("len", move |id| Len { id, runs: counted })
+    .stage_fn("len", len_key, len)
     .build();
 
-assert_eq!(control.run(1, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
-assert_eq!(control.run(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
-assert_eq!(*runs.lock().unwrap(), 2); // the control ran every time
+assert_eq!(control.poll(1, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
+assert_eq!(control.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
+assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 3); // the control ran every time
+# use std::sync::Arc;
 ```
 
 **Opting out.** A stage whose answer is not a cacheable fact - an effect, a
-read of something no key can address - answers `memo_key -> None`. It is then
-neither looked up nor recorded, and everything else about it is unchanged.
-Failures are never cached regardless: a transient failure served back from a
-memo would outlive its cause.
+read of something no key can address - answers `None` from its key function. It
+is then neither looked up nor recorded, and everything else about it is
+unchanged. Failures are never cached regardless: a transient failure served
+back from a memo would outlive its cause.
 
 ## One door, and what it answers
 
-`run(version, &readable)` polls once and returns immediately, whatever the
+`poll(version, &readable)` polls once and returns immediately, whatever the
 answer. Nothing inside it waits, ever. There are four answers:
 
 * **`Run::Computed(value)`** - work happened; take the new value. The pipeline
@@ -260,11 +209,11 @@ answer. Nothing inside it waits, ever. There are four answers:
   state; keep it. Read it as *the value is finished*: not a report that nothing
   happened, but a statement that nothing needs to. The readable is not
   dereferenced, no memo key is computed and no stage is polled.
-* **`Run::Delayed`** - not ready; a wake is coming. The run arranged for the
+* **`Run::Delayed`** - not ready; a wake is coming. The poll arranged for the
   pipeline's waker to be woken when the answer becomes possible, so wait to be
   woken rather than re-polling in a spin.
-* **`Err(Failure)`** - the run did not happen. `at()` names the stage, and the
-  error rides beside it. Nothing is recorded, so a later run with the same
+* **`Err(Failure)`** - the poll did not happen. `at()` names the stage, and the
+  error rides beside it. Nothing is recorded, so a later poll with the same
   version retries.
 
 The `version` argument says WHICH STATE the readable is; it is the only version
@@ -273,83 +222,75 @@ handed. That pairing is the point: the version costs a comparison, and the
 readable may be a large snapshot that a matching version never touches.
 
 ```rust
-use std::sync::{Arc, Mutex};
-use std::task::Context;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use libpipeline::{PipelineBuilder, Run};
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, Stage, StageId};
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
 
-# struct Len { id: StageId, runs: Arc<Mutex<usize>> }
-# impl Stage for Len {
-#     type Input = String;
-#     type Output = usize;
-#     type Error = &'static str;
-#     fn id(&self) -> StageId { self.id }
-#     fn memo_key(&self, input: &String) -> Option<MemoKey> {
-#         Some(MemoKey::new(self.id, [ContentKey::of(input)]))
-#     }
-#     fn poll_stage(&self, input: &String, _cx: &mut Context<'_>)
-#         -> EffectPoll<usize, &'static str>
-#     {
-#         *self.runs.lock().unwrap() += 1;
-#         EffectPoll::Ready(input.len())
-#     }
+# static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
+# fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+#     Some(ctx.key([ContentKey::of(input)]))
 # }
-let runs = Arc::new(Mutex::new(0));
-let counted = Arc::clone(&runs);
+# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+#     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
+#     EffectPoll::Ready(input.len())
+# }
 let pipeline = PipelineBuilder::new()
-    .stage("len", move |id| Len { id, runs: counted })
+    .stage_fn("len", len_key, len)
     .build();
 
 let doc = "doc.title".to_string();
-assert_eq!(pipeline.run(1, &doc), Ok(Run::Computed(Arc::new(9))));
+assert_eq!(pipeline.poll(1, &doc), Ok(Run::Computed(Arc::new(9))));
 
 // The same version again: the gate answers, and the graph is not entered. The
 // readable is not even looked at - which is measurable, because this one is a
 // different string.
-assert_eq!(pipeline.run(1, &"anything at all".to_string()), Ok(Run::Unchanged));
-assert_eq!(*runs.lock().unwrap(), 1);
+assert_eq!(pipeline.poll(1, &"anything at all".to_string()), Ok(Run::Unchanged));
+assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 1);
 
 // A version it has not computed for reaches the graph.
-assert_eq!(pipeline.run(2, &"hi".to_string()), Ok(Run::Computed(Arc::new(2))));
-assert_eq!(*runs.lock().unwrap(), 2);
+assert_eq!(pipeline.poll(2, &"hi".to_string()), Ok(Run::Computed(Arc::new(2))));
+assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 2);
 ```
 
 **A wake counts as much as a version, and the gate knows it.** Two different
 things mean "something happened": the input version moves when the source
 changes, and a wake arrives when a value some stage was waiting on has landed.
-A landed effect does not move the input version, so the gate consumes the
-pipeline's stale flag on every run and answers `Unchanged` only when the
-version matches AND no wake was pending. Without that half, a pipeline sitting
-on `Delayed` would receive its wake, re-run, short-circuit on the unchanged
-version and answer `Unchanged` forever, with the caller holding a value one
-step stale and nothing reporting it.
+A landed effect does not move the input version, so the gate answers
+`Unchanged` only when the version matches AND no wake is pending. Without that
+half, a pipeline sitting on `Delayed` would receive its wake, poll again,
+short-circuit on the unchanged version and answer `Unchanged` forever, with the
+caller holding a value one step stale and nothing reporting it.
 
-`take_stale()` asks the same question directly ("has a wake arrived since I
-last asked"; reading clears it) and `waker()` hands out the wake target for
-landing values out of band. Because the flag clears on read and `run` reads it
-too, a frame caller with nothing else to ask should simply run every frame:
-`Unchanged` is the cheap answer, and it is what that variant is for.
+**There is no "has a wake arrived" accessor.** The flag clears when it is read,
+so a second reader is a second claimant on one wake, and the gate is the reader
+that must not lose. `waker()` hands out the wake target for landing values out
+of band; a caller with nothing else to ask polls every frame and lets
+`Unchanged` be the cheap answer, which is what that variant is for.
 
 ## Two caller patterns
 
-Blocking and frame driving are things a caller does with `run`, not doors the
+Blocking and frame driving are things a caller does with `poll`, not doors the
 pipeline provides. A stage cannot tell which is asking.
 
-* **A frame caller** runs once per frame. A `Delayed` run draws its stand-in;
-  the waker the stage registered marks the pipeline stale when the value lands,
-  and the next frame's run picks it up.
+* **A frame caller** polls once per frame. A `Delayed` poll draws its stand-in;
+  the waker the stage registered wakes the pipeline when the value lands, and
+  the next frame's poll picks it up.
 * **A blocking caller** loops on `Delayed`, pumping its own executor between
-  runs. `Delayed` when the caller has nothing left to run means something
-  waited for an input nothing was going to land - and that is the CALLER's
-  condition, because only the caller can see that its queue is empty.
+  polls. `run_blocking` is that loop, shipped as a free function whose body is
+  a loop over `poll` and nothing else. `Delayed` when the caller has nothing
+  left to run means something waited for an input nothing was going to land -
+  and that is the CALLER's condition, because only the caller can see that its
+  queue is empty, so `run_blocking` hands back the plain `Delayed` rather than
+  deciding.
 
 ```rust
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Waker};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::task::Waker;
 
-use libpipeline::{PipelineBuilder, Run};
-use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
+use libpipeline::{Ctx, PipelineBuilder, Run, run_blocking};
+use libpipelinedata::{EffectPoll, MemoKey};
 
 /// Where a value lands out of band, and where a delayed poll leaves its waker.
 #[derive(Default)]
@@ -367,82 +308,59 @@ impl Slot {
     }
 }
 
-/// `Pending` until the slot is filled. An effect's answer is not a cacheable
-/// fact, so it refuses to key.
-struct Fetch {
-    id: StageId,
-    slot: Arc<Slot>,
+// A stage is a `fn` and cannot capture, so what it waits on is reached through
+// a `static`. That is the shape today; see the note above.
+static SLOT: LazyLock<Slot> = LazyLock::new(Slot::default);
+
+/// An effect's answer is not a cacheable fact, so this refuses to key.
+fn fetch_key(_input: &(), _ctx: &Ctx<'_>) -> Option<MemoKey> {
+    None
 }
 
-impl Stage for Fetch {
-    type Input = ();
-    type Output = u32;
-    type Error = &'static str;
-
-    fn id(&self) -> StageId {
-        self.id
-    }
-
-    fn memo_key(&self, _input: &()) -> Option<MemoKey> {
-        None
-    }
-
-    fn poll_stage(&self, _input: &(), cx: &mut Context<'_>) -> EffectPoll<u32, &'static str> {
-        match *self.slot.value.lock().unwrap() {
-            Some(value) => EffectPoll::Ready(value),
-            None => {
-                // Answering `Pending` obliges the stage to arrange a wake.
-                *self.slot.waker.lock().unwrap() = Some(cx.waker().clone());
-                EffectPoll::Pending
-            }
+/// `Pending` until the slot is filled.
+fn fetch(_input: &(), ctx: &Ctx<'_>) -> EffectPoll<u32, &'static str> {
+    match *SLOT.value.lock().unwrap() {
+        Some(value) => EffectPoll::Ready(value),
+        None => {
+            // Answering `Pending` obliges the stage to arrange a wake.
+            *SLOT.waker.lock().unwrap() = Some(ctx.waker().clone());
+            EffectPoll::Pending
         }
     }
 }
 
-// The frame pattern: run, delayed, wake, run again.
-let slot = Arc::new(Slot::default());
-let registered = Arc::clone(&slot);
+// The frame pattern: poll, delayed, wake, poll again.
 let pipeline = PipelineBuilder::new()
-    .stage("fetch", move |id| Fetch { id, slot: registered })
+    .stage_fn("fetch", fetch_key, fetch)
     .build();
 
-assert_eq!(pipeline.run(1, &()), Ok(Run::Delayed)); // frame 1: draw a stand-in
-slot.land(7);                                       // the value arrives out of band
-assert_eq!(pipeline.run(1, &()), Ok(Run::Computed(Arc::new(7))));
+assert_eq!(pipeline.poll(1, &()), Ok(Run::Delayed)); // frame 1: draw a stand-in
+SLOT.land(7);                                        // the value arrives out of band
+assert_eq!(pipeline.poll(1, &()), Ok(Run::Computed(Arc::new(7))));
 
-// The blocking pattern: the same stage, the caller's own loop and executor.
-let slot = Arc::new(Slot::default());
-let registered = Arc::clone(&slot);
+// The blocking pattern: the same stage, the caller's own pump.
 let pipeline = PipelineBuilder::new()
-    .stage("fetch", move |id| Fetch { id, slot: registered })
+    .stage_fn("fetch", fetch_key, fetch)
     .build();
 
-let landed = Mutex::new(false);
-let mut pump_once = || {
-    let mut landed = landed.lock().unwrap();
-    if *landed {
+let mut pumped = false;
+let outcome = run_blocking(&pipeline, 1, &(), || {
+    if pumped {
         return false; // nothing left to run: the caller's own stall condition
     }
-    *landed = true;
-    slot.land(7);
+    pumped = true;
+    SLOT.land(7);
     true
-};
-
-let outcome = loop {
-    match pipeline.run(1, &()) {
-        Ok(Run::Delayed) if pump_once() => continue,
-        done => break done,
-    }
-};
+});
 assert_eq!(outcome, Ok(Run::Computed(Arc::new(7))));
 ```
 
 **A `Delayed` that owes a wake and leaves none is a value LOST rather than
-late.** It is invisible to a blocking caller, which runs again without being
+late.** It is invisible to a blocking caller, which polls again without being
 asked, and fatal to a frame caller, which never learns there is anything to ask
-for. `Stage::poll_stage` makes registering an obligation for that reason, and
-`take_stale()` staying false after the value lands is what the defect looks
-like from outside.
+for. Answering `Pending` makes registering an obligation for that reason, and
+what the defect looks like from outside is a pipeline answering `Unchanged`
+forever over a value that has already moved.
 
 ## The storage seam
 
@@ -463,21 +381,20 @@ change; only speed does).
 
 One store serves every stage, whatever their outputs are, because the rows are
 erased: the store the builder holds is instantiated at `dyn Any + Send + Sync`,
-so what it records is the share the memo layer already made, unsized - nothing is
-wrapped twice - and a lookup is `Arc::downcast`. `V: ?Sized` on the store below is
-what that costs an implementation generic over its value type; a store written for
-this builder alone would name the erased type directly and need nothing generic at
-all.
+so what it records is the share the stage already answered with, unsized -
+nothing is wrapped twice - and a lookup is `Arc::downcast`. `V: ?Sized` on the
+store below is what that costs an implementation generic over its value type; a
+store written for this builder alone would name the erased type directly and
+need nothing generic at all.
 
 ```rust
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-# use std::task::Context;
-# use libpipelinedata::{ContentKey, EffectPoll, Stage, StageId};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use libpipeline::{PipelineBuilder, Run};
-use libpipelinedata::{MemoKey, MemoStore};
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore};
 
 /// A store of your own: any `lookup`/`record` pair over `MemoKey` will do.
 struct MapStore<V: ?Sized> {
@@ -494,64 +411,35 @@ impl<V: ?Sized> MemoStore<V> for MapStore<V> {
     }
 }
 
-# struct Len {
-#     id: StageId,
-#     runs: Arc<Mutex<usize>>,
+# static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
+# fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+#     Some(ctx.key([ContentKey::of(input)]))
 # }
-# impl Stage for Len {
-#     type Input = String;
-#     type Output = usize;
-#     type Error = &'static str;
-#     fn id(&self) -> StageId { self.id }
-#     fn memo_key(&self, input: &String) -> Option<MemoKey> {
-#         Some(MemoKey::new(self.id, [ContentKey::of(input)]))
-#     }
-#     fn poll_stage(&self, input: &String, _cx: &mut Context<'_>)
-#         -> EffectPoll<usize, &'static str>
-#     {
-#         *self.runs.lock().unwrap() += 1;
-#         EffectPoll::Ready(input.len())
-#     }
+# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<usize, &'static str> {
+#     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
+#     EffectPoll::Ready(input.len())
 # }
 /// Renders the count, so the pipeline below holds two stages whose outputs
 /// are different types - and still one store.
-struct Render {
-    id: StageId,
+fn render_key(input: &usize, ctx: &Ctx<'_>) -> Option<MemoKey> {
+    Some(ctx.key([ContentKey::of(input)]))
 }
 
-impl Stage for Render {
-    type Input = usize;
-    type Output = String;
-    type Error = &'static str;
-
-    fn id(&self) -> StageId {
-        self.id
-    }
-
-    fn memo_key(&self, input: &usize) -> Option<MemoKey> {
-        Some(MemoKey::new(self.id, [ContentKey::of(input)]))
-    }
-
-    fn poll_stage(&self, input: &usize, _cx: &mut Context<'_>)
-        -> EffectPoll<String, &'static str>
-    {
-        EffectPoll::Ready(input.to_string())
-    }
+fn render(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<String, &'static str> {
+    EffectPoll::Ready(input.to_string())
 }
 
 let store: Arc<MapStore<dyn Any + Send + Sync>> = Arc::new(MapStore {
     rows: Mutex::new(HashMap::new()),
 });
-let runs = Arc::new(Mutex::new(0));
-let counted = Arc::clone(&runs);
 
 let pipeline = PipelineBuilder::new()
     .store(Arc::clone(&store))
-    .stage("len", move |id| Len { id, runs: counted })
-    .stage("render", |id| Render { id })
+    .stage_fn("len", len_key, len)
+    .stage_fn("render", render_key, render)
     .build();
 
-let Ok(Run::Computed(rendered)) = pipeline.run(1, &"abcd".to_string()) else {
+let Ok(Run::Computed(rendered)) = pipeline.poll(1, &"abcd".to_string()) else {
     panic!("both stages are pure");
 };
 assert_eq!(*rendered, "4");
@@ -562,19 +450,20 @@ assert_eq!(store.rows.lock().unwrap().len(), 2);
 
 // And the repeat is served from it: neither stage ran again. The version moves,
 // so what answers is the store rather than the gate above it.
-assert_eq!(pipeline.run(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new("4".to_string()))));
-assert_eq!(*runs.lock().unwrap(), 1);
+assert_eq!(pipeline.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new("4".to_string()))));
+assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 1);
 ```
 
 ## Where to look next
 
 * `DESIGN.md` - the design: the model the engine embodies, why the builder is
-  the only public door, why there is one door onto running rather than two, why
-  identity is a position, and where the one store and the one error type come
-  from.
-* `libpipelinedata` - the stage author's crate: `Stage`, `StageId`,
-  `MemoKey`/`ContentKey`, the `ContentHash` streaming hasher and derive, and
-  the `MemoStore` seam.
+  the only public door, why registration takes `fn` pointers rather than a
+  trait, why there is one door onto running rather than two, why identity is a
+  position, and where the one store and the one error type come from. Its
+  "Ruled, not yet built" section is the shortest route to what is about to
+  change.
+* `libpipelinedata` - the shared vocabulary: `StageId`, `MemoKey`/`ContentKey`,
+  the `ContentHash` streaming hasher and derive, and the `MemoStore` seam.
 * The tests in `tests/` are written exclusively against the public API shown
   on this page, and are a good second read.
 

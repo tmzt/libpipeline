@@ -46,7 +46,8 @@ use libpipeline_internals::driver::NoPendingWork;
 use libpipeline_internals::watch::WakePath;
 use libpipeline_internals::watch::poll_watched;
 use libpipeline_internals::driver::run_to_completion;
-use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, NoMemo, Stage, StageId};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, NoMemo, StageId};
+use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
 
@@ -135,7 +136,7 @@ impl Stage for Flaky {
         Some(MemoKey::new(Self::ID, [ContentKey::of(&input.0)]))
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<String, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
         *self.polls.lock().unwrap() += 1;
         let Some(filled) = *self.slot.lock().unwrap() else {
             self.waiting.lock().unwrap().push(cx.waker().clone());
@@ -144,7 +145,7 @@ impl Stage for Flaky {
                 WhileEmpty::Parked => EffectPoll::Pending,
             };
         };
-        EffectPoll::Ready(format!("{}:{filled}", input.0))
+        EffectPoll::Ready(Arc::new(format!("{}:{filled}", input.0)))
     }
 }
 
@@ -180,7 +181,7 @@ impl<S: Stage> Stage for Shared<S> {
         &self,
         input: &Self::Input,
         cx: &mut Context<'_>,
-    ) -> EffectPoll<Self::Output, Self::Error> {
+    ) -> EffectPoll<Arc<Self::Output>, Self::Error> {
         self.0.poll_stage(input, cx)
     }
 }
@@ -189,12 +190,12 @@ const GUARD: StageId = StageId::at(1);
 
 /// Poll once with a waker of no consequence - the offline driver's shape
 /// (`driver.rs:80-81`). What this returns is what a driver sees.
-fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<S::Output, S::Error> {
+fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<Arc<S::Output>, S::Error> {
     stage.poll_stage(input, &mut Context::from_waker(Waker::noop()))
 }
 
 /// `driven`, insisting on a value.
-fn value_of<S: Stage>(stage: &S, input: &S::Input) -> S::Output
+fn value_of<S: Stage>(stage: &S, input: &S::Input) -> Arc<S::Output>
 where
     S::Error: std::fmt::Debug,
 {
@@ -212,9 +213,9 @@ where
 #[test]
 fn a_failure_the_handler_catches_is_substituted_for_the_stages_answer() {
     let flaky = Flaky::failing(Boom::Network);
-    let guarded = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new("fallback".into()));
+    let guarded = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new(Arc::new("fallback".to_string())));
 
-    assert_eq!(value_of(&guarded, &Text("src".into())), "fallback");
+    assert_eq!(*value_of(&guarded, &Text("src".into())), "fallback");
     assert_eq!(
         guarded.substitutions(),
         1,
@@ -225,7 +226,7 @@ fn a_failure_the_handler_catches_is_substituted_for_the_stages_answer() {
     // The failure clears, and the real answer replaces the fallback - nothing
     // in the boundary remembers the substitution it made.
     flaky.land("v1");
-    assert_eq!(value_of(&guarded, &Text("src".into())), "src:v1");
+    assert_eq!(*value_of(&guarded, &Text("src".into())), "src:v1");
     assert_eq!(guarded.substitutions(), 1, "no second substitution");
 }
 
@@ -235,11 +236,11 @@ fn a_handler_that_declines_bubbles_into_this_scopes_own_channel() {
     // says nothing about the other, which is what bubbling IS.
     let arms = || {
         Arms::escalating(Escaped)
-            .catching(|boom: &Boom| matches!(boom, Boom::Network), "fallback".to_string())
+            .catching(|boom: &Boom| matches!(boom, Boom::Network), Arc::new("fallback".to_string()))
     };
 
     let caught = Guarded::new(GUARD, Shared(Flaky::failing(Boom::Network)), arms());
-    assert_eq!(value_of(&caught, &Text("src".into())), "fallback");
+    assert_eq!(*value_of(&caught, &Text("src".into())), "fallback");
 
     let declined = Guarded::new(GUARD, Shared(Flaky::failing(Boom::Malformed)), arms());
     assert_eq!(
@@ -261,19 +262,19 @@ fn an_outermost_stage_boundary_makes_an_unhandled_failure_impossible_by_type() {
     // `Infallible` and "nothing bubbles past here" is checked by the compiler
     // rather than claimed by a comment. Writing the failed arm costs
     // `match never {}`.
-    let guarded: Guarded<_, Fallback<String>> = Guarded::new(
+    let guarded: Guarded<_, Fallback<Arc<String>>> = Guarded::new(
         GUARD,
         Shared(Flaky::failing(Boom::Malformed)),
-        Fallback::new("the last resort".into()),
+        Fallback::new(Arc::new("the last resort".to_string())),
     );
     let value = match driven(&guarded, &Text("src".into())) {
         EffectPoll::Ready(value) => value,
         EffectPoll::Pending => panic!("nothing here is pending"),
         EffectPoll::Failed(never) => match never {},
     };
-    assert_eq!(value, "the last resort");
+    assert_eq!(*value, "the last resort");
 
-    let _: Result<String, DriveError<Infallible>> =
+    let _: Result<Arc<String>, DriveError<Infallible>> =
         run_to_completion(&guarded, &Text("src".into()), &NoPendingWork);
 }
 
@@ -284,7 +285,7 @@ fn an_outermost_stage_boundary_makes_an_unhandled_failure_impossible_by_type() {
 #[test]
 fn a_value_and_a_park_pass_through_untouched() {
     let flaky = Flaky::new(WhileEmpty::Parked);
-    let guarded = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new("fallback".into()));
+    let guarded = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new(Arc::new("fallback".to_string())));
 
     let (polled, path) = poll_watched(&guarded, &Text("src".into()), Waker::noop());
     assert_eq!(polled, EffectPoll::Pending, "a park is not a failure");
@@ -297,7 +298,7 @@ fn a_value_and_a_park_pass_through_untouched() {
     assert_eq!(guarded.substitutions(), 0);
 
     flaky.land("v1");
-    assert_eq!(value_of(&guarded, &Text("src".into())), "src:v1");
+    assert_eq!(*value_of(&guarded, &Text("src".into())), "src:v1");
     assert_eq!(guarded.substitutions(), 0, "a value is nobody's fallback");
 }
 
@@ -309,7 +310,7 @@ fn a_fallback_that_is_still_loading_is_pending_rather_than_a_value() {
     // handed, which is what the probe measures.
     let parked: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
     let stashing = Arc::clone(&parked);
-    let arms = Arms::<Boom, String, Boom>::bubbling().arm(move |_boom, cx: &mut Context<'_>| {
+    let arms = Arms::<Boom, Arc<String>, Boom>::bubbling().arm(move |_boom, cx: &mut Context<'_>| {
         stashing.lock().unwrap().push(cx.waker().clone());
         Some(EffectPoll::Pending)
     });
@@ -342,14 +343,14 @@ fn both_drivers_see_the_same_answer_through_a_boundary() {
     // Caught: the offline driver reaches a value for a graph whose stage never
     // produced one, and so does the frame.
     let flaky = Flaky::failing(Boom::Network);
-    let caught = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new("fallback".into()));
+    let caught = Guarded::new(GUARD, Shared(Arc::clone(&flaky)), Fallback::new(Arc::new("fallback".to_string())));
     assert_eq!(
         run_to_completion(&caught, &input, &NoPendingWork).map_err(|_| "failed"),
-        Ok("fallback".to_string()),
+        Ok(Arc::new("fallback".to_string())),
     );
     assert_eq!(
         FrameDriver::new().poll_frame(&caught, &input),
-        EffectPoll::Ready("fallback".to_string()),
+        EffectPoll::Ready(Arc::new("fallback".to_string())),
     );
 
     // Declined: the failure reaches BOTH drivers, carrying the same path.
@@ -357,7 +358,7 @@ fn both_drivers_see_the_same_answer_through_a_boundary() {
         GUARD,
         Shared(Flaky::failing(Boom::Malformed)),
         Arms::escalating(Escaped)
-            .catching(|boom: &Boom| matches!(boom, Boom::Network), "fallback".to_string()),
+            .catching(|boom: &Boom| matches!(boom, Boom::Network), Arc::new("fallback".to_string())),
     );
     assert_eq!(
         run_to_completion(&declined, &input, &NoPendingWork),
@@ -398,22 +399,22 @@ fn the_answers_through_a_boundary_do_not_change_when_the_cache_is_disabled() {
                 // answers - so the substitute is a share too.
                 Fallback::new(Arc::new("fallback".to_string())),
             );
-            seen.push(value_of(&guarded, &input));
-            seen.push(value_of(&guarded, &input));
+            seen.push(value_of(&guarded, &input).to_string());
+            seen.push(value_of(&guarded, &input).to_string());
             flaky.land("v1");
-            seen.push(value_of(&guarded, &input));
-            seen.push(value_of(&guarded, &input));
+            seen.push(value_of(&guarded, &input).to_string());
+            seen.push(value_of(&guarded, &input).to_string());
         } else {
             let guarded = Guarded::new(
                 GUARD,
                 Memo::new(Shared(Arc::clone(&flaky)), NoMemo),
                 Fallback::new(Arc::new("fallback".to_string())),
             );
-            seen.push(value_of(&guarded, &input));
-            seen.push(value_of(&guarded, &input));
+            seen.push(value_of(&guarded, &input).to_string());
+            seen.push(value_of(&guarded, &input).to_string());
             flaky.land("v1");
-            seen.push(value_of(&guarded, &input));
-            seen.push(value_of(&guarded, &input));
+            seen.push(value_of(&guarded, &input).to_string());
+            seen.push(value_of(&guarded, &input).to_string());
         }
         seen
     };
@@ -422,10 +423,10 @@ fn the_answers_through_a_boundary_do_not_change_when_the_cache_is_disabled() {
     assert_eq!(
         sequence(false),
         vec![
-            Arc::new("fallback".to_string()),
-            Arc::new("fallback".to_string()),
-            Arc::new("src:v1".to_string()),
-            Arc::new("src:v1".to_string()),
+            "fallback".to_string(),
+            "fallback".to_string(),
+            "src:v1".to_string(),
+            "src:v1".to_string(),
         ],
         "and the sequence is the one the pipeline should have: the fallback \
          only while the stage is failing",

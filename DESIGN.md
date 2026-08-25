@@ -10,15 +10,17 @@ A pipeline is **the self-contained state tracker for the steps defined
 through a builder, with one way to run it and four possible outcomes**.
 This document describes that crate.
 
-!!! PROPOSED
+A step is **two functions**, registered as `fn` pointers - a key and a poll.
+Not a trait, and not `impl Fn`: both of those admit captured state, which is
+an input that moves a step's output without moving its key.
 
-The note above applies to this whole document: everything below describes
-the target shape of the crate, and none of it is built yet. The design is
-written in the present tense of its finished state - "the pipeline records
-the version" is a specification, not a claim to check against `src/` today.
-The companion `PLAN.md` records the crate as it currently stands, the
-evidence behind the decisions made here, and the ordered steps from one to
-the other; this document does not depend on it.
+!!! MOSTLY BUILT
+
+The public API below, the version gate, the one store, the flat error and the
+`fn` registration door are built. What is not is collected in **"Ruled, not
+yet built"**, at the end of Internals - read that section before acting on
+anything here, because several of its entries change what a memo key IS. The
+companion `PLAN.md` records the migration that got the crate here.
 
 ## How to read this
 
@@ -92,50 +94,82 @@ it.
 ## Public API
 
 Four types - `PipelineBuilder`, `Pipeline`, `Run` and `Failure` - joined
-by one alias, `RunResult`. A fifth, `MemoStore`, matters only when the
-default store is wrong.
+by one alias, `RunResult`, and one free function, `run_blocking`. A fifth
+type, `Ctx`, is what a step's functions are handed. A sixth, `MemoStore`,
+matters only when the default store is wrong.
 
 ### Building a pipeline
 
 ```rust,ignore
-use libpipeline::{PipelineBuilder, Run};
+use libpipeline::{Ctx, PipelineBuilder, Run};
+use libpipelinedata::{ContentKey, EffectPoll, MemoKey};
+
+fn parse_key(input: &Source, ctx: &Ctx<'_>) -> Option<MemoKey> {
+    Some(ctx.key([ContentKey::of(input)]))
+}
+
+fn parse(input: &Source, _ctx: &Ctx<'_>) -> EffectPoll<Parsed, Error> {
+    EffectPoll::Ready(Parsed::of(input))
+}
 
 let pipeline = PipelineBuilder::new()
-    .stage("parse", |id| Parse::new(id))
-    .stage("lower", |id| Lower::new(id))
+    .stage_fn("parse", parse_key, parse)
+    .stage_fn("lower", lower_key, lower)
     .build();
 ```
 
 * `PipelineBuilder::new()` - the empty builder, remembering into a map of
   its own.
-* `.stage(name, make)` - register one step. `make` receives the identity
-  the builder **mints** for it, which is its position in this builder and
+* `.stage_fn(name, key, poll)` - register one step, as **two `fn`
+  pointers**. `key` answers this input's memo key without running anything,
+  which is what lets a lookup precede the work; `None` there means the input
+  cannot be honestly addressed, and the step is then neither looked up nor
+  recorded. `poll` answers `EffectPoll` - `Ready` with the value, `Pending`
+  having arranged a wake, or `Failed`. Both receive a `Ctx`, which carries
+  the identity the builder **mints** for this registration - its position and
   nothing else; the `name` beside it is a diagnostic label, not an identity
   (see "Identity is a position"). Steps chain: each consumes what the
   previous one produced. Every registered step remembers its answers; there
   is no un-remembering registration to forget.
+
+  **`fn` and not `impl Fn`, and not a trait.** A non-capturing closure
+  coerces to `fn`; a capturing one does not compile. So everything the poll
+  can see, the key can see - which is what makes a memo key an honest address
+  for the answer rather than one that is honest until somebody adds a field.
+  "A trait-taking stage door" under "Rejected alternatives" carries the
+  argument in full.
 * `.uncached()` - the control switch: the pipeline remembers nothing.
   Answers must not change, only speed; a pipeline whose answers change when
   remembering is disabled has a bug the remembering was hiding.
-* `.build()` - the finished pipeline. Its input type is the first step's
-  input; its output type is the last step's output; its error type is the
-  one every step shares; its version type is fixed here, as part of the
-  pipeline's own type.
+* `.build()` - the finished pipeline, `Pipeline<V, I, O, E>`. Its input type
+  is the first step's input; its output type is the last step's output; its
+  error type is the one every step shares; its version type is fixed here.
+  **Four of the consumer's own types and no trait of the engine's**: the
+  assembled graph is erased behind a private field, so nothing about the
+  machinery is spellable from a pipeline's type.
 
-`.stage()` hands back a `StagedPipelineBuilder`, which is not a fifth thing
-to learn: its fields are private and it has no constructor, so a consumer
-receives one, calls a method on it, and with method chaining never writes
-its name. The four names above are the four a consumer CONSTRUCTS OR MATCHES
-ON; an opaque intermediate that only appears in a return type is not a
-concept beside them. `Failure` is the same category - a public type with
+`.stage_fn()` hands back a `StagedPipelineBuilder`, which is not a further
+thing to learn: its fields are private and it has no constructor, so a
+consumer receives one, calls a method on it, and with method chaining never
+writes its name. The four names above are the four a consumer CONSTRUCTS OR
+MATCHES ON; an opaque intermediate that only appears in a return type is not
+a concept beside them. `Failure` is the same category - a public type with
 private fields and a private constructor - so this is a pattern the design
 uses twice rather than an exception to its own count.
 
-A consumer implements steps against the stage contract in
-`libpipelinedata` (`Stage`, `StageId`, and the key vocabulary), which
-exists so a step can be **declared** without linking the engine that runs
-it. A consumer receives a `StageId` from the builder and never constructs
-one. A consumer implements stages and assembles nothing.
+**`Ctx` is the one argument through which the engine gives a step anything**,
+and it exists so that the registration signature does not move when the
+engine gives a step more. Today it carries the minted identity -
+`ctx.key(inputs)` is the only spelling a step needs, and it supplies the
+identity half so a key cannot be built under another step's - and the waker,
+which is what makes `Pending` an honest answer. "The intended stage shape"
+under Internals records what it does not carry yet.
+
+A consumer writes functions and assembles nothing. The vocabulary those
+functions name - `EffectPoll`, `MemoKey`, `ContentKey` - is
+`libpipelinedata`'s. The stage CONTRACT is not: it is
+`libpipeline-internals`', because with registration taking functions nothing
+outside the engine implements it.
 
 ### Running it
 
@@ -146,11 +180,12 @@ A pipeline runs through one method, whose outcome is a standard
 pub type RunResult<T, E> = Result<Run<T>, Failure<E>>;
 ```
 
-`run(version, &readable) -> RunResult<Output, Error>` polls once and
-returns immediately, whatever the answer; nothing inside it waits, ever.
+`poll(version, &readable) -> RunResult<Output, Error>` polls once and
+returns immediately, whatever the answer; nothing inside it waits, ever. The
+name is what it does.
 
 ```rust,ignore
-match pipeline.run(version, &document)? {
+match pipeline.poll(version, &document)? {
     Run::Computed(output) => held = Some(output),
     Run::Unchanged => { /* `held` is finished and current */ }
     Run::Delayed => { /* draw the stand-in; a wake is coming */ }
@@ -178,8 +213,8 @@ The value is an `Arc` of the output, because the memo still holds it after
 answering with it - that is what a memo is, so the caller does not own it
 exclusively and the type says so rather than a copy pretending otherwise.
 It is also what makes a large output cheap without any stage author
-remembering to wrap one: the engine wraps once, on a miss, where it records
-(see "One store, at the builder").
+remembering to wrap one: the engine wraps once, where a poll function's value
+enters the graph, and every hit after that is a refcount bump.
 
 `Run::Unchanged` - the value already held derives from exactly this state;
 keep it. The pipeline compares the version it is handed against the one it
@@ -188,7 +223,7 @@ all. Read it as **the value is finished**: not a report that nothing
 happened, but a statement that nothing needs to, which is what lets a
 caller draw the value it holds and stop.
 
-`Run::Delayed` - not ready; a wake is coming. The run has arranged for the
+`Run::Delayed` - not ready; a wake is coming. The poll has arranged for the
 pipeline's waker to be woken when the answer becomes possible, so wait to
 be woken rather than re-polling in a spin. Where the wake comes from - the
 original input, or a later stage internally - is unspecified, because the
@@ -223,9 +258,20 @@ order; running an older state again is just another state.
 
 ### After `Delayed`: the wake
 
-* `.take_stale() -> bool` - whether a wake arrived since last asked
-  ("stale, run again"); reading clears it.
-* `.waker() -> Waker` - the wake target, for landing values out of band.
+`.waker() -> Waker` - the wake target, for landing values out of band. Waking
+it tells the pipeline that something it cannot see has moved, so the next
+`poll` at an unchanged version enters the graph rather than answering
+`Unchanged` off the version alone. A step that parks does this for itself
+through `Ctx::waker`; this is the same target, for whoever lands a value from
+outside the graph entirely.
+
+**There is no "has a wake arrived" accessor, and its absence is the design.**
+An answer that clears when it is read is a fact two readers race for, and the
+gate is the reader that must not lose: a caller that asked first would have
+TAKEN the wake, leaving `poll` to find none, see the version unchanged, and
+answer `Unchanged` - the exact defect the wake half of the gate exists to
+prevent, reintroduced from the caller's side. The flag stays internal and the
+gate is its only reader.
 
 ### Blocking and frame are what a caller does
 
@@ -234,7 +280,7 @@ whether there is reason to - the gate decides, and `Unchanged` is the cheap
 answer:
 
 ```rust,ignore
-match pipeline.run(version, &document) {
+match pipeline.poll(version, &document) {
     Ok(Run::Computed(value)) => held = Some(value),
     Ok(Run::Unchanged) => { /* draw what is held */ }
     Ok(Run::Delayed) => { /* draw the stand-in */ }
@@ -242,32 +288,19 @@ match pipeline.run(version, &document) {
 }
 ```
 
-**Guarding that call with `take_stale()` would be wrong**, and the reason is
-worth stating because the guard reads as an optimization. The flag clears on
-read and the gate reads it too, so a caller that asks first has TAKEN the
-wake: `run` then sees none, finds the version unchanged, and answers
-`Unchanged` - which is the exact defect the wake half of the gate exists to
-prevent, reintroduced from the caller's side. `take_stale` is for a caller
-with a different question ("is there anything to do at all"), and such a
-caller owns the answer from then on.
-
-A blocking caller loops on `Delayed`, making its own progress between
-runs:
+A blocking caller loops on `Delayed`, making its own progress between polls -
+and that loop is shipped, because every such caller writes the same one:
 
 ```rust,ignore
-let outcome = loop {
-    match pipeline.run(version, &document) {
-        Ok(Run::Delayed) if executor.run_once() => continue,
-        Ok(Run::Delayed) => break stalled(), // the caller's own condition
-        done => break done,
-    }
-};
+let outcome = run_blocking(&pipeline, version, &document, || executor.run_once());
 ```
 
-The second arm matters: `Delayed` when the caller has nothing left to run
-means something waited for an input nothing was going to land. That
-condition is the caller's own - the caller that owns the executor is the
-one that can see its queue is empty.
+**`run_blocking` is a free function and not a second door**, and its body is
+the evidence: it calls `poll` and nothing else. What it does NOT do is decide
+what a stall means. `Delayed` when the pump answers `false` comes back as the
+plain `Ok(Run::Delayed)`, because that condition is the caller's own - the
+caller that owns the executor is the one that can see its queue is empty, and
+a door that guessed would need vocabulary for its own wrong guess.
 
 ### Where answers live, if the default is wrong
 
@@ -278,7 +311,7 @@ decision, taken once:
 ```rust,ignore
 let pipeline = PipelineBuilder::new()
     .store(store)
-    .stage("parse", |id| Parse::new(id))
+    .stage_fn("parse", parse_key, parse)
     .build();
 ```
 
@@ -291,15 +324,21 @@ parameter `?Sized` and is otherwise unchanged.
 
 ### What else is public
 
-The whole public surface: `PipelineBuilder`, `Pipeline`, `Run`,
-`Failure`, the `RunResult` alias, and the `MemoStore` seam. The stage
-contract (`Stage`, `StageId`, `MemoKey`, `ContentKey`, `EffectPoll`,
-`MemoStore`, `MemoMap`, `NoMemo`) lives in `libpipelinedata`: the
-implement-side contract a stage author needs. `StageId` is held, never
-constructed - the builder mints one per registration and hands it to
-`make`. Everything on the composition side - tracking, memoization,
-chaining, scheduling, driving - reaches a consumer's stage only through
-registration and cannot be named from outside this crate.
+The whole public surface: `PipelineBuilder`, `Pipeline`, `Run`, `Failure`,
+the `RunResult` alias, `Ctx`, the `run_blocking` function, and the
+`MemoStore` seam. The vocabulary a step's functions name (`StageId`,
+`MemoKey`, `ContentKey`, `EffectPoll`, `MemoStore`, `MemoMap`, `NoMemo`)
+lives in `libpipelinedata`. `StageId` is held, never constructed - the
+builder mints one per registration and hands it through `Ctx`.
+
+`Ctx` and `run_blocking` are additions to the count this section used to
+give, and each is forced rather than chosen: a `fn` door's signature must
+name what it hands the function, and the blocking loop is the same few lines
+in every caller. Neither is a way INTO the engine that `poll` is not.
+
+Everything on the composition side - the stage contract itself, tracking,
+memoization, chaining, scheduling, driving - reaches a consumer's functions
+only through registration and cannot be named from outside this crate.
 
 ## Identity is a position
 
@@ -461,9 +500,9 @@ downward:
 
 | crate | role |
 |---|---|
-| `libpipeline` | the facade: the builder, the pipeline, the one door |
-| `libpipeline-internals` | the machinery: composition, memoization, tracking, the poll loops |
-| `libpipelinedata` | the port: `Stage`, the key types, `ContentHash`, `MemoStore` |
+| `libpipeline` | the facade: the builder, the pipeline, `Ctx`, the one door |
+| `libpipeline-internals` | the machinery: the `Stage` contract, composition, memoization, tracking, the poll loops |
+| `libpipelinedata` | the vocabulary: the key types, `ContentHash`, `MemoStore` |
 | `libeffects` | the base: the poll/waker protocol, boundaries, wake flags |
 
 ## Internals
@@ -485,10 +524,11 @@ Bottom-up, the machinery the builder assembles:
   work, only `Ready` recorded, and the store is skipped entirely while
   `revalidating()` (`src/track.rs`) is true - the thread-local channel by
   which read tracking outranks the store without any stage declaring
-  anything. Merged into registration: every `.stage()` call wraps its stage
-  in one, each holding a shared handle to the builder's one store.
+  anything. Merged into registration: every `.stage_fn()` call wraps its
+  stage in one, each holding a shared handle to the builder's one store.
 * **Read tracking** (`src/track.rs`) - read observation at the edges, the
-  wake subscription that reaches `take_stale`, and the output-edge cutoff.
+  wake subscription that reaches the gate's stale flag, and the output-edge
+  cutoff.
 * **The poll loop** (`src/driver.rs`) - the engine's single poll: one pass,
   returns immediately, records wakes in a flag.
 * **Error boundaries** (`src/boundary.rs`) - a stage-level boundary that
@@ -513,11 +553,10 @@ in the owning module's doc and pinned by a known-bad twin:
 The one door is the engine's single poll plus a version gate plus an
 outcome mapping - no new engine semantics anywhere in it.
 
-`Pipeline` carries the version type parameter and one field:
-`Pipeline<V, S>` holding the graph, the poll machinery, and
+`Pipeline<V, I, O, E>` holds the erased graph, the poll machinery, and
 `last: Mutex<Option<V>>` (safe interior mutability, as everywhere in this
-crate; `run` keeps `&self` because a poll holds `&self` all the way down).
-`run(version, input)`:
+crate; `poll` keeps `&self` because a poll holds `&self` all the way down).
+`poll(version, input)`:
 
 1. If `last` holds exactly `version` **and no wake is pending**: return
    `Ok(Run::Unchanged)`. The readable is not dereferenced, no memo key is
@@ -543,14 +582,14 @@ sees a legitimate-looking `Unchanged` and holds a value that is permanently
 one step stale. That is precisely the failure this crate exists to prevent,
 arriving through the gate meant to prevent it.
 
-The mechanism is the stale flag itself: `take_stale` answers "has a wake
-arrived since this was last asked" and clears on read, and the gate
-consumes it rather than leaving it a separate question the caller must
-remember to ask. Ordering matters: because it clears when read, the gate
-must consume it on **every** run, not only when the version matches. A run
-that polled for a version change and left an unread wake behind would
-answer `Unchanged` on the next run despite the wake - the same defect one
-step displaced.
+The mechanism is the stale flag itself: it answers "has a wake arrived since
+this was last asked" and clears on read, and the gate is its only reader -
+which is why no accessor exposes it (see "After `Delayed`: the wake").
+Ordering matters: because it clears when read, the gate must consume it on
+**every** poll, not only when the version matches. A poll that entered the
+graph for a version change and left an unread wake behind would answer
+`Unchanged` on the next poll despite the wake - the same defect one step
+displaced.
 
 The error arm is a re-wrap and not a construction: with the position
 stamped at registration, the graph's own error type **is** the flat
@@ -575,7 +614,7 @@ at the input boundary, and **what came out** at the output boundary.
   Recording reads at the boundary is one scope's worth of the same
   mechanism that could serve many.
 * **The wake** - the subscriber list a change notifies, which is what
-  reaches the stale flag and therefore `take_stale`.
+  reaches the gate's stale flag.
 * **The memo-outranking channel** - `revalidating` (`src/track.rs`), read
   by `src/memo.rs` so that a store cannot answer for a run whose ambient
   input moved. A key built from a stage's arguments cannot see an ambient
@@ -606,26 +645,41 @@ way.
 
 ### The intended stage shape: a function, with everything through Ctx
 
-Recorded intent, orthogonal to the one door - registration shape and run
-shape are independent decisions, and nothing in the one door forecloses
-this.
+**The registration half is built.** A stage is a pair of `fn` pointers - a
+key and a poll - each handed a `Ctx`, and the type refuses captured state at
+compile time: everything the poll can see, the key can see. What `Ctx`
+carries today is the minted identity and the waker, which is the minimum a
+poll needs in order to answer `Pending` honestly.
 
-* **A stage is a pure closure taking `Ctx`, registered as a `fn` pointer.**
-  The type refuses captured state at compile time: everything the stage can
-  see, the key can see.
-* **Everything a stage touches comes through `Ctx`**: reads through
-  `Ctx::observe_read` so they enter the read-set; in-flight state between a
-  `Pending` and a `Ready` lives in a store the consumer provides through a
+**Two things it does not carry, and their absence has a cost that is being
+paid now rather than avoided.**
+
+* **The read log.** Reads should go through `Ctx` - `Ctx::observe_read` -
+  so that a stage's ambient inputs enter the read-set and the memo can be
+  outranked for them. The machinery exists (`src/track.rs`) and has no
+  builder spelling, so nothing routes through it.
+* **In-flight and ambient state.** State between a `Pending` and a `Ready`,
+  and any handle a stage needs from the world - an upstream, an atlas, a
+  module runtime - should live in a store the consumer provides through a
   trait seam (as `MemoStore` already is), addressed by
   `(PipelineId, position)`. The `Ctx` carries **access to a store**, not a
-  world. In-flight state is runtime state, so the durability decision
-  applies to it in full: it does not survive a restart, and the same `Any`
-  erasure serves it. Whether it is the store the builder already holds or a
-  second seam beside it is not settled here; both are "at the builder" in
-  the sense the decision means.
+  world. In-flight state is runtime state, so the durability decision applies
+  to it in full: it does not survive a restart, and the same `Any` erasure
+  serves it. Whether it is the store the builder already holds or a second
+  seam beside it is not settled here; both are "at the builder" in the sense
+  the decision means.
+
+  **Until it exists, a stage's only honest route to anything ambient is a
+  `static` or a `thread_local`**, which the `fn` door permits and no type can
+  distinguish from a captured field. That is the door's one real gap, and it
+  is visible in this crate's own tests: every counter and every upstream in
+  `tests/` is a thread-local because a `fn` cannot hold one. The gap is
+  narrower than a captured field - a `static` is shared, named and greppable
+  where a field is private and invisible - but it is a gap, and naming it
+  here is the alternative to pretending the door is complete.
 * **`PipelineId` is the serial the builder mints, and nothing else.** The
-  serial carries instance identity by itself, and a rebuild mints a new
-  one, so keyed state dies with the instance.
+  serial carries instance identity by itself, and a rebuild mints a new one,
+  so keyed state dies with the instance. Not built.
 
 ### Rejected alternatives
 
@@ -693,6 +747,14 @@ an alternative lives, in full.
   input that moves the output without moving the key. The `fn` door makes
   the field impossible rather than reviewable. `impl Fn` fails the same
   way, one increment earlier: it permits capture.
+
+  This crate SHIPPED the trait door for three waves, because the Public API
+  section above demonstrated it - `.stage(name, |id| Parse::new(id))`, a
+  closure constructing a struct that implements `Stage` - while this entry
+  rejected it. The section was the half that was wrong, and the record of
+  that is worth more than a silent correction: an example is a specification
+  to whoever implements against it, and it outranks a paragraph three
+  sections away every time.
 
 * **A typed store factory at the builder.** Not the design: minting a
   `MemoStore<V>` for arbitrary `V` needs a generic method, a generic method
@@ -763,6 +825,97 @@ an alternative lives, in full.
   leaves no wake path. An optional diagnostic a caller must remember to run
   is a contract nobody enforces.
 
+### Ruled, not yet built
+
+Decisions taken and not yet implemented, each recorded here so that no
+example above is read as the last word. Nothing in this list is speculation:
+each is a ruling.
+
+* **The version is a hash, and the engine does not content-key.** A memo key
+  today is `(position, content keys of the inputs)`, and the engine computes
+  those keys by hashing what it is handed. It should not: the source already
+  content-addresses its own writes at the boundary where that is cheap, and
+  the version it hands `poll` IS that address. Hashing again to rediscover
+  what the caller already told us is `O(input)` per poll for an answer already
+  in hand.
+
+  The layering this settles is worth stating on its own, because each layer
+  hashes only what it is competent to hash: **the STORE addresses its writes
+  and hands the pipeline a version; the DOMAIN addresses its own trees to
+  decide whether it changed anything; the ENGINE addresses neither and trusts
+  what it is handed.** A pipeline that knows nothing about what a tree is has
+  no business deciding whether one moved.
+
+  What this deletes from the engine is the CONTENT-KEY-AS-MEMO-KEY use, not
+  the hashing vocabulary: `ContentKey` and its hashers are what the domain
+  needs for its own early exit, and they relocate rather than die (see "What
+  `libpipelinedata` is for" below).
+
+* **A keyed variant beside the default.** With the version as the default
+  key, a stage that can cheaply say what PART of its input it depends on
+  should be able to say so, in the shape `sort_by_key` has: a key extractor
+  supplied beside the poll function.
+
+  ```rust,ignore
+  .stage_fn(name, key, poll)          // proposed default: keyed by the version
+  .stage_by_key(name, extract, poll)  // keyed by what `extract` says
+  ```
+
+  **The engine still never hashes** - the author's function produces the
+  identity and the engine only compares it, which is the version rule applied
+  one level down. It is opt-in and the default serves the majority, which is
+  the same shape the store override has.
+
+  Internally it is one `Option` field on the engine's own stage struct:
+  `None` means "keyed by the version", `Some(f)` means "keyed by `f`". That
+  is not the rejected trait door returning - the argument there was about
+  CONSUMER-authored structs accreting fields the engine cannot see, and this
+  struct is the engine's own, which knows what is in its key because it put
+  it there.
+
+  **What the extractor returns is the open question.** A type parameter `K`
+  is awkward on an `Option`: with `None` there is nothing to infer it from, so
+  it needs a phantom or a default, and it would have to reach `MemoKey`, which
+  today carries `ContentKey` operands and is `Hash + Eq + Clone` because the
+  default store is a `HashMap`. Erasing to a scalar the engine can compare -
+  a `u64`, or the existing `ContentKey`'s `u128` - avoids the inference
+  problem entirely and keeps the no-hashing rule intact. The alternative,
+  a generic `K: Hash + Eq + 'static` erased into the key, buys arbitrary
+  author-chosen identities at the cost of a second erasure beside the row's.
+
+  **Nothing in the door as built forecloses it**: the shipped `.stage_fn`
+  already takes a key function, so the variant is the DEFAULT changing rather
+  than a new parameter appearing.
+
+* **A stage answering `Unchanged`.** Early cutoff can be OBSERVED from a
+  stage's own answer or RECONSTRUCTED by comparing outputs afterwards.
+  `Backdated` (`src/track.rs`) is the second: it addresses each `Ready`
+  output and retracts its consumers' staleness when the address repeats -
+  work after the fact, and work the domain has often already done. The first
+  is cheaper and is already present in the consumer's vocabulary: a domain
+  pass that rewrote nothing says so at its return, and the distinction is
+  then discarded because both paths return the same type.
+
+  A stage-level `Unchanged` is a different shape from the caller-facing one:
+  the caller's carries nothing, because the caller already holds the value; a
+  stage's must still carry the value, because its consumers need one either
+  way. "The same value, and I am telling you it is the same" - not "no
+  value".
+
+  A stage that can answer it needs nothing the door does not already pass:
+  it has its input and, once the version is the key, the version. What it
+  needs is somewhere to PUT the answer, which is the outcome enum gaining a
+  variant.
+
+* **What `libpipelinedata` is for.** With `Stage` internal, the crate's
+  stated purpose - author a stage without linking the engine - has no
+  consumer, because no crate's role is authoring stages: a domain crate
+  implements its domain operation, and whoever ASSEMBLES wraps it in a
+  registration and links the engine. What is left is reported in
+  `PLAN.md`; the short form is that the hashing vocabulary relocates to
+  where the domain needs it, `MemoStore`'s value as a seam is in doubt, and
+  the residue is small.
+
 ## The subcrate boundary
 
 "Public versus internal" is a **crate** boundary. The facade,
@@ -785,6 +938,14 @@ because that subrepo's root **is** its crate, and a path dependency inside
 the workspace directory becomes a workspace member on its own
 (`../libpipelinedata/Cargo.toml` records the reasoning). The same
 constraint holds here, so the same shape applies.
+The stage contract itself lives in the internals crate, which is what makes
+the boundary total: with no consumer implementing it, a trait the facade
+cannot name is a trait a consumer cannot name. That is also why `Pipeline`
+and `StagedPipelineBuilder` erase their graph - a public signature saying
+`impl Stage<..>` would have put the machinery back in the facade's vocabulary
+under a different spelling, and one indirect call per stage per poll is a
+cheap price for not doing that.
+
 `libpipeline-internals` depends on `libeffects` and `libpipelinedata` only;
 `libpipeline` adds the path edge to it, and the generic-stack walk
 (`tests/engine_stays_generic.rs`) checks its manifest through the same

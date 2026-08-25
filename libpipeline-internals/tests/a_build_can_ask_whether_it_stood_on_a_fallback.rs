@@ -35,6 +35,7 @@
 //! generic").
 
 use std::sync::Mutex;
+use std::sync::Arc;
 use std::task::{Context, Waker};
 
 use libeffects::Fallback;
@@ -44,7 +45,8 @@ use libpipeline_internals::driver::NoPendingWork;
 use libpipeline_internals::boundary::Substitutions;
 use libpipeline_internals::driver::run_to_completion;
 use libpipeline_internals::boundary::run_to_completion_counted;
-use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
+use libpipelinedata::{EffectPoll, MemoKey, StageId};
+use libpipeline_internals::{Stage};
 
 // ---------------------------------------------------------------- stand-ins
 
@@ -92,12 +94,12 @@ impl Stage for Flaky {
         None
     }
 
-    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<String, Boom> {
+    fn poll_stage(&self, input: &Text, cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
         let Some(filled) = *self.slot.lock().unwrap() else {
             self.waiting.lock().unwrap().push(cx.waker().clone());
             return EffectPoll::Failed(Boom);
         };
-        EffectPoll::Ready(format!("{}:{filled}", input.0))
+        EffectPoll::Ready(Arc::new(format!("{}:{filled}", input.0)))
     }
 }
 
@@ -131,9 +133,9 @@ impl Stage for Appends {
         None
     }
 
-    fn poll_stage(&self, input: &String, _cx: &mut Context<'_>) -> EffectPoll<String, Boom> {
+    fn poll_stage(&self, input: &String, _cx: &mut Context<'_>) -> EffectPoll<Arc<String>, Boom> {
         match *self.slot.lock().unwrap() {
-            Some(filled) => EffectPoll::Ready(format!("{input}/{filled}")),
+            Some(filled) => EffectPoll::Ready(Arc::new(format!("{input}/{filled}"))),
             None => EffectPoll::Failed(Boom),
         }
     }
@@ -157,12 +159,12 @@ fn the_plain_offline_driver_cannot_tell_a_fallback_from_an_answer() {
     let real = Guarded::new(
         GUARD,
         Flaky::holding("v1"),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
     );
     let substituted = Guarded::new(
         GUARD,
         Flaky::failing(),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
     );
 
     let built = run_to_completion(&real, &input, &NoPendingWork);
@@ -184,26 +186,26 @@ fn the_counted_drive_says_which_it_was_and_returns_the_same_result() {
     let real = Guarded::tallied(
         GUARD,
         Flaky::holding("v1"),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
         &tally,
     );
     let (driven, substitutions) =
         run_to_completion_counted(&real, &input, &NoPendingWork, &tally);
-    assert_eq!(driven.map_err(|_| "failed"), Ok("src:v1".to_string()));
+    assert_eq!(driven.map_err(|_| "failed"), Ok(Arc::new("src:v1".to_string())));
     assert_eq!(substitutions, 0, "nothing stood in for anything");
 
     let tally = Substitutions::new();
     let substituted = Guarded::tallied(
         GUARD,
         Flaky::failing(),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
         &tally,
     );
     let (driven, substitutions) =
         run_to_completion_counted(&substituted, &input, &NoPendingWork, &tally);
     assert_eq!(
         driven.map_err(|_| "failed"),
-        Ok("fallback".to_string()),
+        Ok(Arc::new("fallback".to_string())),
         "the RESULT is unchanged - a driver that failed a graph the plain one \
          completes would break the two-driver rule in order to report on it",
     );
@@ -227,13 +229,13 @@ fn one_tally_counts_every_boundary_in_the_graph() {
     let inner = Guarded::tallied(
         GUARD,
         Flaky::failing(),
-        Fallback::new("first fallback".to_string()),
+        Fallback::new(Arc::new("first fallback".to_string())),
         &tally,
     );
     let outer = Guarded::tallied(
         GUARD,
         Appends::failing(),
-        Fallback::new("second fallback".to_string()),
+        Fallback::new(Arc::new("second fallback".to_string())),
         &tally,
     );
     let graph = Chain::new(CHAIN, inner, outer);
@@ -242,7 +244,7 @@ fn one_tally_counts_every_boundary_in_the_graph() {
         run_to_completion_counted(&graph, &Text("src".into()), &NoPendingWork, &tally);
     assert_eq!(
         driven.map_err(|_| "failed"),
-        Ok("second fallback".to_string()),
+        Ok(Arc::new("second fallback".to_string())),
     );
     assert_eq!(
         substitutions, 2,
@@ -264,12 +266,12 @@ fn a_private_tally_stays_the_boundarys_own() {
     let first = Guarded::new(
         GUARD,
         Flaky::failing(),
-        Fallback::new("first fallback".to_string()),
+        Fallback::new(Arc::new("first fallback".to_string())),
     );
     let second = Guarded::new(
         GUARD,
         Appends::failing(),
-        Fallback::new("second fallback".to_string()),
+        Fallback::new(Arc::new("second fallback".to_string())),
     );
     let graph = Chain::new(CHAIN, first, second);
 
@@ -291,7 +293,7 @@ fn a_reused_tally_reports_per_drive_rather_than_forever() {
     let guarded = Guarded::tallied(
         GUARD,
         Flaky::failing(),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
         &tally,
     );
     let input = Text("src".into());
@@ -316,20 +318,20 @@ fn a_drive_that_recovers_between_passes_reports_the_change() {
     let guarded = Guarded::tallied(
         GUARD,
         Flaky::failing(),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
         &tally,
     );
     let input = Text("src".into());
 
     let (driven, substitutions) =
         run_to_completion_counted(&guarded, &input, &NoPendingWork, &tally);
-    assert_eq!(driven.map_err(|_| "failed"), Ok("fallback".to_string()));
+    assert_eq!(driven.map_err(|_| "failed"), Ok(Arc::new("fallback".to_string())));
     assert_eq!(substitutions, 1);
 
     *guarded.stage().slot.lock().unwrap() = Some("v1");
     let (driven, substitutions) =
         run_to_completion_counted(&guarded, &input, &NoPendingWork, &tally);
-    assert_eq!(driven.map_err(|_| "failed"), Ok("src:v1".to_string()));
+    assert_eq!(driven.map_err(|_| "failed"), Ok(Arc::new("src:v1".to_string())));
     assert_eq!(substitutions, 0, "this build is not standing on anything");
 }
 
@@ -348,7 +350,7 @@ fn a_frame_loop_takes_the_same_measurement_by_differencing_the_tally() {
     let guarded = Guarded::tallied(
         GUARD,
         Flaky::failing(),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
         &tally,
     );
     let driver = libpipeline_internals::driver::FrameDriver::new();
@@ -357,7 +359,7 @@ fn a_frame_loop_takes_the_same_measurement_by_differencing_the_tally() {
     let before = tally.count();
     assert_eq!(
         driver.poll_frame(&guarded, &input),
-        EffectPoll::Ready("fallback".to_string()),
+        EffectPoll::Ready(Arc::new("fallback".to_string())),
     );
     assert_eq!(
         tally.count() - before,
