@@ -1,4 +1,4 @@
-#![doc = include_str!("../README_AGY.md")]
+#![doc = include_str!("../README.md")]
 //!
 //! # Inside the crate (an inventory, not an API)
 //!
