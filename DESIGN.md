@@ -48,60 +48,52 @@ internal.
 
 ## What a pipeline is
 
-A pipeline is the self-contained state tracker for a sequence of steps
-defined through a builder. Self-contained means the pipeline itself holds
-what it last ran against and what it remembered along the way; none of that
-state lives in the caller, and none of it lives in hand-composed wrappers
-around the pipeline. A caller holds a pipeline, hands it the current state
-of the world, and reads one of four answers.
+A pipeline turns a source value into derived outputs through a sequence of
+pure steps, and remembers enough along the way that asking again is cheap.
+It is the tool to reach for when a value is derived - a document lowered to
+a render tree, a bundle compiled from sources - and the input keeps
+changing: the pipeline re-derives what moved, answers from memory for what
+did not, and keeps all of the bookkeeping itself. Self-contained means
+exactly that: the pipeline holds what it last ran against and what it
+remembered along the way, so none of that state lives in the caller and
+none of it lives in hand-composed wrappers around the pipeline.
 
-* **Steps come from a builder.** Each step is registered once, and its
-  identity is its **position** in that registration order - tracked by the
-  builder, never declared by the step. The pipeline owns everything about
-  how the steps compose and what they remember between runs.
-* **There is one way to run it.** One method, which polls once and returns
-  immediately. Whether a caller blocks until the answer or returns and
-  waits for a wake is what the caller **does** with the `Delayed` outcome.
-* **A run has four outcomes, split by kind.** Three of them mean the run
-  happened, and they are the success side: `Computed` - work happened, here
-  is the new value; `Unchanged` - no work was needed and none is
-  outstanding, the value the caller holds is **finished**; `Delayed` - not
-  ready yet, a wake is coming. The fourth means the run did not happen, and
-  it is the error side: `Failure` - which stage, and its error.
-* **Input is a `(version, readable)` pair, supplied per run.** The version
-  says **which** state this is; the readable **is** that state. A version
-  matching the previous run's answers `Unchanged` without reading the
-  readable at all.
-* **One store, chosen once.** Where the whole pipeline remembers is a
-  single decision taken at the builder - and it has a default, so most
-  consumers never take it at all.
-* **The data is durable; the pipeline's runtime state is not.** The action
-  store, the node-graph and a bundle persist. What the pipeline holds - its
-  memo, the version it last ran against, whatever is in flight between a
-  `Delayed` and its wake - does not, and is not meant to. On restart the
-  data is there, the memo is empty, and everything recomputes once. That is
-  the expected cost of a start, and several of the simplifications below
-  are paid for by it.
+Steps are registered once, through a builder, and chain: each consumes what
+the previous one produced. A step's identity is its **position** in that
+registration order - the builder tracks it, and a step never declares one.
+Where the whole pipeline remembers is also the builder's: one store, chosen
+once - and defaulted, so most consumers never choose at all.
 
-All three of `Computed`, `Unchanged` and `Delayed` are successes, and each
-asks something different of the caller: use the new value, keep the one you
-hold, wait to be woken. That distinction is the entire point of a memoizing
-pipeline - whether work happened is the pipeline's own knowledge, and the
-outcome delivers it to the caller, who is the one that can act on it.
+A built pipeline has one way to run. A run is handed a
+`(version, readable)` pair: the version says **which** state of the world
+this is, and the readable **is** that state. The answer comes back one of
+four ways - three successes and one failure. `Computed` means work happened
+and carries the new value. `Unchanged` means no work was needed and none is
+outstanding - the value the caller holds is **finished**, and a version
+matching the previous run's is answered this way without the readable ever
+being read. `Delayed` means not ready yet: a wake is coming. `Failure`
+means the run did not happen, and says which stage raised the error. Each
+success asks something different of the caller - use the new value, keep
+the one you hold, wait to be woken - and that distinction is what a
+memoizing pipeline is for: whether work happened is the pipeline's own
+knowledge, and the outcome delivers it to the caller, who is the one that
+can act on it. Whether a caller blocks until the answer or returns and
+waits for the wake is what the caller **does** with `Delayed`; there is no
+second door for it.
+
+The data is durable; the pipeline's runtime state is not. The action store,
+the node-graph and a bundle persist. What the pipeline holds - its memo,
+the version it last ran against, whatever is in flight between a `Delayed`
+and its wake - dies with the process, and is meant to. On restart the data
+is there, the memo is empty, and everything recomputes once: the expected
+cost of a start, and several of the simplifications below are paid for by
+it.
 
 ## Public API
 
-This section is the whole contract. A consumer learns here what a pipeline
-is, how to build one, how to run it, and what the four outcomes mean - and
-meets nothing else. The machinery behind it is described under "Internals"
-and is deliberately absent here.
-
-**Four names are required reading**: `PipelineBuilder`, `Pipeline`, `Run`
-and `Failure`, spelled together by one alias, `RunResult`. A fifth name,
-`MemoStore`, is optional and has its own passage at the end of this
-section; a consumer reaches for it only when the default is wrong. The
-order is deliberate - everything up to that passage can be read, and a
-pipeline built and run, without meeting a store at all.
+Four types - `PipelineBuilder`, `Pipeline`, `Run` and `Failure` - joined
+by one alias, `RunResult`. A fifth, `MemoStore`, matters only when the
+default store is wrong.
 
 ### Building a pipeline
 
@@ -138,15 +130,15 @@ one. A consumer implements stages and assembles nothing.
 
 ### Running it
 
-The outcome of a run is a standard `Result`, spelled by one alias:
+A pipeline runs through one method, whose outcome is a standard
+`Result` spelled by one alias:
 
 ```rust,ignore
 pub type RunResult<T, E> = Result<Run<T>, Failure<E>>;
 ```
 
-`run(version, &readable) -> RunResult<Output, Error>` is the one door. It
-polls once and returns immediately, whatever the answer; nothing inside it
-waits, ever.
+`run(version, &readable) -> RunResult<Output, Error>` polls once and
+returns immediately, whatever the answer; nothing inside it waits, ever.
 
 ```rust,ignore
 match pipeline.run(version, &document)? {
@@ -156,62 +148,49 @@ match pipeline.run(version, &document)? {
 }
 ```
 
-**A standard `Result`, with `Failure` on the error side.** The split lands
-exactly where the meaning is: `Failure` means the run did not happen, and
-the three `Run` variants all mean it did, each demanding something
-different of the caller. `?` works - a caller that only cares about failure
-propagates it and never matches it, which is the common case in a lowering
-chain - and the match above is left with three arms that are genuinely
-three decisions.
+The error side is `Failure<E>` rather than a bare `E` because a pipeline
+is a sequence of steps, and "it failed" is half an answer: **which** step
+failed is what a caller acts on, and that is the state `Failure` tracks.
+`at()` gives the failing stage's position, with the stage's error beside
+it. One `Failure` type serves the whole pipeline - a chain of five steps
+has the same error type as a chain of two - so `?` propagates it through
+any depth of assembly, and a caller that does match it matches once. See
+"One error type, flat and positioned".
 
-`Failure` is **flat**: one type for the whole pipeline, carrying the
-failing stage's position - read through `at()` - and that stage's error.
-See "One error type, flat and positioned".
+The `version` argument is the run version: which state the input is. It is
+the only version in the API.
 
-There is exactly one number called a version, and it is the **run**
-version: which state the input is.
+### The four outcomes
 
-### The four outcomes, and what each answer means
+`Run::Computed(output)` - work happened; take the new value. The pipeline
+records the version each `Computed` answered for.
 
-| outcome | side | meaning |
-|---|---|---|
-| `Run::Computed(Output)` | `Ok` | work happened; here is the new value |
-| `Run::Unchanged` | `Ok` | no work was needed and none is outstanding; the value the caller holds is finished |
-| `Run::Delayed` | `Ok` | not ready; a wake is coming |
-| `Failure` | `Err` | the run did not happen: `at()` names the stage, and the error rides beside it |
+`Run::Unchanged` - the value already held derives from exactly this state;
+keep it. The pipeline compares the version it is handed against the one it
+last computed for, and on a match answers without reading the readable at
+all. Read it as **the value is finished**: not a report that nothing
+happened, but a statement that nothing needs to, which is what lets a
+caller draw the value it holds and stop.
 
-**`Computed` and `Unchanged` are both success**, and the pipeline's memory
-is what tells them apart. The pipeline records the version each `Computed`
-answered for; a run handed that same version again answers `Unchanged`
-without reading the readable. So `Unchanged` always means: the value I last
-handed you derives from exactly this state - keep it.
+`Run::Delayed` - not ready; a wake is coming. The run has arranged for the
+pipeline's waker to be woken when the answer becomes possible, so wait to
+be woken rather than re-polling in a spin. Where the wake comes from - the
+original input, or a later stage internally - is unspecified, because the
+caller's obligation is identical either way. A `Delayed` run does not
+record the version, so asking again with the same version polls again. A
+step that cannot keep the wake promise has made its value lost rather than
+late, and the pipeline treats that as the defect it is (see "Delayed keeps
+its promise" under Internals).
 
-The actionable reading of `Unchanged` is **the value is finished**. It is
-not a report that nothing happened; it is a statement that nothing needs
-to, which is what lets a caller draw the value it holds and stop. "Nothing
-moved" describes the pipeline; "your value is finished" describes the
-caller's situation, and the caller is who the answer is for.
-
-**Only `Computed` records the version.** A `Delayed` run has not produced
-the value for that version, so asking again with the same version polls
-again. A failed run records nothing either: a failure is this run's answer,
-not the pipeline's verdict, and a later run with the same version retries.
-A consequence worth knowing: after a newer version fails, re-running the
-**old** version still answers `Unchanged` - the old value still stands,
-which is true.
-
-**`Delayed` is a promise.** A run that answers it has arranged for the
-pipeline's waker to be woken when the answer becomes possible. Where the
-wake comes from - the original input, or a later stage internally - is
-deliberately not part of the answer, because the caller's obligation is
-identical either way, and that identity is the point of not saying: wait to
-be woken, and do not re-poll in a spin. A step that cannot keep the promise
-has made its value lost rather than late, and the pipeline treats that as
-the defect it is (see "Delayed keeps its promise" under Internals).
-
-**Neither `Computed` nor `Failure` is terminal.** A pipeline is a standing
-derivation over inputs that change; a later run over a changed version can
-move a failure back to `Computed`, and `Computed` to a different value.
+`Failure` - the run did not happen: `at()` names the stage, and the error
+rides beside it. A failure is this run's answer, not the pipeline's
+verdict: nothing is recorded, and a later run with the same version
+retries. Neither `Computed` nor `Failure` is terminal - a pipeline is a
+standing derivation over inputs that change, and a later run over a
+changed version can move a failure back to `Computed`, and `Computed` to a
+different value. One consequence worth knowing: after a newer version
+fails, re-running the **old** version still answers `Unchanged` - the old
+value still stands, which is true.
 
 ### The version
 
@@ -259,19 +238,14 @@ let outcome = loop {
 
 The second arm matters: `Delayed` when the caller has nothing left to run
 means something waited for an input nothing was going to land. That
-condition belongs to the caller - the caller that owns the executor is the
-one that can see its queue is empty. Waiting is the caller's job, so
-having-nothing-left-to-wait-on is the caller's vocabulary.
+condition is the caller's own - the caller that owns the executor is the
+one that can see its queue is empty.
 
 ### Where answers live, if the default is wrong
 
-This is the optional passage. A consumer whose answers can live in the map
-the builder already owns can skip it entirely - which is the point of its
-being here rather than back at `.stage`.
-
-By default the builder remembers into a map it owns, and that default is
-why nothing so far has mentioned a store. `.store(store)` overrides it for
-the **whole pipeline** - one store, one decision, taken once:
+By default the builder remembers into a map it owns. `.store(store)`
+overrides the default for the **whole pipeline** - one store, one
+decision, taken once:
 
 ```rust,ignore
 let pipeline = PipelineBuilder::new()
@@ -286,22 +260,15 @@ builder" gives its shape.
 
 ### What else is public
 
-Nothing beyond what this section has already named:
-
-* **`PipelineBuilder` and `Pipeline`** - building and running, above.
-* **`Run` and `Failure`** - the success and error sides of a run, and
-  `RunResult`, the alias that spells their `Result`.
-* **`MemoStore`** - the defaulted seam, behind the default.
-* **The stage contract** (`Stage`, `StageId`, `MemoKey`, `ContentKey`,
-  `EffectPoll`, `MemoStore`, `MemoMap`, `NoMemo`) - lives in
-  `libpipelinedata`, not here: the implement-side contract a stage author
-  needs, not composition machinery. `StageId` is held, never constructed:
-  the builder mints one per registration and hands it to `make`.
-
-The shortness of the list is the design. Everything on the composition side
-- tracking, memoization, chaining, scheduling, driving - belongs to whoever
-links the engine, reaches a consumer's stage only through registration, and
-cannot be named from outside this crate.
+The whole public surface: `PipelineBuilder`, `Pipeline`, `Run`,
+`Failure`, the `RunResult` alias, and the `MemoStore` seam. The stage
+contract (`Stage`, `StageId`, `MemoKey`, `ContentKey`, `EffectPoll`,
+`MemoStore`, `MemoMap`, `NoMemo`) lives in `libpipelinedata`: the
+implement-side contract a stage author needs. `StageId` is held, never
+constructed - the builder mints one per registration and hands it to
+`make`. Everything on the composition side - tracking, memoization,
+chaining, scheduling, driving - reaches a consumer's stage only through
+registration and cannot be named from outside this crate.
 
 ## Identity is a position
 
