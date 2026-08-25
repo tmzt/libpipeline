@@ -325,7 +325,7 @@ assert_eq!(pipeline.poll(2, &"HI".to_string()), Ok(Run::Unchanged));
 
 Triggering `unchanged` on a cold pipeline without a prior cached value results in a panic:
 
-```rust,should_panic
+```rust,should_panic(expected = "stage at position 0 answered Unchanged before it had answered at all")
 use libpipeline::{Ctx, PipelineBuilder};
 use libpipelinedata::{EffectPoll, MemoKey, StageAnswer};
 
