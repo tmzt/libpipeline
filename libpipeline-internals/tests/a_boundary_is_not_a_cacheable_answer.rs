@@ -67,7 +67,7 @@ struct Flaky {
 }
 
 impl Flaky {
-    const ID: StageId = StageId::new("test.flaky", 1);
+    const ID: StageId = StageId::at(0);
 
     fn failing() -> Arc<Self> {
         Arc::new(Self {
@@ -218,7 +218,7 @@ impl<V: Clone> MemoStore<V> for Watching<V> {
     }
 }
 
-const GUARD: StageId = StageId::new("test.guard", 1);
+const GUARD: StageId = StageId::at(1);
 
 fn guard(flaky: &Arc<Flaky>) -> Guarded<Shared<Flaky>, Fallback<String>> {
     Guarded::new(

@@ -45,29 +45,23 @@ impl<A, B> Chain<A, B> {
     }
 }
 
-/// A failure from one of a chain's two halves, tagged with which.
+/// **Both halves share one error type, and a join propagates rather than
+/// retypes.**
 ///
-/// This is the boundary rule at its smallest scope: a failure that the inner stage did
-/// not handle bubbles to the containing scope, which retypes it into its own
-/// error channel rather than flattening it. Nesting chains nests this type, so
-/// the path a failure took out is recoverable from its type - and an error
-/// boundary that wants to catch only its own half can match on the tag.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ChainError<A, B> {
-    /// The first stage failed; the second never ran.
-    First(A),
-    /// The first stage produced a value and the second failed on it.
-    Second(B),
-}
-
+/// An earlier revision tagged each failure with the half it came from and
+/// nested once per join, so five stages read a type nobody writes in a
+/// signature and "which stage failed" was answered by counting layers. The
+/// position is stamped where it is known - at registration - and the tag is
+/// gone (`DESIGN.md`, "One error type, flat and positioned"): here a failure
+/// travels out unchanged, which is why this impl has no `map_err` in it.
 impl<A, B> Stage for Chain<A, B>
 where
     A: Stage,
-    B: Stage<Input = A::Output>,
+    B: Stage<Input = A::Output, Error = A::Error>,
 {
     type Input = A::Input;
     type Output = B::Output;
-    type Error = ChainError<A::Error, B::Error>;
+    type Error = A::Error;
 
     fn id(&self) -> StageId {
         self.id
@@ -91,12 +85,9 @@ where
         cx: &mut Context<'_>,
     ) -> EffectPoll<Self::Output, Self::Error> {
         match self.first.poll_stage(input, cx) {
-            EffectPoll::Ready(intermediate) => self
-                .second
-                .poll_stage(&intermediate, cx)
-                .map_err(ChainError::Second),
+            EffectPoll::Ready(intermediate) => self.second.poll_stage(&intermediate, cx),
             EffectPoll::Pending => EffectPoll::Pending,
-            EffectPoll::Failed(e) => EffectPoll::Failed(ChainError::First(e)),
+            EffectPoll::Failed(e) => EffectPoll::Failed(e),
         }
     }
 }

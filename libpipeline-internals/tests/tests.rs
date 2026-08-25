@@ -78,7 +78,7 @@ impl Stage for Parks {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.parks", 1)
+        StageId::at(0)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {

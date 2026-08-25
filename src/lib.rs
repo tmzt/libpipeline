@@ -65,9 +65,9 @@
 //!
 //! **Read the list above as an inventory, not as an API.** Every item named in
 //! it lives in `libpipeline-internals` and is reached only by this crate: the
-//! only things this crate exports are [`PipelineBuilder`], [`Pipeline`] and the
-//! result/report vocabulary their signatures name ([`DriveError`],
-//! [`ChainError`], [`PendingWork`]/[`NoPendingWork`],
+//! only things this crate exports are [`PipelineBuilder`], [`Pipeline`],
+//! [`Failure`] and the result/report vocabulary their signatures name
+//! ([`DriveError`], [`PendingWork`]/[`NoPendingWork`],
 //! [`WakePath`]/[`WakeReport`]). `DESIGN.md` says why, and `PLAN.md` says what
 //! to do when a consumer needs one of the internals: that is a FINDING about
 //! the builder's reach, recorded there, not a re-export.
@@ -86,30 +86,25 @@ mod builder;
 /// consumer that takes only this crate's manifest edge cannot name it. A
 /// consumer that needs one is not missing an export; it has found something the
 /// builder cannot express, which `PLAN.md` records as a finding.
-pub use builder::{Pipeline, PipelineBuilder, StagedPipelineBuilder};
+pub use builder::{Failure, Pipeline, PipelineBuilder, StagedPipelineBuilder};
 
 // Result and report vocabulary - named in the runner's signatures, so a
 // caller matching on them needs the names (PLAN.md, "What else stays
 // public").
 //
 // A TEMPORARY LIST, and named one by one for that reason rather than glob-ed
-// out of the internals crate: all six leave over PLAN.md's steps 4 and 5.
-// `ChainError` goes with the nesting when the flat `Failure` lands, and
-// `DriveError`, `PendingWork`, `NoPendingWork`, `WakePath` and `WakeReport` go
-// with the four doors. What is re-exported here is exactly what today's
-// signatures oblige, so each removal is a signature change and nothing else.
+// out of the internals crate: all five leave with the four doors (PLAN.md's
+// step 5). What is re-exported here is exactly what today's signatures oblige,
+// so each removal is a signature change and nothing else.
 //
-// `ChainError` is here for that reason and not by inheritance: a pipeline of
-// two or more registered stages has `Error = ChainError<..>` in
-// `Pipeline::run`'s return type, so a caller matching on WHICH stage failed
-// must be able to name it. `Chain` - the type that builds such graphs - is not
-// re-exported.
+// `ChainError` was the sixth and is gone: with one error type per pipeline a
+// join propagates rather than retypes, and "which stage failed" is
+// `Failure::at`, which is this crate's own vocabulary rather than a re-export.
 //
 // `WakePath` is the exception worth stating: after the flip no public signature
 // names it, because the runner's watched door is `run_watched`, which reports a
 // `WakeReport` (counts) rather than per-poll paths. It is kept exported as the
 // report's vocabulary; the tests that read a path are `poll_watched`'s, and
 // they are `libpipeline-internals`' tests for exactly that reason.
-pub use libpipeline_internals::chain::ChainError;
 pub use libpipeline_internals::driver::{DriveError, NoPendingWork, PendingWork};
 pub use libpipeline_internals::watch::{WakePath, WakeReport};

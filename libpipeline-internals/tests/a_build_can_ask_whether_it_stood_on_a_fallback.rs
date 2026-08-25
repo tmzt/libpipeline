@@ -62,7 +62,7 @@ struct Flaky {
 }
 
 impl Flaky {
-    const ID: StageId = StageId::new("test.flaky", 1);
+    const ID: StageId = StageId::at(0);
 
     fn failing() -> Self {
         Self {
@@ -109,7 +109,7 @@ struct Appends {
 }
 
 impl Appends {
-    const ID: StageId = StageId::new("test.appends", 1);
+    const ID: StageId = StageId::at(1);
 
     fn failing() -> Self {
         Self {
@@ -139,8 +139,8 @@ impl Stage for Appends {
     }
 }
 
-const GUARD: StageId = StageId::new("test.guard", 1);
-const CHAIN: StageId = StageId::new("test.chain", 1);
+const GUARD: StageId = StageId::at(2);
+const CHAIN: StageId = StageId::at(3);
 
 // ---------------------------------------------------------------------------
 // Gate 1: the ambiguity, and its resolution.

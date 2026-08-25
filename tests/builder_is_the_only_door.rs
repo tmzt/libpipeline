@@ -12,10 +12,11 @@
 //! LOST rather than late - fatal to the frame drive and invisible to the
 //! blocking one.
 
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
-use libpipeline::{ChainError, DriveError, PendingWork, PipelineBuilder};
+use libpipeline::{DriveError, Failure, PendingWork, PipelineBuilder};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoMap, Stage, StageId};
 
 /// A deterministic content key for test inputs. What matters here is only
@@ -30,6 +31,10 @@ fn key_of_bytes(bytes: &[u8]) -> ContentKey {
 }
 
 /// First stage: length of a string, counting its runs.
+///
+/// Its error type is the pipeline's one error type, shared with every stage it
+/// is registered beside - `DESIGN.md`'s named cost of the flat error. `Len`
+/// never fails; it still spells the type its neighbours raise.
 struct Len {
     id: StageId,
     runs: Arc<Mutex<usize>>,
@@ -38,7 +43,7 @@ struct Len {
 impl Stage for Len {
     type Input = String;
     type Output = usize;
-    type Error = ();
+    type Error = &'static str;
 
     fn id(&self) -> StageId {
         self.id
@@ -67,7 +72,7 @@ struct Double {
 impl Stage for Double {
     type Input = usize;
     type Output = usize;
-    type Error = ();
+    type Error = &'static str;
 
     fn id(&self) -> StageId {
         self.id
@@ -87,6 +92,36 @@ impl Stage for Double {
     }
 }
 
+/// Third stage: renders the count, so a pipeline can hold two stages whose
+/// outputs are different types.
+struct Render {
+    id: StageId,
+    runs: Arc<Mutex<usize>>,
+}
+
+impl Stage for Render {
+    type Input = usize;
+    type Output = String;
+    type Error = &'static str;
+
+    fn id(&self) -> StageId {
+        self.id
+    }
+
+    fn memo_key(&self, input: &Self::Input) -> Option<MemoKey> {
+        Some(MemoKey::new(self.id, [ContentKey::from_u128(*input as u128)]))
+    }
+
+    fn poll_stage(
+        &self,
+        input: &Self::Input,
+        _cx: &mut Context<'_>,
+    ) -> EffectPoll<Self::Output, Self::Error> {
+        *self.runs.lock().unwrap() += 1;
+        EffectPoll::Ready(input.to_string())
+    }
+}
+
 fn counter() -> Arc<Mutex<usize>> {
     Arc::new(Mutex::new(0))
 }
@@ -98,8 +133,8 @@ fn count(c: &Arc<Mutex<usize>>) -> usize {
 #[test]
 fn two_stages_compose_and_answer() {
     let pipeline = PipelineBuilder::new()
-        .stage("len", 1, |id| Len { id, runs: counter() })
-        .stage("double", 1, |id| Double { id, runs: counter() })
+        .stage("len", |id| Len { id, runs: counter() })
+        .stage("double", |id| Double { id, runs: counter() })
         .build();
     assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok(8));
 }
@@ -108,8 +143,8 @@ fn two_stages_compose_and_answer() {
 fn an_unchanged_input_hits_at_the_first_stage() {
     let (len_runs, double_runs) = (counter(), counter());
     let pipeline = PipelineBuilder::new()
-        .stage("len", 1, |id| Len { id, runs: Arc::clone(&len_runs) })
-        .stage("double", 1, |id| Double { id, runs: Arc::clone(&double_runs) })
+        .stage("len", |id| Len { id, runs: Arc::clone(&len_runs) })
+        .stage("double", |id| Double { id, runs: Arc::clone(&double_runs) })
         .build();
 
     assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok(8));
@@ -128,39 +163,56 @@ fn an_unchanged_input_hits_at_the_first_stage() {
 }
 
 #[test]
-fn a_version_bump_at_the_call_site_is_a_cold_cache() {
-    let store: Arc<MemoMap<usize>> = Arc::new(MemoMap::new());
-    let runs = counter();
-    let run_once = |version: u32| {
-        let pipeline = PipelineBuilder::new()
-            .stage_in("len", version, Arc::clone(&store), |id| Len {
-                id,
-                runs: Arc::clone(&runs),
-            })
-            .build();
-        pipeline.run_pure(&"abcd".to_string())
-    };
+fn two_stages_may_share_a_name_with_no_consequence() {
+    // The test `DESIGN.md` names for the label discipline: "a label two steps
+    // can share without consequence is a label nothing depends on". Both
+    // stages here are registered under one name, and nothing about the
+    // pipeline moves - identity is the position, which the builder minted
+    // separately for each.
+    let (len_runs, double_runs) = (counter(), counter());
+    let shared = PipelineBuilder::new()
+        .stage("same", |id| Len { id, runs: Arc::clone(&len_runs) })
+        .stage("same", |id| Double { id, runs: Arc::clone(&double_runs) })
+        .build();
 
-    // The store outlives each build, so a rebuild at the SAME version is a
-    // hit across pipelines...
-    assert_eq!(run_once(1), Ok(4));
-    assert_eq!(run_once(1), Ok(4));
-    assert_eq!(count(&runs), 1);
-    // ...and bumping the version at the one call site that declares it makes
-    // every old entry unreachable: the id is half of the key.
-    assert_eq!(run_once(2), Ok(4));
-    assert_eq!(count(&runs), 2);
+    assert_eq!(shared.run_pure(&"abcd".to_string()), Ok(8));
+    assert_eq!(shared.run_pure(&"abcd".to_string()), Ok(8));
+    // Two rows in one store under one name: each stage was looked up and hit
+    // on its own identity, so neither served the other its answer and neither
+    // ran twice.
+    assert_eq!((count(&len_runs), count(&double_runs)), (1, 1));
+
+    // And a different input still reaches both, which is what says the first
+    // repeat was a hit rather than a stage that had stopped running.
+    assert_eq!(shared.run_pure(&"xy".to_string()), Ok(4));
+    assert_eq!((count(&len_runs), count(&double_runs)), (2, 2));
 }
 
 #[test]
-#[should_panic(expected = "registered as")]
-fn a_stage_that_answers_a_different_id_than_registered_panics() {
-    let _ = PipelineBuilder::new().stage("len", 3, |_id| Len {
-        // The defect the check exists for: keys built from an id that is not
-        // the one the call site declares. It must die at registration.
-        id: StageId::new("len", 1),
-        runs: counter(),
-    });
+fn one_store_serves_stages_of_different_output_types() {
+    // Where the pipeline remembers is one decision, taken once, about the
+    // whole pipeline - and the rows are erased, so one store serves stages
+    // that do not agree about their output type. These two produce a `usize`
+    // and a `String`, into the one store the builder was handed.
+    let store: Arc<MemoMap<Arc<dyn Any + Send + Sync>>> = Arc::new(MemoMap::new());
+    let (len_runs, render_runs) = (counter(), counter());
+    let pipeline = PipelineBuilder::new()
+        .store(Arc::clone(&store))
+        .stage("len", |id| Len { id, runs: Arc::clone(&len_runs) })
+        .stage("render", |id| Render { id, runs: Arc::clone(&render_runs) })
+        .build();
+
+    assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok("4".to_string()));
+    assert_eq!(store.len(), 2, "one store, one row per stage");
+
+    // Each stage got its OWN answer back: the repeat is two hits, and the row
+    // each one hit is the row it recorded. A row holding the other stage's
+    // type would be an identity collision, which one builder cannot mint -
+    // which is why the lookup asserts the invariant rather than reporting a
+    // miss and quietly recomputing.
+    assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok("4".to_string()));
+    assert_eq!((count(&len_runs), count(&render_runs)), (1, 1));
+    assert_eq!(store.len(), 2);
 }
 
 #[test]
@@ -169,12 +221,12 @@ fn uncached_is_the_control_run_answers_hold_speed_does_not() {
 
     let cached_runs = counter();
     let cached = PipelineBuilder::new()
-        .stage("len", 1, |id| Len { id, runs: Arc::clone(&cached_runs) })
+        .stage("len", |id| Len { id, runs: Arc::clone(&cached_runs) })
         .build();
     let uncached_runs = counter();
     let uncached = PipelineBuilder::new()
         .uncached()
-        .stage("len", 1, |id| Len { id, runs: Arc::clone(&uncached_runs) })
+        .stage("len", |id| Len { id, runs: Arc::clone(&uncached_runs) })
         .build();
 
     assert_eq!(cached.run_pure(&input), Ok(4));
@@ -185,7 +237,7 @@ fn uncached_is_the_control_run_answers_hold_speed_does_not() {
     assert_eq!(count(&uncached_runs), 2);
 }
 
-/// A second-stage failure arrives tagged with which half raised it.
+/// A second-stage failure, for the position the pipeline stamps on it.
 struct Reject {
     id: StageId,
 }
@@ -215,13 +267,16 @@ impl Stage for Reject {
 #[test]
 fn a_failure_names_the_stage_that_raised_it() {
     let pipeline = PipelineBuilder::new()
-        .stage("len", 1, |id| Len { id, runs: counter() })
-        .stage("reject", 1, |id| Reject { id })
+        .stage("len", |id| Len { id, runs: counter() })
+        .stage("reject", |id| Reject { id })
         .build();
-    assert_eq!(
-        pipeline.run_pure(&"abcd".to_string()),
-        Err(DriveError::Failed(ChainError::Second("rejected")))
-    );
+    // Which stage failed is a position, answered in one call - not a count of
+    // `First`/`Second` layers read off a nested type.
+    let Err(DriveError::Failed(failure)) = pipeline.run_pure(&"abcd".to_string()) else {
+        panic!("the second stage rejects, so the drive must fail");
+    };
+    assert_eq!(failure.at(), 1);
+    assert_eq!(*failure.error(), "rejected");
 }
 
 // --- the two-drivers property, through the builder -------------------------
@@ -302,10 +357,10 @@ impl PendingWork for LandOnPump {
 fn fetch_pipeline(
     slot: &Arc<Slot>,
     registers: bool,
-) -> libpipeline::Pipeline<impl Stage<Input = (), Output = u64, Error = ()>> {
+) -> libpipeline::Pipeline<impl Stage<Input = (), Output = u64, Error = Failure<()>>> {
     let slot = Arc::clone(slot);
     PipelineBuilder::new()
-        .stage("fetch", 1, move |id| Fetch { id, slot, registers })
+        .stage("fetch", move |id| Fetch { id, slot, registers })
         .build()
 }
 

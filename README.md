@@ -59,7 +59,7 @@ impl Stage for Split {
 }
 
 let pipeline = PipelineBuilder::new()
-    .stage("split", 1, |id| Split { id })
+    .stage("split", |id| Split { id })
     .build();
 
 assert_eq!(
@@ -70,24 +70,26 @@ assert_eq!(
 
 Two things to notice at the registration call site:
 
-* `stage("split", 1, ...)` declares the stage's **version** right there, in
-  the same lexical scope as the closure that builds the behaviour it
-  versions. The builder mints a `StageId` from `(name, version)` and hands it
-  to the closure; if the constructed stage answers a different id, the
-  builder panics at construction rather than misfiling cache entries later.
+* **The builder mints the identity, and the identity is a position.** The
+  `StageId` handed to the closure is this registration's index and nothing
+  else; a stage never declares one, so there is no second id it could answer
+  with and nothing to check. `"split"` beside it is a diagnostic label: it
+  enters no key, nothing is looked up or compared by it, and a second stage
+  may carry the same one with no consequence.
 * There is no separate "memoize" step. **Registering a stage memoizes it**;
   there is no un-memoized registration to reach for.
 
 ## Adding stages
 
 Chain another `.stage(..)` call; the new stage's `Input` must equal the
-previous stage's `Output`. A failure comes back tagged with which stage
-raised it.
+previous stage's `Output`, and its `Error` is the pipeline's one error type -
+every stage of one pipeline shares it. A failure comes back carrying the
+POSITION of the stage that raised it.
 
 ```rust
 use std::task::Context;
 
-use libpipeline::{ChainError, DriveError, PipelineBuilder};
+use libpipeline::{DriveError, PipelineBuilder};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, Stage, StageId};
 
 # struct Split { id: StageId }
@@ -136,18 +138,20 @@ impl Stage for Count {
 }
 
 let pipeline = PipelineBuilder::new()
-    .stage("split", 1, |id| Split { id })
-    .stage("count", 1, |id| Count { id })
+    .stage("split", |id| Split { id })
+    .stage("count", |id| Count { id })
     .build();
 
 assert_eq!(pipeline.run_pure(&"doc.section.title".to_string()), Ok(3));
 
-// A failure names the stage that raised it: `First` here, because `Split`
-// failed and `Count` never ran.
-assert_eq!(
-    pipeline.run_pure(&String::new()),
-    Err(DriveError::Failed(ChainError::First("nothing to split"))),
-);
+// A failure names the stage that raised it, as a position: stage 0 here,
+// because `Split` failed and `Count` never ran. One `at()` call answers that
+// at any length of chain.
+let Err(DriveError::Failed(failure)) = pipeline.run_pure(&String::new()) else {
+    panic!("an empty source cannot be split");
+};
+assert_eq!(failure.at(), 0);
+assert_eq!(*failure.error(), "nothing to split");
 ```
 
 (The `#`-prefixed lines in this and later examples are hidden doctest lines
@@ -198,21 +202,21 @@ impl Stage for Len {
 let runs = Arc::new(Mutex::new(0));
 let counted = Arc::clone(&runs);
 let pipeline = PipelineBuilder::new()
-    .stage("len", 1, move |id| Len { id, runs: counted })
+    .stage("len", move |id| Len { id, runs: counted })
     .build();
 
 assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok(4));
 assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok(4));
 assert_eq!(*runs.lock().unwrap(), 1); // the repeat was served by the lookup
 
-// `.uncached()` disables every store: the control run. Answers must not
+// `.uncached()` turns the store off: the control run. Answers must not
 // change, only speed - a pipeline whose answers change when the cache is
 // disabled has a bug the cache was hiding.
 let runs = Arc::new(Mutex::new(0));
 let counted = Arc::clone(&runs);
 let control = PipelineBuilder::new()
     .uncached()
-    .stage("len", 1, move |id| Len { id, runs: counted })
+    .stage("len", move |id| Len { id, runs: counted })
     .build();
 
 assert_eq!(control.run_pure(&"abcd".to_string()), Ok(4));
@@ -300,7 +304,7 @@ impl Stage for Fetch {
 let slot = Arc::new(Slot::default());
 let registered = Arc::clone(&slot);
 let pipeline = PipelineBuilder::new()
-    .stage("fetch", 1, move |id| Fetch { id, slot: registered })
+    .stage("fetch", move |id| Fetch { id, slot: registered })
     .build();
 
 assert!(pipeline.poll_frame(&()).is_pending()); // frame 1: draw a stand-in
@@ -326,7 +330,7 @@ impl PendingWork for LandsSeven {
 let slot = Arc::new(Slot::default());
 let registered = Arc::clone(&slot);
 let pipeline = PipelineBuilder::new()
-    .stage("fetch", 1, move |id| Fetch { id, slot: registered })
+    .stage("fetch", move |id| Fetch { id, slot: registered })
     .build();
 
 assert_eq!(pipeline.run(&(), &LandsSeven(slot, Mutex::new(false))), Ok(7));
@@ -396,7 +400,7 @@ impl Stage for Forgets {
 let slot = Arc::new(Slot::default());
 let registered = Arc::clone(&slot);
 let pipeline = PipelineBuilder::new()
-    .stage("fetch", 1, move |id| Forgets { id, slot: registered })
+    .stage("fetch", move |id| Forgets { id, slot: registered })
     .build();
 
 let (out, report) = pipeline.run_watched(&(), &LandsSeven(slot, Mutex::new(false)));
@@ -407,14 +411,20 @@ assert_eq!(report.unwakeable_polls(), 1);
 
 ## The storage seam
 
-Where answers are remembered is a separate decision from the engine. By
-default each registered stage gets a fresh store owned by the pipeline;
-`stage_in` takes any `MemoStore` implementation you provide instead, which is
-how a cache outlives one build of the pipeline - and how you can see the
-version rule work: share a store across two builds, bump the version, and the
-old entries become unreachable, because the stage id is half of every key.
+Where answers are remembered is a separate decision from the engine, and it is
+ONE decision about the whole pipeline, taken once, at the builder. By default
+the pipeline remembers into a map it owns; `.store(..)` takes any `MemoStore`
+implementation you provide instead. The store is handed over at the builder and
+lives exactly as long as the pipeline does.
+
+One store serves every stage, whatever their outputs are, because the rows are
+erased: a store records `Arc<dyn Any + Send + Sync>` and a lookup downcasts back.
+That is why the store below is instantiated at that type rather than at any one
+stage's output - and why an implementation generic over its value type, like this
+one, needs no change to serve a whole pipeline.
 
 ```rust
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 # use std::task::Context;
@@ -457,37 +467,60 @@ impl<V: Clone> MemoStore<V> for MapStore<V> {
 #         EffectPoll::Ready(input.len())
 #     }
 # }
-let store: Arc<MapStore<usize>> = Arc::new(MapStore {
+/// Renders the count, so the pipeline below holds two stages whose outputs
+/// are different types - and still one store.
+struct Render {
+    id: StageId,
+}
+
+impl Stage for Render {
+    type Input = usize;
+    type Output = String;
+    type Error = &'static str;
+
+    fn id(&self) -> StageId {
+        self.id
+    }
+
+    fn memo_key(&self, input: &usize) -> Option<MemoKey> {
+        Some(MemoKey::new(self.id, [ContentKey::of(input)]))
+    }
+
+    fn poll_stage(&self, input: &usize, _cx: &mut Context<'_>)
+        -> EffectPoll<String, &'static str>
+    {
+        EffectPoll::Ready(input.to_string())
+    }
+}
+
+let store: Arc<MapStore<Arc<dyn Any + Send + Sync>>> = Arc::new(MapStore {
     rows: Mutex::new(HashMap::new()),
 });
 let runs = Arc::new(Mutex::new(0));
+let counted = Arc::clone(&runs);
 
-let run_once = |version: u32| {
-    let counted = Arc::clone(&runs);
-    let pipeline = PipelineBuilder::new()
-        .stage_in("len", version, Arc::clone(&store), move |id| Len {
-            id,
-            runs: counted,
-        })
-        .build();
-    pipeline.run_pure(&"abcd".to_string())
-};
+let pipeline = PipelineBuilder::new()
+    .store(Arc::clone(&store))
+    .stage("len", move |id| Len { id, runs: counted })
+    .stage("render", |id| Render { id })
+    .build();
 
-// The store outlives each pipeline: a rebuild at the same version hits.
-assert_eq!(run_once(1), Ok(4));
-assert_eq!(run_once(1), Ok(4));
+assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok("4".to_string()));
+
+// One store, two stages, two output types: each row is keyed by the stage's
+// identity - its position - so each stage gets its own answer back.
+assert_eq!(store.rows.lock().unwrap().len(), 2);
+
+// And the repeat is served from it: neither stage ran again.
+assert_eq!(pipeline.run_pure(&"abcd".to_string()), Ok("4".to_string()));
 assert_eq!(*runs.lock().unwrap(), 1);
-
-// Bumping the version at the one call site that declares it: a cold cache.
-assert_eq!(run_once(2), Ok(4));
-assert_eq!(*runs.lock().unwrap(), 2);
 ```
 
 ## Where to look next
 
 * `DESIGN.md` - the design: the model the engine embodies, why the builder is
-  the only public door, the proposed closure-shaped stage registration, and
-  the honest list of what the builder cannot yet express.
+  the only public door, why identity is a position, and where the one store
+  and the one error type come from.
 * `libpipelinedata` - the stage author's crate: `Stage`, `StageId`,
   `MemoKey`/`ContentKey`, the `ContentHash` streaming hasher and derive, and
   the `MemoStore` seam.

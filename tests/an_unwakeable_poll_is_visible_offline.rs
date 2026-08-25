@@ -34,7 +34,7 @@
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
-use libpipeline::{DriveError, PendingWork, Pipeline, PipelineBuilder};
+use libpipeline::{DriveError, Failure, PendingWork, Pipeline, PipelineBuilder};
 use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
 
 // ---------------------------------------------------------------- stand-ins
@@ -119,12 +119,12 @@ fn parking(
     on_park: OnPark,
 ) -> (
     Arc<Parks>,
-    Pipeline<impl Stage<Input = Text, Output = String, Error = &'static str>>,
+    Pipeline<impl Stage<Input = Text, Output = String, Error = Failure<&'static str>>>,
 ) {
     let stage = Parks::new(on_park);
     let registered = Arc::clone(&stage);
     let pipeline = PipelineBuilder::new()
-        .stage("test.parks", 1, move |id| {
+        .stage("test.parks", move |id| {
             *registered.id.lock().unwrap() = Some(id);
             registered
         })

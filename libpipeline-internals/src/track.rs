@@ -425,16 +425,15 @@ impl Ledger {
     /// How many times `node` has been declared changed, starting at 0.
     ///
     /// **A stage may fold this into its own key, and no longer has to.**
-    /// `ContentKey`'s doc states the rule an ambient input must satisfy: "an
-    /// ambient input either becomes a real input with a content key, or it
-    /// moves the version. There is no third option that leaves the cache
-    /// correct." A revision folded into [`Stage::memo_key`] is the first
-    /// branch, spelled by the stage. It is exact, it lets a hit be served
-    /// straight from the store, and it is a DECLARATION - so it is also
-    /// forgettable, and forgetting it is silent.
+    /// An ambient input - one that moves a stage's output without being one of
+    /// its arguments - either becomes a real input with a content key, or the
+    /// engine has to notice it moved. A revision folded into
+    /// [`Stage::memo_key`] is the first branch, spelled by the stage. It is
+    /// exact, it lets a hit be served straight from the store, and it is a
+    /// DECLARATION - so it is also forgettable, and forgetting it is silent.
     ///
-    /// The second branch is the one the engine now takes on every stage's
-    /// behalf, because it needs nothing declared: staleness IS the version, and
+    /// The second branch is the one the engine takes on every stage's
+    /// behalf, because it needs nothing declared: staleness is the revision, and
     /// [`revalidating`] carries it into the poll where a cache can defer to it.
     /// So this is a sharpening a stage may buy - one that turns an extra run
     /// into a hit under a moved key - rather than the thing that stands between

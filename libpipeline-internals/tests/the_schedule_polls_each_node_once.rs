@@ -54,7 +54,7 @@ impl Stage for Reads {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.reads", 1)
+        StageId::at(0)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -88,7 +88,7 @@ where
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.joins", 1)
+        StageId::at(1)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -311,7 +311,7 @@ fn a_pending_node_stays_in_the_schedule_after_it_is_polled() {
         type Output = String;
         type Error = &'static str;
         fn id(&self) -> StageId {
-            StageId::new("test.parks", 1)
+            StageId::at(2)
         }
         fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
             None

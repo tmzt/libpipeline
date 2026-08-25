@@ -73,7 +73,7 @@ impl Stage for Normalizes {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.normalizes", 1)
+        StageId::at(0)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -112,7 +112,7 @@ impl<S: Stage<Input = Text, Output = String, Error = &'static str>> Stage for Re
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.relays", 1)
+        StageId::at(1)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -137,7 +137,7 @@ impl<S: Stage<Input = Text, Output = String, Error = &'static str>> Stage for Pa
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.parks_after_reading", 1)
+        StageId::at(2)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -337,7 +337,7 @@ impl Stage for Joins {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.joins", 1)
+        StageId::at(3)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {

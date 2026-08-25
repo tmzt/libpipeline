@@ -50,21 +50,21 @@ revision. It is the ground the design has to be reached from.
 
 ### The builder (built)
 
-`src/builder.rs`: `PipelineBuilder::new`, `.stage(name, version, make)`,
-`.stage_in(name, version, store, make)`, `.uncached()`, and
-`StagedPipelineBuilder::build`. Memoization is intrinsic to registration -
-every `stage()` call wraps its stage in the memo layer with an owned map, a
-caller-given store, or the off switch (`BuilderStore`: owned / given /
-off). The version is declared at the registration call site, and `checked`
-in `src/builder.rs` panics at construction when a stage answers a different
-id than it was registered under.
+`src/builder.rs`: `PipelineBuilder::new`, `.store(store)`, `.uncached()`,
+`.stage(name, make)`, and `StagedPipelineBuilder::build`. Memoization is
+intrinsic to registration - every `stage()` call wraps its stage in the memo
+layer over a shared handle to the builder's one store (`BuilderStore`: owned
+map / given / off, resolved at the first registration). The identity is the
+position the builder mints; the `name` beside it is a diagnostic label held
+for messages. Registration also stamps that position onto whatever the stage
+raises, as `Failure<E>`.
 
 Carries forward: the builder as the only door, and memoization as
-intrinsic to registration. Changes: the `version` argument goes from both
-registration methods (step 2), `stage_in` goes in favour of one store at
-the builder (step 3), `checked` goes with the self-declared identity
-(step 2), `build` acquires the run-version type parameter (step 5), and the
-chained error type stops growing per join (step 4).
+intrinsic to registration. Landed since this section was written: the
+`version` argument and `checked` (step 2), one store at the builder with
+erased rows (step 3), and the flat positioned error (step 4). Still to
+change: `build` acquires the run-version type parameter (step 5), and the
+four doors below become one (step 5).
 
 ### The four doors (built, and what the design replaces)
 
@@ -101,17 +101,25 @@ Three result types, at three scopes:
   graph, under a frame drive it is normal and the frame keeps its stand-in.
   That asymmetry is why `run_watched` exists, and it is what the one door
   dissolves by making the waiting the caller's.
-* **`ChainError<A, B>`** (`src/chain.rs`) - which stage failed: `First(A)`
-  (the second never ran) or `Second(B)`, nesting once per join.
+* **`Failure<E>`** (`src/builder.rs`, step 4, landed) - which stage failed:
+  the position, through `at()`, with the stage's error beside it. One type per
+  pipeline, at any length of chain. It replaced `ChainError<A, B>`, which
+  tagged each failure with the half it came from and nested once per join.
 
 ### What else stays public, and why
 
 Today's full export list, from `src/lib.rs`: `PipelineBuilder`,
-`StagedPipelineBuilder`, `Pipeline`, `ChainError`, `DriveError`,
+`StagedPipelineBuilder`, `Pipeline`, `Failure`, `DriveError`,
 `PendingWork`, `NoPendingWork`, `WakePath`, `WakeReport`. `WakePath` is
 named by no public signature and is kept as `WakeReport`'s vocabulary. The
 stage contract lives in `libpipelinedata` and is re-exported by nothing
-here (finding 8).
+here (finding 8). `ChainError` left with step 4.
+
+`StagedPipelineBuilder` is on this list and is not on the design's: the
+design says it is "absorbed by the builder's chaining", and no step below
+absorbs it. It cannot simply be dropped - `PipelineBuilder::stage` names it
+in its return type - so removing it means the empty builder and the staged
+one becoming one type. Recorded here rather than done silently.
 
 Target surface, for contrast: `PipelineBuilder`, `Pipeline`, `Run`,
 `Failure`, the `RunResult` alias, with `MemoStore` behind the default.
@@ -160,16 +168,23 @@ stage-level boundary (`Guarded`, `src/boundary.rs`) answers
 `memo_key -> None` structurally, and a substitution count rides alongside
 the drive's result. Real, tested, and unwired (finding 2).
 
-### A memo hit is a deep copy today
+### A memo hit, and what the erased row did and did not fix
 
 Registration requires `S::Output: Clone` (`src/builder.rs`),
 `MemoStore::lookup` returns an owned value on purpose
 (`libpipelinedata/src/store.rs`), and the memo layer clones on both sides:
 `.cloned()` on the hit (`libpipelinedata/src/store.rs`) and
 `value.clone()` on the record (`src/memo.rs`). For an output the size of a
-whole bundle that is the opposite of the saving a memo exists for. Fixed by
-step 3: the erased `Arc` row makes a hit a downcast plus a refcount bump,
-so the store erasure and the cheap-output fix are one change, not two.
+whole bundle that is the opposite of the saving a memo exists for.
+
+Step 3 landed the erased `Arc` row, and it fixes half of that. The store no
+longer holds a `V` it must clone out of its map: it holds an `Arc`, so the
+store's own copy is a refcount bump. The seam's copy remains - `lookup`
+answers `Option<V>` and the memo layer needs an owned `V` to return - so a
+hit is a downcast plus `V::clone`, which is a refcount bump for an
+`Arc`-shaped output and still a deep copy for one that is not. Removing the
+second half means changing `MemoStore::lookup`'s owned-value contract, which
+is `libpipelinedata`'s and is not in this plan.
 
 ## Why the stage version goes
 
@@ -386,20 +401,20 @@ entry records its status under the one-door design.
    builder-level door; rides on finding 1. Status: **open**, and likely to
    close by dissolution - a chain's schedule is the chain, and the module's
    own headline case is a diamond.
-5. **Store lifecycle.** `.stage_in` lets a cache outlive a build; there is
-   no whole-pipeline store policy. Status: **settled** - one store at the
-   builder is the whole-pipeline store policy, and the store does not
-   outlive the pipeline. Closed by step 3.
+5. **Store lifecycle.** `.stage_in` let a cache outlive a build; there was
+   no whole-pipeline store policy. Status: **closed** (step 3, landed) - one
+   store at the builder is the whole-pipeline store policy, and the store
+   does not outlive the pipeline.
 6. **A watched single poll.** Nothing public answers "what did this poll
    leave behind". Status: **subsumed** - the one door checks the wake path
    itself in debug builds (step 6), and the finding closes by deletion
    rather than by a new door.
 7. **The registration-site guarantee protects only what is registered.** A
    stage-authoring crate that never links the engine carries its versions
-   unchecked. Status: **closes by dissolution** - with no version and no
-   self-declared identity there is nothing for an unlinked authoring crate
-   to carry unchecked; the builder mints the identity at registration or it
-   does not exist (step 2).
+   unchecked. Status: **closed by dissolution** (step 2, landed) - with no
+   version and no self-declared identity there is nothing for an unlinked
+   authoring crate to carry unchecked; the builder mints the identity at
+   registration or it does not exist.
 8. **Assembling a pipeline takes two manifest edges** (`libpipeline` plus
    `libpipelinedata`). This crate could re-export the port so one edge
    suffices without weakening the split. Status: **open**, deliberately
@@ -513,7 +528,7 @@ above.
 *Gate*: facade 30 tests + 6 doctests; internals 71 tests; zero test bodies
 changed; `builder_is_the_only_door.rs` unchanged and green.
 
-**Step 2 - identity becomes position, and the version goes.**
+**Step 2 - identity becomes position, and the version goes.** LANDED.
 In `libpipelinedata`: `StageId` becomes the builder's index
 (`libpipelinedata/src/key.rs`), with the two folds in
 `libpipelinedata/src/hash.rs` following it; `StageId::new(name, version)`
@@ -535,7 +550,12 @@ there", which becomes false the moment this step lands.
 `grep -rn "StageId::new\|\.version()"` finds nothing outside the key type
 itself; no test asserts on a stage name as though it were an identity.
 
-**Step 3 - one store at the builder, erased.**
+**Step 3 - one store at the builder, erased.** LANDED, with the placement
+rule of 2026-08-25 applied: nothing the internals use is DEFINED in the
+facade. No trait was added anywhere - the seam is `libpipelinedata`'s
+`MemoStore`, instantiated at the erased row - and the row is constructed and
+consumed on the same side (`Erased` in `src/builder.rs`), so `Memo` still
+sees only `Option<S::Output>` through a trait it can name.
 Add `.store(store)` to `PipelineBuilder` and remove both `stage_in`
 methods, taking the `St` type parameter with them and leaving two
 registration signatures where there were four (`src/builder.rs`). The
@@ -556,7 +576,13 @@ sharing one store, each getting its own answer back.
 finds nothing; the new test fails if the downcast is made to swallow a
 miss.
 
-**Step 4 - one error type, flat and positioned.**
+**Step 4 - one error type, flat and positioned.** LANDED, and `Failure`
+lives in the facade because both ends of its pair do: it is constructed at
+registration (`src/builder.rs`) and read by the caller. `libpipeline-internals`
+names it nowhere - `Chain` propagates `A::Error` unchanged and the drivers are
+generic over `S::Error` - so it travels through the machinery as an opaque type
+parameter. If any of them ever constructs or unwraps one, it moves to
+`libpipelinedata`.
 Add `Failure<E>` (`src/builder.rs`, exported from `src/lib.rs`): private
 fields - the failing stage's position and its error - with `at() -> usize`
 as the position accessor and an accessor for the error beside it.

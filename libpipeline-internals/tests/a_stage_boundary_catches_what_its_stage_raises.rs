@@ -89,7 +89,7 @@ struct Flaky {
 }
 
 impl Flaky {
-    const ID: StageId = StageId::new("test.flaky", 1);
+    const ID: StageId = StageId::at(0);
 
     fn new(while_empty: WhileEmpty) -> Arc<Self> {
         Arc::new(Self {
@@ -185,7 +185,7 @@ impl<S: Stage> Stage for Shared<S> {
     }
 }
 
-const GUARD: StageId = StageId::new("test.guard", 1);
+const GUARD: StageId = StageId::at(1);
 
 /// Poll once with a waker of no consequence - the offline driver's shape
 /// (`driver.rs:80-81`). What this returns is what a driver sees.

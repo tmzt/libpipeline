@@ -57,7 +57,7 @@ impl Stage for Reads {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.reads", 1)
+        StageId::at(0)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -83,7 +83,7 @@ impl Stage for ReadsEither {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.reads_either", 1)
+        StageId::at(1)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -110,7 +110,7 @@ impl Stage for ReadsNothing {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.reads_nothing", 1)
+        StageId::at(2)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -134,7 +134,7 @@ impl<S: Stage<Input = Text, Output = Shout, Error = &'static str>> Stage for Pol
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.polls_another", 1)
+        StageId::at(3)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {

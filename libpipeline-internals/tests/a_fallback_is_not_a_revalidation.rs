@@ -92,7 +92,7 @@ struct Flaky {
 }
 
 impl Flaky {
-    const ID: StageId = StageId::new("test.flaky", 1);
+    const ID: StageId = StageId::at(0);
 
     fn new(while_empty: WhileEmpty, from: &Arc<TrackedInput<String>>) -> Self {
         Self {
@@ -148,7 +148,7 @@ impl Stage for Flaky {
     }
 }
 
-const GUARD: StageId = StageId::new("test.guard", 1);
+const GUARD: StageId = StageId::at(1);
 
 /// Poll unconditionally, as both drivers do.
 fn driven<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<S::Output, S::Error> {

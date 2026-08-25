@@ -17,7 +17,7 @@
 //!
 //! `DESIGN.md`: the builder is the only public way to compose, memoize or
 //! drive. This file names `PipelineBuilder`, `Pipeline`, `DriveError`,
-//! `ChainError` and `PendingWork` and nothing else from the crate - so it is
+//! `Failure` and `PendingWork` and nothing else from the crate - so it is
 //! also the measurement that the two-driver property is EXPRESSIBLE through the
 //! public door. A test in `tests/` proves the public API reaches something; a
 //! test in `src/` admits it does not yet.
@@ -26,10 +26,10 @@
 //! the design rather than of this file:
 //!
 //! * **The stages' ids are minted at registration**, not declared as
-//!   associated consts, so the version sits beside the closure that builds the
-//!   behaviour it versions. `Lower::new` and `Emit::new` take the id the
-//!   builder hands them and answer it from `Stage::id`; a mismatch panics
-//!   there.
+//!   associated consts: an id is the position the builder counted to, and
+//!   `Lower::new` and `Emit::new` take the one they are handed and answer it
+//!   from `Stage::id`. There is no second id for a stage to disagree with, so
+//!   nothing checks for a disagreement.
 //! * **The run counts are handed IN.** The builder owns what it registers, so a
 //!   test cannot reach back through the opaque graph for a counter a stage
 //!   holds. [`Runs`] is that counter, shared.
@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
-use libpipeline::{ChainError, DriveError, PendingWork, Pipeline, PipelineBuilder};
+use libpipeline::{DriveError, Failure, PendingWork, Pipeline, PipelineBuilder};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, MemoStore, Stage, StageId};
 use std::task::Context;
 
@@ -90,9 +90,13 @@ impl Runs {
 /// shows `MemoStore` is implementable by someone who did not write it, which
 /// is what a seam is for. `MemoMap` cannot prove that about itself.
 ///
-/// It reaches the graph through `PipelineBuilder::stage_in`, which is the
-/// builder's door for a caller-provided store - so the seam is still exercised
-/// after the flip, through the public API rather than by hand-composing a memo.
+/// It reaches the graph through `PipelineBuilder::store` - the builder's one
+/// door for a caller-provided store, taken once for the whole pipeline - so the
+/// seam is still exercised through the public API rather than by hand-composing
+/// a memo. What the builder instantiates it at is the ERASED row
+/// (`Arc<dyn Any + Send + Sync>`), which is how one store serves stages of
+/// differing output types; the implementation below is generic over its value
+/// type and needs no change to say so.
 struct MapStore<V> {
     rows: Mutex<HashMap<MemoKey, V>>,
 }
@@ -125,9 +129,8 @@ struct Lower {
 }
 
 impl Lower {
-    /// Written to be the builder's `make`: it takes the id minted from the name
-    /// and version at the registration call site, and answers it from
-    /// [`Stage::id`].
+    /// Written to be the builder's `make`: it takes the id the builder minted
+    /// from this registration's position, and answers it from [`Stage::id`].
     fn new(id: StageId, runs: Runs) -> Self {
         Self { id, runs }
     }
@@ -237,27 +240,40 @@ fn content_key_of(text: &str) -> ContentKey {
 
 // -------------------------------------------------------------------- graphs
 
-/// The failure type a two-stage registration produces, tagged with the half it
-/// came from - the vocabulary a caller matching on which stage failed needs.
-type TwoStageError = ChainError<&'static str, &'static str>;
+/// The failure type a registration produces, whatever the length of the chain:
+/// the pipeline's one error type, with the failing stage's position stamped on
+/// it. A five-stage graph spells this the same way a two-stage one does.
+type PipelineError = Failure<&'static str>;
 
-/// The two-stage graph, registered: `lower` then `emit`, each memoized in a
-/// [`MapStore`] the caller provides.
+/// The position and error a drive ended on.
 ///
-/// **The versions are here**, at the registration call sites, which is the whole
-/// of why the builder takes them there.
+/// [`Failure`]'s fields are private and it has no constructor - a position is
+/// the builder's to stamp - so a test READS one rather than building one to
+/// compare against.
+fn failed<T: std::fmt::Debug>(
+    outcome: Result<T, DriveError<PipelineError>>,
+) -> (usize, &'static str) {
+    match outcome {
+        Err(DriveError::Failed(failure)) => (failure.at(), *failure.error()),
+        other => panic!("expected a failed drive, got {other:?}"),
+    }
+}
+
+/// The two-stage graph, registered: `lower` then `emit`, both memoized in the
+/// one [`MapStore`] the caller hands the builder.
+///
+/// **The store is chosen once**, before any registration, and the two stages
+/// share it - the whole-pipeline decision, taken where `DESIGN.md` puts it.
+/// The names are labels: nothing here is looked up by one.
 fn pipeline(
     upstream: Arc<Upstream>,
     lower_runs: Runs,
     emit_runs: Runs,
-) -> Pipeline<impl Stage<Input = Source, Output = Emitted, Error = TwoStageError>> {
+) -> Pipeline<impl Stage<Input = Source, Output = Emitted, Error = PipelineError>> {
     PipelineBuilder::new()
-        .stage_in("test.lower", 1, MapStore::new(), move |id| {
-            Lower::new(id, lower_runs)
-        })
-        .stage_in("test.emit", 1, MapStore::new(), move |id| {
-            Emit::new(id, upstream, emit_runs)
-        })
+        .store(MapStore::new())
+        .stage("test.lower", move |id| Lower::new(id, lower_runs))
+        .stage("test.emit", move |id| Emit::new(id, upstream, emit_runs))
         .build()
 }
 
@@ -265,7 +281,7 @@ fn pipeline(
 /// rather than runs.
 fn graph(
     upstream: Arc<Upstream>,
-) -> Pipeline<impl Stage<Input = Source, Output = Emitted, Error = TwoStageError>> {
+) -> Pipeline<impl Stage<Input = Source, Output = Emitted, Error = PipelineError>> {
     pipeline(upstream, Runs::default(), Runs::default())
 }
 
@@ -275,16 +291,17 @@ fn graph(
 fn lowering(
     runs: Runs,
     cached: bool,
-) -> Pipeline<impl Stage<Input = Source, Output = Lowered, Error = &'static str>> {
+) -> Pipeline<impl Stage<Input = Source, Output = Lowered, Error = PipelineError>> {
     let builder = if cached {
         PipelineBuilder::new()
     } else {
+        // `uncached` wins over `store` whichever order they are called in: the
+        // control run controls for every store.
         PipelineBuilder::new().uncached()
     };
     builder
-        .stage_in("test.lower", 1, MapStore::new(), move |id| {
-            Lower::new(id, runs)
-        })
+        .store(MapStore::new())
+        .stage("test.lower", move |id| Lower::new(id, runs))
         .build()
 }
 
@@ -455,10 +472,9 @@ fn a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late() {
     let upstream = Arc::new(Upstream::default());
     let forgetful = Arc::clone(&upstream);
     let graph = PipelineBuilder::new()
-        .stage_in("test.lower", 1, MapStore::new(), |id| {
-            Lower::new(id, Runs::default())
-        })
-        .stage("test.emit_without_registering", 1, move |id| ForgetfulEmit {
+        .store(MapStore::new())
+        .stage("test.lower", |id| Lower::new(id, Runs::default()))
+        .stage("test.emit_without_registering", move |id| ForgetfulEmit {
             id,
             upstream: forgetful,
         })
@@ -502,15 +518,14 @@ fn a_stalled_graph_ends_rather_than_spinning() {
 }
 
 #[test]
-fn a_failure_bubbles_out_tagged_with_the_half_it_came_from() {
+fn a_failure_bubbles_out_positioned_at_the_stage_that_raised_it() {
     let upstream = Arc::new(Upstream::default());
     upstream.land("built");
     let graph = graph(upstream);
-    let out = graph.run_pure(&Source(""));
-    assert_eq!(
-        out,
-        Err(DriveError::Failed(ChainError::First("nothing to lower"))),
-    );
+    // The first stage failed and the second never ran. "Which one" is a
+    // position read in one call, at any length of chain - not a count of
+    // `First`/`Second` layers.
+    assert_eq!(failed(graph.run_pure(&Source(""))), (0, "nothing to lower"));
 }
 
 #[test]
@@ -608,14 +623,8 @@ fn a_failure_is_never_cached() {
     let runs = Runs::default();
     let stage = lowering(runs.clone(), true);
 
-    assert_eq!(
-        stage.run_pure(&Source("")),
-        Err(DriveError::Failed("nothing to lower")),
-    );
-    assert_eq!(
-        stage.run_pure(&Source("")),
-        Err(DriveError::Failed("nothing to lower")),
-    );
+    assert_eq!(failed(stage.run_pure(&Source(""))), (0, "nothing to lower"));
+    assert_eq!(failed(stage.run_pure(&Source(""))), (0, "nothing to lower"));
     assert_eq!(
         runs.get(),
         2,

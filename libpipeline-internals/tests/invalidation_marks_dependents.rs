@@ -77,7 +77,7 @@ impl Stage for Reads {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.reads", 1)
+        StageId::at(0)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -109,7 +109,7 @@ impl Stage for ReadsEither {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.reads_either", 1)
+        StageId::at(1)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -137,7 +137,7 @@ impl<S: Stage<Input = Text, Output = String, Error = &'static str>> Stage for Re
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.relays", 1)
+        StageId::at(2)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -159,7 +159,7 @@ impl Stage for Parks {
     type Error = &'static str;
 
     fn id(&self) -> StageId {
-        StageId::new("test.parks", 1)
+        StageId::at(3)
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -190,7 +190,7 @@ struct Composes {
 }
 
 impl Composes {
-    const ID: StageId = StageId::new("test.composes", 1);
+    const ID: StageId = StageId::at(4);
 
     fn new(
         ledger: &Arc<Ledger>,
@@ -229,9 +229,10 @@ impl Stage for Composes {
     fn memo_key(&self, input: &Text) -> Option<MemoKey> {
         let mut inputs = vec![content_key_of(&input.0)];
         if self.folds_revision {
-            // ContentKey's doc: "an ambient input either becomes a real input
-            // with a content key, or it moves the version." This is the first
-            // branch, and the revision is what it costs.
+            // An ambient input either becomes a real input with a content
+            // key, or the engine has to notice it moved (`Ledger::revision`'s
+            // doc). This is the first branch, and the revision is what it
+            // costs.
             inputs.push(ContentKey::from_u128(u128::from(
                 self.ledger.revision(self.from.node()),
             )));
