@@ -7,7 +7,7 @@
 //! costs is measured, and worse, WHERE: a stage that forgets is fatal to the
 //! frame driver and INVISIBLE to the blocking one, because the offline driver
 //! re-polls without being asked
-//! (`tests/two_drivers_one_graph.rs`'s
+//! (`libpipeline/tests/one_door_two_patterns.rs`'s
 //! `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
 //! A defect that only the harder-to-run driver can find is a defect that ships.
 //!

@@ -1,18 +1,18 @@
 //! **The per-POLL half of `an_unwakeable_poll_is_visible_offline.rs`**,
-//! hosted here because [`poll_watched`] is internal.
+//! which is now its sibling in this crate's `tests/`.
 //!
-//! `Pipeline::run_watched` is the public door onto the watched DRIVE, and
-//! the three drive-level properties are gated through it in `tests/`. These
-//! six are finer than a drive: they read the [`WakePath`] of a single poll,
-//! which is what tells a stage that registers apart from one that forgets
-//! and both apart from one that yields. The runner has no watched
-//! single-poll door (`Pipeline::poll_frame` is unwatched), so there is no
-//! public expression for them - `DESIGN.md`'s rule is that a test needing
-//! internals is a finding about the builder's reach, recorded rather than
-//! papered over with a re-export.
+//! Both halves are here, and for the same reason: the runner has ONE door,
+//! `run(version, &input)`, which is a single unwatched poll, so neither the
+//! watched drive nor the watched poll has a public expression. `DESIGN.md`'s
+//! rule is that a test needing internals is a finding about the builder's
+//! reach, recorded and left visible rather than papered over with a
+//! re-export - and a test in this crate is how it stays visible.
 //!
-//! They migrate outward to `tests/` unchanged, minus the `poll_watched`
-//! call, the day the runner grows one.
+//! These six are the finer half: they read the [`WakePath`] of a single poll,
+//! which is what tells a stage that registers apart from one that forgets and
+//! both apart from one that yields. `PLAN.md`'s step 6 is the one that gives
+//! the door a use for them - a debug-build check inside `run` - and even then
+//! they stay here, because a check is not a door.
 //!
 //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
 //! generic").
@@ -41,7 +41,7 @@ enum OnPark {
     RegisterAndDrop,
     /// Wake before returning `Pending`: a yield, not a park.
     Yield,
-    /// Nothing at all - `two_drivers_one_graph.rs`'s `ForgetfulEmit`.
+    /// Nothing at all - `one_door_two_patterns.rs`'s `ForgetfulEmit`.
     Forget,
 }
 

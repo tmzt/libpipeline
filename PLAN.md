@@ -62,14 +62,13 @@ raises, as `Failure<E>`.
 Carries forward: the builder as the only door, and memoization as
 intrinsic to registration. Landed since this section was written: the
 `version` argument and `checked` (step 2), one store at the builder with
-erased rows (step 3), and the flat positioned error (step 4). Still to
-change: `build` acquires the run-version type parameter (step 5), and the
-four doors below become one (step 5).
+erased rows (step 3), the flat positioned error (step 4), and the run-version
+type parameter on `build` with the four doors below reduced to one (step 5).
 
-### The four doors (built, and what the design replaces)
+### The four doors (REPLACED by step 5; kept for what they explain)
 
-`Pipeline` in `src/builder.rs` exposes four ways to run one graph, onto two
-drives:
+Before the flip, `Pipeline` in `src/builder.rs` exposed four ways to run one
+graph, onto two drives:
 
 * `.run(&input, &work) -> Result<Output, DriveError<Error>>` - the
   blocking drive, pumping `work: impl PendingWork` while polls answer
@@ -80,10 +79,11 @@ drives:
 * `.poll_frame(&input) -> EffectPoll<Output, Error>` - the frame drive:
   one poll, returns immediately.
 
-Plus `.take_stale()` and `.waker()`, which the design keeps. There is no
-version gate, no `Unchanged`, and no outcome type: an unchanged input
-produces the same output again - cheaply, via the memo, but produced and
-handed over all the same.
+Plus `.take_stale()` and `.waker()`, which the design keeps and step 5 kept.
+There was no version gate, no `Unchanged`, and no outcome type: an unchanged
+input produced the same output again - cheaply, via the memo, but produced
+and handed over all the same. All four are gone; what stands in their place
+is `run(version, &input) -> RunResult<Output, Error>`.
 
 ### What a run answers today
 
@@ -94,13 +94,16 @@ Three result types, at three scopes:
   to have registered the supplied waker), `Failed(error)`. This is the
   stage contract's vocabulary and survives; it leaves the **door**
   signature only.
-* **`DriveError<E>`** (`src/driver.rs`) - how a blocking run ends badly:
-  `Failed(E)`, or `Stalled` - the graph answered `Pending` with no
-  outstanding work left. `Stalled` is not a timeout, and the same state
-  means opposite things under the two drives: offline it is a bug in the
-  graph, under a frame drive it is normal and the frame keeps its stand-in.
-  That asymmetry is why `run_watched` exists, and it is what the one door
-  dissolves by making the waiting the caller's.
+* **`DriveError<E>`** (`libpipeline-internals/src/driver.rs`) - how a
+  blocking drive ends badly: `Failed(E)`, or `Stalled` - the graph answered
+  `Pending` with no outstanding work left. `Stalled` is not a timeout, and
+  the same state means opposite things under the two drives: offline it is a
+  bug in the graph, under a frame drive it is normal and the frame keeps its
+  stand-in. That asymmetry is why `run_watched` existed, and it is what the
+  one door dissolved by making the waiting the caller's: step 5 left
+  `DriveError` in the internals, where the blocking loop still lives, and
+  took it off the facade's exports. A blocking CALLER now reads its own
+  stall off `Ok(Run::Delayed)` and its own empty queue.
 * **`Failure<E>`** (`src/builder.rs`, step 4, landed) - which stage failed:
   the position, through `at()`, with the stage's error beside it. One type per
   pipeline, at any length of chain. It replaced `ChainError<A, B>`, which
@@ -108,25 +111,25 @@ Three result types, at three scopes:
 
 ### What else stays public, and why
 
-Today's full export list, from `src/lib.rs`: `PipelineBuilder`,
-`StagedPipelineBuilder`, `Pipeline`, `Failure`, `DriveError`,
-`PendingWork`, `NoPendingWork`, `WakePath`, `WakeReport`. `WakePath` is
-named by no public signature and is kept as `WakeReport`'s vocabulary. The
-stage contract lives in `libpipelinedata` and is re-exported by nothing
-here (finding 8). `ChainError` left with step 4.
+The full export list, from `src/lib.rs`, is now `PipelineBuilder`,
+`StagedPipelineBuilder`, `Pipeline`, `Run`, `RunResult`, `Failure` - and
+nothing re-exported from the internals at all. `ChainError` left with step 4;
+`DriveError`, `PendingWork`, `NoPendingWork`, `WakePath` and `WakeReport`
+left with the doors in step 5, each because a signature that named it no
+longer exists. The stage contract lives in `libpipelinedata` and is
+re-exported by nothing here (finding 8).
 
-`StagedPipelineBuilder` is on this list and is not on the design's: the
-design says it is "absorbed by the builder's chaining", and no step below
-absorbs it. It cannot simply be dropped - `PipelineBuilder::stage` names it
-in its return type - so removing it means the empty builder and the staged
-one becoming one type. Recorded here rather than done silently.
-
-Target surface, for contrast: `PipelineBuilder`, `Pipeline`, `Run`,
-`Failure`, the `RunResult` alias, with `MemoStore` behind the default.
-Everything else on today's list leaves: `StagedPipelineBuilder` is absorbed
-by the builder's chaining, `ChainError` goes with the nesting (step 4), and
-`DriveError`, `PendingWork`, `NoPendingWork`, `WakePath`, `WakeReport` go
-with the doors (step 5).
+`StagedPipelineBuilder` is on this list and was not on the design's, which
+said it is "absorbed by the builder's chaining". RESOLVED, 2026-08-25, by
+Tim's ruling: "an unconstructable `StagedPipelineBuilder` is fine as a public
+API, since the fields are private the consumer can't just build one itself."
+Its fields are private and it has no constructor, so a consumer receives one
+from `.stage()`, calls a method on it, and with method chaining never names
+it. The design's count is four things a consumer CONSTRUCTS OR MATCHES ON, and
+an opaque intermediate that appears only in a return type is not a fifth. It
+is a category this crate already uses twice - `Failure` is the other, public
+with private fields and a private `new` - so it is a pattern rather than an
+exception. `DESIGN.md`'s "Building a pipeline" now says so.
 
 ### Where a consumer works, and what it may never name
 
@@ -420,6 +423,21 @@ entry records its status under the one-door design.
    suffices without weakening the split. Status: **open**, deliberately
    undecided; the subcrate split makes the facade the natural place to
    decide it.
+9. **`take_stale` and the gate are two readers of one clear-on-read flag.**
+   Found while landing step 5. `Pipeline::run` consumes the stale flag on
+   every run - it must, or a wake left unread answers `Unchanged` one run
+   later - and `Pipeline::take_stale` is still public and clears it too. A
+   caller that guards `run` with `take_stale()` therefore TAKES the wake,
+   and `run` then finds the version unchanged and answers `Unchanged`: the
+   exact defect the wake half exists to prevent, reintroduced from the
+   caller's side. `DESIGN.md`'s frame-caller example was written that way
+   and has been rewritten to run every frame and let `Unchanged` be the
+   cheap answer; `Pipeline::take_stale`'s doc now states the race. Status:
+   **open as a design question** - the mechanical options are to make the
+   flag idempotent for the gate (a wake debt the gate clears only when it
+   polls), to give `take_stale` a non-clearing sibling, or to leave it as a
+   documented hazard. Not decided here, because it belongs with step 6's
+   open wake-debt decision, which is about the same flag.
 
 ## Verdict: migrate, do not rewrite
 
@@ -598,7 +616,24 @@ out of `src/lib.rs`'s exports. Re-spell
 pipeline's error type is spellable in one line in a test signature, which
 is the property the change is for.
 
-**Step 5 - the outcome and the one door (the flip).**
+**Step 5 - the outcome and the one door (the flip).** LANDED, together with
+Tim's addition of 2026-08-25: **the store contract is `Arc` on both sides.**
+`MemoStore<V>` (`libpipelinedata/src/store.rs`) became
+`lookup -> Option<Arc<V>>` / `record(_, Arc<V>)`, with `V: ?Sized` so the
+erased row is `dyn Any + Send + Sync` itself rather than a handle around one;
+`MemoMap`, `NoMemo` and the `ecs` backend followed, and `V: Clone` left all
+three. `Memo` (`libpipeline-internals/src/memo.rs`) answers `Arc<S::Output>`,
+wrapping once on a miss where it records, so a hit is a downcast and a refcount
+bump and `Erased::record` in the facade is a coercion with no second
+allocation. `Run::Computed` therefore carries `Arc<Output>`. Registration wraps
+each stage after the first in a facade-private `Shared` adapter, so the chain
+carries shares while a stage author still writes `type Input = Lowered`: the
+engine wraps on the way out and unwraps on the way in, and neither side is
+written by a consumer. Counts landed at facade 28 (not the 26 below: the
+version gate earned a test of its own, and step 4's "spellable in one line"
+property was never written down until now) + 6 doctests, internals 74,
+`libpipelinedata` 42 + 1.
+
 In `src/builder.rs`: add `Run<Output>` and the alias
 `pub type RunResult<T, E> = Result<Run<T>, Failure<E>>` (both exported from
 `src/lib.rs`); give `Pipeline` the `V: Copy + Eq` parameter and the

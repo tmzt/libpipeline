@@ -1,5 +1,6 @@
 //! Memoization: the lookup precedes the work.
 
+use std::sync::Arc;
 use std::task::Context;
 
 use libpipelinedata::{EffectPoll, MemoKey, MemoStore, Stage, StageId};
@@ -102,11 +103,19 @@ impl<S, St> Memo<S, St> {
 impl<S, St> Stage for Memo<S, St>
 where
     S: Stage,
-    S::Output: Clone,
     St: MemoStore<S::Output>,
 {
     type Input = S::Input;
-    type Output = S::Output;
+    /// A SHARE of the stage's output, because that is what the store holds
+    /// (`MemoStore`'s "It accepts and returns `Arc`, on both sides, always").
+    /// The memo keeps the value after it answers - that is the whole of what a
+    /// memo is - so the caller does not own it exclusively, and the type says
+    /// so rather than a copy pretending otherwise.
+    ///
+    /// The wrapping happens HERE, once, on a miss, at the point the value is
+    /// recorded. No stage author writes `Arc` to be memoized cheaply and none
+    /// can forget to.
+    type Output = Arc<S::Output>;
     type Error = S::Error;
 
     /// The inner stage's id. Memoization is transparent: it must not change
@@ -132,14 +141,24 @@ where
         {
             return EffectPoll::Ready(hit);
         }
-        let polled = self.stage.poll_stage(input, cx);
-        // Recorded even when the lookup was skipped, and under the same key:
-        // the store then holds the value the stage has just produced, so the
-        // next poll of an unstale node hits on something current rather than on
-        // the entry the ledger ruled out.
-        if let (EffectPoll::Ready(value), Some(key)) = (&polled, &key) {
-            self.store.record(key, value.clone());
+        match self.stage.poll_stage(input, cx) {
+            EffectPoll::Ready(value) => {
+                // One allocation, on the miss, and both the answer and the row
+                // are that same allocation: recording is a refcount bump, and
+                // so is every hit it serves afterwards.
+                let held = Arc::new(value);
+                // Recorded even when the lookup was skipped, and under the same
+                // key: the store then holds the value the stage has just
+                // produced, so the next poll of an unstale node hits on
+                // something current rather than on the entry the ledger ruled
+                // out.
+                if let Some(key) = &key {
+                    self.store.record(key, Arc::clone(&held));
+                }
+                EffectPoll::Ready(held)
+            }
+            EffectPoll::Pending => EffectPoll::Pending,
+            EffectPoll::Failed(error) => EffectPoll::Failed(error),
         }
-        polled
     }
 }

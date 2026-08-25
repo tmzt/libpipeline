@@ -13,8 +13,9 @@
 //!   crate has no vocabulary for: a boundary refuses to be memoized, because a
 //!   substituted fallback cached under a key that never moves is a permanent
 //!   fallback indistinguishable from a correct answer.
-//! * `run_to_completion` and `FrameDriver` - the two drivers over the same
-//!   graph, the same contract and the same keys.
+//! * `FrameDriver` and `run_to_completion` - the single poll the one door
+//!   makes, and the loop a blocking caller would otherwise write by hand,
+//!   over the same graph, the same contract and the same keys.
 //! * `Ledger`, `Tracked`, `TrackedInput` - the read-observation ledger:
 //!   edges recorded by observing reads rather than declared, re-logged on every
 //!   run so they follow conditionals; and invalidation over those edges, where
@@ -64,13 +65,19 @@
 //! key at all.
 //!
 //! **Read the list above as an inventory, not as an API.** Every item named in
-//! it lives in `libpipeline-internals` and is reached only by this crate: the
-//! only things this crate exports are [`PipelineBuilder`], [`Pipeline`],
-//! [`Failure`] and the result/report vocabulary their signatures name
-//! ([`DriveError`], [`PendingWork`]/[`NoPendingWork`],
-//! [`WakePath`]/[`WakeReport`]). `DESIGN.md` says why, and `PLAN.md` says what
-//! to do when a consumer needs one of the internals: that is a FINDING about
-//! the builder's reach, recorded there, not a re-export.
+//! it lives in `libpipeline-internals` and is reached only by this crate. The
+//! whole of what this crate exports is [`PipelineBuilder`], [`Pipeline`],
+//! [`Run`], [`Failure`] and the [`RunResult`] alias over the last two - four
+//! names and one alias, and nothing else. `DESIGN.md` says why, and `PLAN.md`
+//! says what to do when a consumer needs one of the internals: that is a
+//! FINDING about the builder's reach, recorded there, not a re-export.
+//!
+//! [`StagedPipelineBuilder`] is exported beside them and is not a fifth thing
+//! to learn: it is what `.stage()` hands back, its fields are private and it
+//! has no constructor, so a consumer receives one, calls a method on it, and
+//! with method chaining never writes its name. `Failure` is the same category -
+//! public type, private fields, private `new` - and the two are the pattern
+//! rather than exceptions to it.
 
 #![forbid(unsafe_code)]
 
@@ -86,25 +93,12 @@ mod builder;
 /// consumer that takes only this crate's manifest edge cannot name it. A
 /// consumer that needs one is not missing an export; it has found something the
 /// builder cannot express, which `PLAN.md` records as a finding.
-pub use builder::{Failure, Pipeline, PipelineBuilder, StagedPipelineBuilder};
-
-// Result and report vocabulary - named in the runner's signatures, so a
-// caller matching on them needs the names (PLAN.md, "What else stays
-// public").
-//
-// A TEMPORARY LIST, and named one by one for that reason rather than glob-ed
-// out of the internals crate: all five leave with the four doors (PLAN.md's
-// step 5). What is re-exported here is exactly what today's signatures oblige,
-// so each removal is a signature change and nothing else.
-//
-// `ChainError` was the sixth and is gone: with one error type per pipeline a
-// join propagates rather than retypes, and "which stage failed" is
-// `Failure::at`, which is this crate's own vocabulary rather than a re-export.
-//
-// `WakePath` is the exception worth stating: after the flip no public signature
-// names it, because the runner's watched door is `run_watched`, which reports a
-// `WakeReport` (counts) rather than per-poll paths. It is kept exported as the
-// report's vocabulary; the tests that read a path are `poll_watched`'s, and
-// they are `libpipeline-internals`' tests for exactly that reason.
-pub use libpipeline_internals::driver::{DriveError, NoPendingWork, PendingWork};
-pub use libpipeline_internals::watch::{WakePath, WakeReport};
+// NOTHING IS RE-EXPORTED FROM THE INTERNALS, and that is now checkable rather
+// than intended. Six names were: `ChainError` went when a join stopped
+// retyping, and `DriveError`, `PendingWork`, `NoPendingWork`, `WakePath` and
+// `WakeReport` went with the four doors - every one of them was here because
+// some door's SIGNATURE named it, and with one door that returns `RunResult`
+// no signature does. A consumer that finds itself needing one has found
+// something the builder cannot express (`PLAN.md`'s findings), not an export
+// this list forgot.
+pub use builder::{Failure, Pipeline, PipelineBuilder, Run, RunResult, StagedPipelineBuilder};

@@ -206,13 +206,13 @@ impl<V> Watching<V> {
     }
 }
 
-impl<V: Clone> MemoStore<V> for Watching<V> {
-    fn lookup(&self, key: &MemoKey) -> Option<V> {
+impl<V> MemoStore<V> for Watching<V> {
+    fn lookup(&self, key: &MemoKey) -> Option<Arc<V>> {
         *self.lookups.lock().unwrap() += 1;
         self.rows.lookup(key)
     }
 
-    fn record(&self, key: &MemoKey, value: V) {
+    fn record(&self, key: &MemoKey, value: Arc<V>) {
         *self.records.lock().unwrap() += 1;
         self.rows.record(key, value);
     }
@@ -228,10 +228,20 @@ fn guard(flaky: &Arc<Flaky>) -> Guarded<Shared<Flaky>, Fallback<String>> {
     )
 }
 
-/// Poll once with a waker of no consequence - the offline driver's shape.
-fn value_of<S: Stage<Output = String>>(stage: &S, input: &S::Input) -> String {
+/// Poll once with a waker of no consequence - a blocking caller's shape - and
+/// read the answer as text.
+///
+/// As text, rather than as the output type, so that every assertion below reads
+/// the same whether the layer on top answers the value (`String`, from a bare
+/// boundary) or the share the memo holds (`Arc<String>`, from a memo). The
+/// difference is real and is the memo layer's business; it is not what any of
+/// these gates are about.
+fn value_of<S: Stage>(stage: &S, input: &S::Input) -> String
+where
+    S::Output: std::fmt::Display,
+{
     match stage.poll_stage(input, &mut Context::from_waker(Waker::noop())) {
-        EffectPoll::Ready(value) => value,
+        EffectPoll::Ready(value) => value.to_string(),
         EffectPoll::Pending => panic!("nothing here is pending"),
         EffectPoll::Failed(_) => panic!("this boundary catches everything"),
     }
@@ -377,7 +387,10 @@ fn a_boundary_outside_a_memo_caches_only_real_answers() {
     let guarded = Guarded::new(
         GUARD,
         Memo::new(Shared(Arc::clone(&flaky)), Watching::new()),
-        Fallback::new("fallback".to_string()),
+        // The memo answers a SHARE of its stage's output, so the substitute a
+        // boundary over it stands in for is a share too: `Recover::Value` is
+        // the stage's output type, whatever that layer makes it.
+        Fallback::new(Arc::new("fallback".to_string())),
     );
     let input = Text("src".into());
 

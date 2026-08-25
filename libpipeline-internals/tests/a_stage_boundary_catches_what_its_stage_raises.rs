@@ -393,7 +393,10 @@ fn the_answers_through_a_boundary_do_not_change_when_the_cache_is_disabled() {
             let guarded = Guarded::new(
                 GUARD,
                 Memo::new(Shared(Arc::clone(&flaky)), MemoMap::new()),
-                Fallback::new("fallback".to_string()),
+                // A memo answers a SHARE of its stage's output, and
+                // `Recover::Value` is whatever the stage under the boundary
+                // answers - so the substitute is a share too.
+                Fallback::new(Arc::new("fallback".to_string())),
             );
             seen.push(value_of(&guarded, &input));
             seen.push(value_of(&guarded, &input));
@@ -404,7 +407,7 @@ fn the_answers_through_a_boundary_do_not_change_when_the_cache_is_disabled() {
             let guarded = Guarded::new(
                 GUARD,
                 Memo::new(Shared(Arc::clone(&flaky)), NoMemo),
-                Fallback::new("fallback".to_string()),
+                Fallback::new(Arc::new("fallback".to_string())),
             );
             seen.push(value_of(&guarded, &input));
             seen.push(value_of(&guarded, &input));
@@ -419,10 +422,10 @@ fn the_answers_through_a_boundary_do_not_change_when_the_cache_is_disabled() {
     assert_eq!(
         sequence(false),
         vec![
-            "fallback".to_string(),
-            "fallback".to_string(),
-            "src:v1".to_string(),
-            "src:v1".to_string(),
+            Arc::new("fallback".to_string()),
+            Arc::new("fallback".to_string()),
+            Arc::new("src:v1".to_string()),
+            Arc::new("src:v1".to_string()),
         ],
         "and the sequence is the one the pipeline should have: the fallback \
          only while the stage is failing",
@@ -438,16 +441,16 @@ fn a_memoized_stage_under_a_boundary_still_serves_its_real_answers() {
     let guarded = Guarded::new(
         GUARD,
         Memo::new(Shared(Arc::clone(&flaky)), MemoMap::new()),
-        Fallback::new("fallback".to_string()),
+        Fallback::new(Arc::new("fallback".to_string())),
     );
     let input = Text("src".into());
 
-    assert_eq!(value_of(&guarded, &input), "fallback");
+    assert_eq!(*value_of(&guarded, &input), "fallback");
     flaky.land("v1");
-    assert_eq!(value_of(&guarded, &input), "src:v1");
+    assert_eq!(*value_of(&guarded, &input), "src:v1");
 
     let polls = flaky.polls();
-    assert_eq!(value_of(&guarded, &input), "src:v1");
+    assert_eq!(*value_of(&guarded, &input), "src:v1");
     assert_eq!(
         flaky.polls(),
         polls,

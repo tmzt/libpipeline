@@ -487,7 +487,7 @@ impl Ledger {
     /// **This is the layer's payoff.** A driver that subscribes is woken
     /// because a read was OBSERVED, not because the stage remembered to stash
     /// the waker it was handed - which is the measured defect class
-    /// (`two_drivers_one_graph.rs`'s
+    /// (`libpipeline/tests/one_door_two_patterns.rs`'s
     /// `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
     /// A stage that reads a [`TrackedInput`] cannot forget, because it never
     /// had to remember.
@@ -585,7 +585,7 @@ impl Drop for Scope<'_> {
 /// layer makes: a `TrackedInput` change reaches the driver because the read was
 /// OBSERVED, not because the stage remembered to stash the waker it was handed
 /// (the lost-wake finding pinned by
-/// `two_drivers_one_graph.rs`'s
+/// `libpipeline/tests/one_door_two_patterns.rs`'s
 /// `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
 pub struct Tracked<S> {
     stage: S,

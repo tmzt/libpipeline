@@ -20,10 +20,12 @@
 //!   crate has no vocabulary for: a boundary refuses to be memoized, because a
 //!   substituted fallback cached under a key that never moves is a permanent
 //!   fallback indistinguishable from a correct answer.
-//! * [`driver`] - the two drivers over the same graph, the same contract and
-//!   the same keys: `run_to_completion` and `FrameDriver`.
-//! * [`watch`] - the blocking driver again, reporting `Pending` polls that
-//!   left no wake path. Same answers, one more observation.
+//! * [`driver`] - `FrameDriver`, the single poll the facade's one door makes,
+//!   and `run_to_completion`, the loop a blocking caller would otherwise write
+//!   by hand: the same graph, the same contract and the same keys, and a stage
+//!   cannot tell which is asking.
+//! * [`watch`] - that loop again, reporting `Pending` polls that left no wake
+//!   path. Same answers, one more observation.
 //! * [`track`] - the read-observation ledger: edges recorded by observing
 //!   reads rather than declared, re-logged on every run so they follow
 //!   conditionals; invalidation over those edges; and `Backdated`, the early

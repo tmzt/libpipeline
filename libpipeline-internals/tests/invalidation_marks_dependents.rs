@@ -15,10 +15,10 @@
 //! fail separately: who gets marked, how far the marking travels, what a write
 //! that changes nothing does, and how the mark reaches a driver.
 //!
-//! **The payoff clause is the last one.** `two_drivers_one_graph.rs`
+//! **The payoff clause is the last one.** `libpipeline/tests/one_door_two_patterns.rs`
 //! measures that staleness ordinarily reaches a driver only because a
 //! stage registered the waker it was handed
-//! (`two_drivers_one_graph.rs`'s
+//! (`libpipeline/tests/one_door_two_patterns.rs`'s
 //! `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`).
 //! Here the stage registers nothing, holds no waker and has no idea a driver
 //! exists - and the frame loop still learns, because the READ was observed.
@@ -253,7 +253,7 @@ impl Stage for Composes {
 }
 
 /// Stand-in for the streaming content hash - FNV over the bytes, as in
-/// `two_drivers_one_graph.rs`. Equal inputs key equally; nothing more is
+/// `libpipeline/tests/one_door_two_patterns.rs`. Equal inputs key equally; nothing more is
 /// claimed.
 fn content_key_of(text: &str) -> ContentKey {
     let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58du128;
@@ -266,15 +266,15 @@ fn content_key_of(text: &str) -> ContentKey {
 
 /// A store that remembers, so a memo hit is a real hit.
 struct MapStore<V> {
-    rows: Mutex<HashMap<MemoKey, V>>,
+    rows: Mutex<HashMap<MemoKey, Arc<V>>>,
 }
 
-impl<V: Clone> MemoStore<V> for MapStore<V> {
-    fn lookup(&self, key: &MemoKey) -> Option<V> {
-        self.rows.lock().unwrap().get(key).cloned()
+impl<V> MemoStore<V> for MapStore<V> {
+    fn lookup(&self, key: &MemoKey) -> Option<Arc<V>> {
+        self.rows.lock().unwrap().get(key).map(Arc::clone)
     }
 
-    fn record(&self, key: &MemoKey, value: V) {
+    fn record(&self, key: &MemoKey, value: Arc<V>) {
         self.rows.lock().unwrap().insert(key.clone(), value);
     }
 }
@@ -285,6 +285,16 @@ impl<V> MapStore<V> {
             rows: Mutex::new(HashMap::new()),
         }
     }
+}
+
+/// What a MEMOIZED stage answers: a share of its output, not the output.
+///
+/// `Memo` wraps once, on a miss, where it records - so both the value it hands
+/// back and the row it kept are that one allocation, and every hit after it is
+/// a refcount bump. Every expectation in this file that is stated against a
+/// memoized stage goes through here.
+fn shared(text: &str) -> EffectPoll<Arc<String>, &'static str> {
+    EffectPoll::Ready(Arc::new(text.to_string()))
 }
 
 fn poll<S: Stage>(stage: &S, input: &S::Input) -> EffectPoll<S::Output, S::Error> {
@@ -527,13 +537,13 @@ fn a_memo_over_a_tracked_read_cannot_serve_what_the_ledger_ruled_stale() {
         );
         let input = Text("hi".to_string());
 
-        assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiA".to_string()));
+        assert_eq!(poll(&stage, &input), shared("hiA"));
         from.set("B".to_string());
         assert!(ledger.is_stale(stage.node()), "the ledger saw the read");
 
         assert_eq!(
             poll(&stage, &input),
-            EffectPoll::Ready("hiB".to_string()),
+            shared("hiB"),
             "the store held `hiA` under a key that had not moved; the ledger's \
              mark outranks it",
         );
@@ -549,7 +559,7 @@ fn a_memo_over_a_tracked_read_cannot_serve_what_the_ledger_ruled_stale() {
         // stale now, so the store answers and the stage does not run - and it
         // answers with what the second run recorded, not the entry the ledger
         // ruled out.
-        assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiB".to_string()));
+        assert_eq!(poll(&stage, &input), shared("hiB"));
         assert_eq!(stage.stage().stage().runs(), 2, "the third poll was a hit");
     }
 }
@@ -570,12 +580,12 @@ fn a_memo_over_an_unobserved_read_is_the_case_only_a_declared_key_saves() {
     );
     let input = Text("hi".to_string());
 
-    assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiA".to_string()));
+    assert_eq!(poll(&stage, &input), shared("hiA"));
     from.set("B".to_string());
     assert!(!ledger.is_stale(stage.node()), "no edge, so nothing was marked");
     assert_eq!(
         poll(&stage, &input),
-        EffectPoll::Ready("hiA".to_string()),
+        shared("hiA"),
         "the memo served a value that had moved - and no layer here was ever \
          told it had",
     );
@@ -591,11 +601,11 @@ fn a_memo_over_an_unobserved_read_is_the_case_only_a_declared_key_saves() {
         "composes",
         Memo::new(Composes::new(&ledger, &from, false, true), MapStore::new()),
     );
-    assert_eq!(poll(&declared, &input), EffectPoll::Ready("hiA".to_string()));
+    assert_eq!(poll(&declared, &input), shared("hiA"));
     from.set("B".to_string());
     assert_eq!(
         poll(&declared, &input),
-        EffectPoll::Ready("hiB".to_string()),
+        shared("hiB"),
         "the revision moved the key, so the lookup missed on its own",
     );
 }
@@ -623,7 +633,7 @@ fn a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach() {
     );
     let input = Text("hi".to_string());
 
-    assert_eq!(poll(&stage, &input), EffectPoll::Ready("hiA".to_string()));
+    assert_eq!(poll(&stage, &input), shared("hiA"));
     from.set("B".to_string());
     assert!(
         ledger.is_stale(stage.stage().node()),
@@ -631,7 +641,7 @@ fn a_cache_outside_the_tracking_is_a_cache_the_ledger_cannot_reach() {
     );
     assert_eq!(
         poll(&stage, &input),
-        EffectPoll::Ready("hiA".to_string()),
+        shared("hiA"),
         "and the outer store answered anyway - the contradiction the correct \
          order removes",
     );
@@ -643,7 +653,7 @@ fn the_memo_over_tracked_state_changes_speed_and_not_answers() {
     // `NoMemo` is the control case its own doc describes: "a pipeline whose
     // ANSWERS change when the cache is disabled has a bug the cache was
     // hiding". Over UNTRACKED stages that check already passed
-    // (`two_drivers_one_graph.rs`'s `the_memo_changes_speed_and_not_answers`);
+    // (`libpipeline/tests/one_door_two_patterns.rs`'s `the_memo_changes_speed_and_not_answers`);
     // over a stage that reads tracked state it did not, and that failure is
     // what the revalidation gate exists to remove.
     //
@@ -655,7 +665,7 @@ fn the_memo_over_tracked_state_changes_speed_and_not_answers() {
 
     assert_eq!(
         cached_answers,
-        ["hiA", "hiB", "hiB", "hiA"],
+        ["hiA", "hiB", "hiB", "hiA"].map(|text| Arc::new(text.to_string())),
         "the answers follow the tracked value, cache or no cache",
     );
     assert_eq!(cached_answers, uncached_answers);
@@ -668,7 +678,7 @@ fn the_memo_over_tracked_state_changes_speed_and_not_answers() {
 
 /// Poll one memoized, tracked stage through a sequence of writes - one of which
 /// changes nothing - and report the answers and how many times it ran.
-fn drive_over_tracked_state<St: MemoStore<String>>(store: St) -> (Vec<String>, usize) {
+fn drive_over_tracked_state<St: MemoStore<String>>(store: St) -> (Vec<Arc<String>>, usize) {
     let ledger = Ledger::new();
     let from = Arc::new(TrackedInput::new(&ledger, "from", "A".to_string()));
     let stage = Tracked::new(

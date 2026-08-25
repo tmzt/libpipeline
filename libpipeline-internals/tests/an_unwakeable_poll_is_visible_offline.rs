@@ -1,32 +1,38 @@
-//! Gate: **a `Pending` poll that leaves no wake path is detectable from the
-//! offline driver.**
+//! Gate: **a `Pending` poll that leaves no wake path is detectable from a
+//! blocking drive.**
 //!
-//! The finding this driver exists to close: a `Pending` stage that registers
-//! no waker is invisible to the blocking driver and fatal to the frame driver
-//! - the value is lost rather than late, and the offline path cannot detect
-//! it (`tests/two_drivers_one_graph.rs` measures exactly that). This file is
-//! that sentence's last clause tested again with the watching driver in
-//! place, and it now fails: the blocking run reaches the same value it always
-//! did AND reports the defect.
+//! The finding this drive exists to close: a `Pending` stage that registers
+//! no waker is invisible to a caller that loops and re-polls, and fatal to a
+//! frame caller - the value is lost rather than late, and the looping path
+//! cannot detect it (`libpipeline/tests/one_door_two_patterns.rs`'s
+//! `a_pending_stage_that_registers_no_waker_is_a_value_lost_rather_than_late`
+//! measures exactly that). This file is that sentence's last clause tested
+//! again with the watching drive in place, and it now fails: the drive reaches
+//! the same value it always did AND reports the defect.
 //!
 //! **Two claims, and they pull against each other, so both are gated.**
 //!
 //! 1. The report is accurate: a graph that registers reports clean, one that
 //!    forgets is counted.
-//! 2. Watching changes nothing else. Same answers as the plain driver on the
+//! 2. Watching changes nothing else. Same answers as the plain drive on the
 //!    same graphs - a diagnostic that could stall a working graph would be
 //!    worse than the defect it looks for.
 //!
-//! # What is here and what is in `src/watch.rs`
+//! # Why this file is here rather than in `libpipeline/tests/`
 //!
-//! `Pipeline::run_watched` is the public door onto the watched drive, so the
-//! three DRIVE-level properties are here, through the builder. The finer
-//! measurements - [`WakePath`](libpipeline::WakePath) per poll, telling a yield
-//! apart from a park, and the probe forwarding a wake rather than swallowing it
-//! - are made by `poll_watched`, which is a single poll and is internal: the
-//! runner has no watched single-poll door (`Pipeline::poll_frame` is unwatched).
-//! Those six tests live beside `poll_watched` in `src/watch.rs` and migrate back
-//! here if the runner ever grows one.
+//! It was a public test until the flip. The runner has ONE door now -
+//! `run(version, &input)`, a single poll - and no watched door beside it, so
+//! `run_to_completion_watched` has no public expression and neither do the
+//! properties below. `DESIGN.md`'s rule is that a test which has to reach the
+//! internals is a finding about the builder's reach, recorded and left visible,
+//! rather than papered over with a re-export - and a test in this crate is how
+//! it stays visible. `tests.rs` beside it holds the finer, per-POLL half for
+//! the same reason.
+//!
+//! The plan for `Delayed`'s promise (`PLAN.md`, step 6) is the debug-build
+//! check `run` itself will make through `poll_watched`; when that lands, the
+//! drive-level properties here stay where they are, because the drive is still
+//! not a door.
 //!
 //! **Every type here is a stand-in** (`DESIGN.md`, "The engine stays
 //! generic").
@@ -34,8 +40,10 @@
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
 
-use libpipeline::{DriveError, Failure, PendingWork, Pipeline, PipelineBuilder};
 use libpipelinedata::{EffectPoll, MemoKey, Stage, StageId};
+
+use libpipeline_internals::driver::{DriveError, NoPendingWork, PendingWork};
+use libpipeline_internals::watch::run_to_completion_watched;
 
 // ---------------------------------------------------------------- stand-ins
 
@@ -48,14 +56,14 @@ struct Text(String);
 enum OnPark {
     /// Stash a clone, as `Effect::poll_effect`'s doc obliges.
     Register,
-    /// Nothing at all - `two_drivers_one_graph.rs`'s `ForgetfulEmit`.
+    /// Nothing at all - `one_door_two_patterns.rs`'s `ForgetfulEmit`.
     Forget,
 }
 
 /// A stage that is `Pending` until its slot is filled, and treats the waker
 /// according to `on_park`.
 struct Parks {
-    id: Mutex<Option<StageId>>,
+    id: StageId,
     on_park: OnPark,
     slot: Mutex<Option<&'static str>>,
     waiting: Mutex<Vec<Waker>>,
@@ -64,7 +72,9 @@ struct Parks {
 impl Parks {
     fn new(on_park: OnPark) -> Arc<Self> {
         Arc::new(Self {
-            id: Mutex::new(None),
+            // The position a builder would have minted for a single
+            // registration. Nothing here is keyed, so it is only an identity.
+            id: StageId::at(0),
             on_park,
             slot: Mutex::new(None),
             waiting: Mutex::new(Vec::new()),
@@ -87,9 +97,6 @@ impl Stage for Parks {
 
     fn id(&self) -> StageId {
         self.id
-            .lock()
-            .unwrap()
-            .expect("the builder minted this stage's id at registration")
     }
 
     fn memo_key(&self, _input: &Text) -> Option<MemoKey> {
@@ -108,31 +115,7 @@ impl Stage for Parks {
     }
 }
 
-/// The stage, and the pipeline it is registered in.
-///
-/// The stage is handed back as well as registered because the executor below
-/// has to be able to LAND its value, and the builder owns what it registers -
-/// there is no reaching back through `Pipeline` for it. The id is stamped into
-/// the stage by the builder's `make`, so `Stage::id` answers the id it was
-/// registered under rather than a constant that could drift from it.
-fn parking(
-    on_park: OnPark,
-) -> (
-    Arc<Parks>,
-    Pipeline<impl Stage<Input = Text, Output = String, Error = Failure<&'static str>>>,
-) {
-    let stage = Parks::new(on_park);
-    let registered = Arc::clone(&stage);
-    let pipeline = PipelineBuilder::new()
-        .stage("test.parks", move |id| {
-            *registered.id.lock().unwrap() = Some(id);
-            registered
-        })
-        .build();
-    (stage, pipeline)
-}
-
-/// The blocking driver's executor: it lands the slot the first time it is
+/// The blocking caller's executor: it lands the slot the first time it is
 /// pumped, then has nothing left to do.
 struct LandsOnFirstPump {
     stage: Arc<Parks>,
@@ -163,28 +146,31 @@ impl PendingWork for LandsOnFirstPump {
 // --------------------------------------------------------------------- gate
 
 #[test]
-fn the_offline_driver_reports_the_defect_without_changing_its_answer() {
+fn the_blocking_drive_reports_the_defect_without_changing_its_answer() {
     // The lost-wake finding, closed. The same graph, the same drive, the same
-    // value - and now the run says that a frame driver would have lost it.
-    let (stage, pipeline) = parking(OnPark::Forget);
-    let (out, report) = pipeline.run_watched(&Text("hi".to_string()), &LandsOnFirstPump::for_stage(&stage));
+    // value - and now the run says that a frame caller would have lost it.
+    let stage = Parks::new(OnPark::Forget);
+    let input = Text("hi".to_string());
+    let (out, report) =
+        run_to_completion_watched(&stage, &input, &LandsOnFirstPump::for_stage(&stage));
 
     assert_eq!(
         out,
         Ok("hi::built".to_string()),
-        "the offline driver still completes, because it re-polls without \
-         being asked - that is what made the defect invisible",
+        "the drive still completes, because it re-polls without being asked - \
+         that is what made the defect invisible",
     );
     assert_eq!(report.pending_polls(), 1);
     assert_eq!(report.unwakeable_polls(), 1);
     assert!(!report.is_clean());
 
-    // And the plain driver agrees on the answer, which is the two-driver
-    // rule's claim: the watching is an observation, not a different drive.
-    let (plain_stage, plain) = parking(OnPark::Forget);
+    // And the plain drive agrees on the answer, which is the claim: the
+    // watching is an observation, not a different drive.
+    let plain_stage = Parks::new(OnPark::Forget);
     assert_eq!(
-        plain.run(
-            &Text("hi".to_string()),
+        libpipeline_internals::driver::run_to_completion(
+            &plain_stage,
+            &input,
             &LandsOnFirstPump::for_stage(&plain_stage),
         ),
         out,
@@ -193,8 +179,12 @@ fn the_offline_driver_reports_the_defect_without_changing_its_answer() {
 
 #[test]
 fn a_graph_that_registers_reports_clean() {
-    let (stage, pipeline) = parking(OnPark::Register);
-    let (out, report) = pipeline.run_watched(&Text("hi".to_string()), &LandsOnFirstPump::for_stage(&stage));
+    let stage = Parks::new(OnPark::Register);
+    let (out, report) = run_to_completion_watched(
+        &stage,
+        &Text("hi".to_string()),
+        &LandsOnFirstPump::for_stage(&stage),
+    );
     assert_eq!(out, Ok("hi::built".to_string()));
     assert_eq!(report.pending_polls(), 1, "it did park once");
     assert!(report.is_clean(), "and left a wake path when it did");
@@ -205,13 +195,15 @@ fn a_stalled_graph_still_stalls_and_says_why() {
     // Nothing to pump, so the drive ends where the plain one ends - and the
     // report distinguishes the two reasons a drive can stall: an effect that
     // never lands (clean) from a stage that could never have been woken.
-    let (_forgetful, pipeline) = parking(OnPark::Forget);
-    let (out, report) = pipeline.run_watched(&Text("hi".to_string()), &libpipeline::NoPendingWork);
+    let forgetful = Parks::new(OnPark::Forget);
+    let (out, report) =
+        run_to_completion_watched(&forgetful, &Text("hi".to_string()), &NoPendingWork);
     assert_eq!(out, Err(DriveError::Stalled));
     assert_eq!(report.unwakeable_polls(), 1);
 
-    let (_registering, pipeline) = parking(OnPark::Register);
-    let (out, report) = pipeline.run_watched(&Text("hi".to_string()), &libpipeline::NoPendingWork);
+    let registering = Parks::new(OnPark::Register);
+    let (out, report) =
+        run_to_completion_watched(&registering, &Text("hi".to_string()), &NoPendingWork);
     assert_eq!(
         out,
         Err(DriveError::Stalled),

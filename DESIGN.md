@@ -122,6 +122,15 @@ let pipeline = PipelineBuilder::new()
   one every step shares; its version type is fixed here, as part of the
   pipeline's own type.
 
+`.stage()` hands back a `StagedPipelineBuilder`, which is not a fifth thing
+to learn: its fields are private and it has no constructor, so a consumer
+receives one, calls a method on it, and with method chaining never writes
+its name. The four names above are the four a consumer CONSTRUCTS OR MATCHES
+ON; an opaque intermediate that only appears in a return type is not a
+concept beside them. `Failure` is the same category - a public type with
+private fields and a private constructor - so this is a pattern the design
+uses twice rather than an exception to its own count.
+
 A consumer implements steps against the stage contract in
 `libpipelinedata` (`Stage`, `StageId`, and the key vocabulary), which
 exists so a step can be **declared** without linking the engine that runs
@@ -164,6 +173,13 @@ the only version in the API.
 
 `Run::Computed(output)` - work happened; take the new value. The pipeline
 records the version each `Computed` answered for.
+
+The value is an `Arc` of the output, because the memo still holds it after
+answering with it - that is what a memo is, so the caller does not own it
+exclusively and the type says so rather than a copy pretending otherwise.
+It is also what makes a large output cheap without any stage author
+remembering to wrap one: the engine wraps once, on a miss, where it records
+(see "One store, at the builder").
 
 `Run::Unchanged` - the value already held derives from exactly this state;
 keep it. The pipeline compares the version it is handed against the one it
@@ -213,15 +229,27 @@ order; running an older state again is just another state.
 
 ### Blocking and frame are what a caller does
 
-A frame-driven caller runs once per frame when there is reason to:
+A frame-driven caller runs once per frame, and does not have to decide
+whether there is reason to - the gate decides, and `Unchanged` is the cheap
+answer:
 
 ```rust,ignore
-if pipeline.take_stale() || version != drawn_for {
-    match pipeline.run(version, &document) {
-        /* ... */
-    }
+match pipeline.run(version, &document) {
+    Ok(Run::Computed(value)) => held = Some(value),
+    Ok(Run::Unchanged) => { /* draw what is held */ }
+    Ok(Run::Delayed) => { /* draw the stand-in */ }
+    Err(failure) => report(failure),
 }
 ```
+
+**Guarding that call with `take_stale()` would be wrong**, and the reason is
+worth stating because the guard reads as an optimization. The flag clears on
+read and the gate reads it too, so a caller that asks first has TAKEN the
+wake: `run` then sees none, finds the version unchanged, and answers
+`Unchanged` - which is the exact defect the wake half of the gate exists to
+prevent, reintroduced from the caller's side. `take_stale` is for a caller
+with a different question ("is there anything to do at all"), and such a
+caller owns the answer from then on.
 
 A blocking caller loops on `Delayed`, making its own progress between
 runs:
@@ -256,7 +284,10 @@ let pipeline = PipelineBuilder::new()
 
 Any `MemoStore` implementation will do; the trait lives in
 `libpipelinedata` beside the stage contract, and "One store, at the
-builder" gives its shape.
+builder" gives its shape. The builder instantiates it at the erased value
+type, `dyn Any + Send + Sync`, which a store written for this purpose names
+directly; one written generically over its value type declares that
+parameter `?Sized` and is otherwise unchanged.
 
 ### What else is public
 
@@ -300,34 +331,48 @@ builder owns **where**.
 ### The erased row
 
 One store serves stages of many output types by erasure, and the erasure is
-`Any`: it needs only `V: 'static` and costs one allocation and one downcast
-per lookup.
+`Any`: it needs only `V: 'static`, and it costs a downcast per lookup and
+nothing else.
 
-The seam carries this without change. `MemoStore<V>` is generic over the
-value type, so erasure is a choice of `V`: the builder's store is a
-`MemoStore` whose `V` is an erased handle. Two things in
-`libpipelinedata/src/store.rs` make this fit as it stands - the blanket
-`impl<V, S: MemoStore<V> + ?Sized> MemoStore<V> for Arc<S>`, which exists
-precisely because "the natural way to put one store in front of several
-stages is to share it", and `MemoMap`'s own impl, bounded `V: Clone`.
+**The seam accepts and returns `Arc`, on both sides, always**
+(`libpipelinedata/src/store.rs`): `lookup` answers `Option<Arc<V>>` and
+`record` takes `Arc<V>`. A store holds a stage's output for as long as it is
+worth remembering, and what a lookup hands back is a SHARE of it - not a
+copy, and not a borrow, because a cache handing out borrows "ties the
+caller's frame to the store's lock" (that file's own doc).
 
-That `Clone` bound decides the shape of the handle.
-`Arc<dyn Any + Send + Sync>` satisfies it, and `lookup` returns owned
-values by design. So the row is an `Arc` and the erasure is an unsizing
-coercion of one: record an `Arc<Output>`, look up an
-`Arc<dyn Any + Send + Sync>`, downcast back to `Arc<Output>`. `Send + Sync`
-follows from the store being shared across threads, which is the same
-reason `MemoMap` holds a `Mutex` rather than a `RefCell` (its own doc).
+It is unconditional, and that is the part worth defending. A contract that
+shared large outputs and copied small ones would put the choice on the stage
+author; that judgement gets made once, at the moment the output is small,
+and then silently outlives the output growing. Nobody revisits it, and the
+symptom is a copy per hit that no test can see - answers do not change, only
+speed does, which is the one axis a memo is invisible on. Unconditional
+means nobody chooses and nobody can choose wrong, which is the same rule
+this design applies to memoization being intrinsic to registration.
+
+The erasure follows from that shape. `MemoStore<V>` is generic over the
+value type and `V` is `?Sized`, so the builder's store is a `MemoStore`
+whose `V` is `dyn Any + Send + Sync` - the unsized type itself, not a handle
+wrapped around one. Recording is then an unsizing coercion of the share the
+memo layer already made, and a lookup is `Arc::downcast`. `Send + Sync`
+follows from the store being shared across threads, which is the same reason
+`MemoMap` holds a `Mutex` rather than a `RefCell` (its own doc). The blanket
+`impl<V: ?Sized, S: MemoStore<V> + ?Sized> MemoStore<V> for Arc<S>` is what
+lets one store sit in front of several stages, which is what it was written
+for.
+
+`V: Clone` appears nowhere: with the contract `Arc`-shaped there is nothing
+to clone but a refcount.
 
 ### A memo hit is cheap
 
-The `Arc` row is what keeps the memo's promise. The seam returns owned
-values on purpose - a cache handing out borrows "ties the caller's frame to
-the store's lock" (`libpipelinedata/src/store.rs`) - and with the row an
-`Arc`, owned is cheap: an output that is itself `Arc`-shaped erases into
-the row with no second indirection, and a hit is a downcast plus a refcount
-bump. For an output the size of a whole bundle, that is the saving a memo
-exists for.
+One allocation per miss, none per hit. The memo layer wraps a stage's output
+once, at the point it records it, so the row and the value it answers with
+are the same allocation; the erased store coerces that share rather than
+wrapping it again; and every hit afterwards is a downcast plus a refcount
+bump, whatever the output is. For an output the size of a whole bundle, that
+is the saving a memo exists for - and it arrives without any stage author
+having shaped their output as an `Arc` to get it.
 
 ### The store belongs to the pipeline
 
