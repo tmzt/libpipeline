@@ -32,21 +32,24 @@ hand.
 use libpipeline::{Ctx, PipelineBuilder, Run};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
-/// What "doc.title" IS, as a key - computable without splitting anything.
-///
-/// `Ctx::key` supplies the identity half: a key is `(stage id, input content
-/// keys)`, and the id is the half a stage has no business choosing.
-fn split_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+// What "doc.title" IS, as a key - computable without splitting anything.
+//
+// `Ctx::key` supplies the identity half: a key is `(stage id, input content
+// keys)`, and the id is the half a stage has no business choosing.
+let split_key = |input: &String, ctx: &Ctx<'_>| -> Option<MemoKey> {
     Some(ctx.key([ContentKey::of(input)]))
-}
+};
 
-/// Splits a dotted path like "doc.title" into its segments.
-fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Vec<String>>, &'static str> {
+// Splits a dotted path like "doc.title" into its segments.
+let split = |input: &String, _ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<Vec<String>>, &'static str>
+{
     if input.is_empty() {
         return EffectPoll::Failed("nothing to split");
     }
+
     StageAnswer::computed(input.split('.').map(str::to_string).collect())
-}
+};
 
 let pipeline = PipelineBuilder::new()
     .stage_fn("split", split_key, split)
@@ -57,6 +60,7 @@ let pipeline = PipelineBuilder::new()
 let Ok(Run::Computed(segments)) = pipeline.poll(1, &"doc.title".to_string()) else {
     panic!("a pure stage answers on the first poll");
 };
+
 assert_eq!(*segments, vec!["doc".to_string(), "title".to_string()]);
 ```
 
@@ -96,23 +100,28 @@ carrying the POSITION of the stage that raised it.
 use libpipeline::{Ctx, PipelineBuilder, Run};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
-# fn split_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+# let split_key = |input: &String, ctx: &Ctx<'_>| -> Option<MemoKey> {
 #     Some(ctx.key([ContentKey::of(input)]))
-# }
-# fn split(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<Vec<String>>, &'static str> {
+# };
+# let split = |input: &String, _ctx: &Ctx<'_>|
+#     -> EffectPoll<StageAnswer<Vec<String>>, &'static str>
+# {
 #     if input.is_empty() {
 #         return EffectPoll::Failed("nothing to split");
 #     }
+#
 #     StageAnswer::computed(input.split('.').map(str::to_string).collect())
-# }
-/// Counts the segments the first stage produced.
-fn count_key(input: &Vec<String>, ctx: &Ctx<'_>) -> Option<MemoKey> {
+# };
+// Counts the segments the first stage produced.
+let count_key = |input: &Vec<String>, ctx: &Ctx<'_>| -> Option<MemoKey> {
     Some(ctx.key(input.iter().map(ContentKey::of)))
-}
+};
 
-fn count(input: &Vec<String>, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
+let count = |input: &Vec<String>, _ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<usize>, &'static str>
+{
     StageAnswer::computed(input.len())
-}
+};
 
 let pipeline = PipelineBuilder::new()
     .stage_fn("split", split_key, split)
@@ -122,6 +131,7 @@ let pipeline = PipelineBuilder::new()
 let Ok(Run::Computed(count)) = pipeline.poll(1, &"doc.section.title".to_string()) else {
     panic!("both stages are pure");
 };
+
 assert_eq!(*count, 3);
 
 // A failure names the stage that raised it, as a position: stage 0 here,
@@ -130,6 +140,7 @@ assert_eq!(*count, 3);
 let Err(failure) = pipeline.poll(2, &String::new()) else {
     panic!("an empty source cannot be split");
 };
+
 assert_eq!(failure.at(), 0);
 assert_eq!(*failure.error(), "nothing to split");
 ```
@@ -156,21 +167,27 @@ carry one yet; `DESIGN.md`'s "The intended stage shape" is the record of that.
 
 ```rust
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use libpipeline::{Ctx, PipelineBuilder, Run};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
+// A closure that captures nothing coerces to the `fn` the door takes - which
+// is also why the run counter is a `static` rather than a local it closes over.
 static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
 
-fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+let len_key = |input: &String, ctx: &Ctx<'_>| -> Option<MemoKey> {
     Some(ctx.key([ContentKey::of(input)]))
-}
+};
 
-/// Measures a string, counting how many times it actually ran.
-fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
+// Measures a string, counting how many times it actually ran.
+let len = |input: &String, _ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<usize>, &'static str>
+{
     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
+
     StageAnswer::computed(input.len())
-}
+};
 
 let pipeline = PipelineBuilder::new()
     .stage_fn("len", len_key, len)
@@ -191,7 +208,6 @@ let control = PipelineBuilder::new()
 assert_eq!(control.poll(1, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
 assert_eq!(control.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new(4))));
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 3); // the control ran every time
-# use std::sync::Arc;
 ```
 
 **Opting out.** A stage whose answer is not a cacheable fact - an effect, a
@@ -222,23 +238,29 @@ static SHOUT_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 // Neither stage keys, so neither is served from the store: each is entered and
 // answers for itself. That is what lets the first one say `unchanged`.
-fn unkeyed<I>(_input: &I, _ctx: &Ctx<'_>) -> Option<MemoKey> {
+let unkeyed = |_input: &String, _ctx: &Ctx<'_>| -> Option<MemoKey> {
     None
-}
+};
 
-/// Upper-cases - and says so when there was nothing to upper-case.
-fn upper(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
+// Upper-cases - and says so when there was nothing to upper-case.
+let upper = |input: &String, _ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<String>, &'static str>
+{
     UPPER_RUNS.fetch_add(1, Ordering::Relaxed);
+
     match input.chars().any(|c| c.is_lowercase()) {
         true => StageAnswer::computed(input.to_uppercase()),
         false => StageAnswer::unchanged(),
     }
-}
+};
 
-fn shout(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
+let shout = |input: &String, _ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<String>, &'static str>
+{
     SHOUT_RUNS.fetch_add(1, Ordering::Relaxed);
+
     StageAnswer::computed(format!("{input}!"))
-}
+};
 
 let pipeline = PipelineBuilder::new()
     .stage_fn("upper", unkeyed, upper)
@@ -254,6 +276,7 @@ assert_eq!(
 // A new version, and nothing to do. `upper` is entered - it is unkeyed, so
 // nothing answers ahead of it - and says `unchanged`. `shout` is not entered.
 assert_eq!(pipeline.poll(2, &"HI".to_string()), Ok(Run::Unchanged));
+
 assert_eq!(UPPER_RUNS.load(Ordering::Relaxed), 2);
 assert_eq!(SHOUT_RUNS.load(Ordering::Relaxed), 1);
 ```
@@ -303,13 +326,16 @@ use libpipeline::{Ctx, PipelineBuilder, Run};
 use libpipelinedata::{ContentKey, EffectPoll, MemoKey, StageAnswer};
 
 # static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
-# fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+# let len_key = |input: &String, ctx: &Ctx<'_>| -> Option<MemoKey> {
 #     Some(ctx.key([ContentKey::of(input)]))
-# }
-# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
+# };
+# let len = |input: &String, _ctx: &Ctx<'_>|
+#     -> EffectPoll<StageAnswer<usize>, &'static str>
+# {
 #     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
+#
 #     StageAnswer::computed(input.len())
-# }
+# };
 let pipeline = PipelineBuilder::new()
     .stage_fn("len", len_key, len)
     .build();
@@ -386,22 +412,25 @@ impl Slot {
 // a `static`. That is the shape today; see the note above.
 static SLOT: LazyLock<Slot> = LazyLock::new(Slot::default);
 
-/// An effect's answer is not a cacheable fact, so this refuses to key.
-fn fetch_key(_input: &(), _ctx: &Ctx<'_>) -> Option<MemoKey> {
+// An effect's answer is not a cacheable fact, so this refuses to key.
+let fetch_key = |_input: &(), _ctx: &Ctx<'_>| -> Option<MemoKey> {
     None
-}
+};
 
-/// `Pending` until the slot is filled.
-fn fetch(_input: &(), ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<u32>, &'static str> {
+// `Pending` until the slot is filled.
+let fetch = |_input: &(), ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<u32>, &'static str>
+{
     match *SLOT.value.lock().unwrap() {
         Some(value) => StageAnswer::computed(value),
         None => {
             // Answering `Pending` obliges the stage to arrange a wake.
             *SLOT.waker.lock().unwrap() = Some(ctx.waker().clone());
+
             EffectPoll::Pending
         }
     }
-}
+};
 
 // The frame pattern: poll, delayed, wake, poll again.
 let pipeline = PipelineBuilder::new()
@@ -486,22 +515,27 @@ impl<V: ?Sized> MemoStore<V> for MapStore<V> {
 }
 
 # static LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
-# fn len_key(input: &String, ctx: &Ctx<'_>) -> Option<MemoKey> {
+# let len_key = |input: &String, ctx: &Ctx<'_>| -> Option<MemoKey> {
 #     Some(ctx.key([ContentKey::of(input)]))
-# }
-# fn len(input: &String, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<usize>, &'static str> {
+# };
+# let len = |input: &String, _ctx: &Ctx<'_>|
+#     -> EffectPoll<StageAnswer<usize>, &'static str>
+# {
 #     LEN_RUNS.fetch_add(1, Ordering::Relaxed);
+#
 #     StageAnswer::computed(input.len())
-# }
-/// Renders the count, so the pipeline below holds two stages whose outputs
-/// are different types - and still one store.
-fn render_key(input: &usize, ctx: &Ctx<'_>) -> Option<MemoKey> {
+# };
+// Renders the count, so the pipeline below holds two stages whose outputs
+// are different types - and still one store.
+let render_key = |input: &usize, ctx: &Ctx<'_>| -> Option<MemoKey> {
     Some(ctx.key([ContentKey::of(input)]))
-}
+};
 
-fn render(input: &usize, _ctx: &Ctx<'_>) -> EffectPoll<StageAnswer<String>, &'static str> {
+let render = |input: &usize, _ctx: &Ctx<'_>|
+    -> EffectPoll<StageAnswer<String>, &'static str>
+{
     StageAnswer::computed(input.to_string())
-}
+};
 
 let store: Arc<MapStore<dyn Any + Send + Sync>> = Arc::new(MapStore {
     rows: Mutex::new(HashMap::new()),
@@ -516,6 +550,7 @@ let pipeline = PipelineBuilder::new()
 let Ok(Run::Computed(rendered)) = pipeline.poll(1, &"abcd".to_string()) else {
     panic!("both stages are pure");
 };
+
 assert_eq!(*rendered, "4");
 
 // One store, two stages, two output types: each row is keyed by the stage's
@@ -524,7 +559,10 @@ assert_eq!(store.rows.lock().unwrap().len(), 2);
 
 // And the repeat is served from it: neither stage ran again. The version moves,
 // so what answers is the store rather than the gate above it.
-assert_eq!(pipeline.poll(2, &"abcd".to_string()), Ok(Run::Computed(Arc::new("4".to_string()))));
+assert_eq!(
+    pipeline.poll(2, &"abcd".to_string()),
+    Ok(Run::Computed(Arc::new("4".to_string()))),
+);
 assert_eq!(LEN_RUNS.load(Ordering::Relaxed), 1);
 ```
 
