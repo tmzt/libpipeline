@@ -18,25 +18,41 @@ To guarantee cache correctness across the dependency graph, the architecture enf
 
 A stage is defined strictly by two function pointers: a key function for input identification and a poll function for output generation. The API enforces statelessness at compile time by requiring raw `fn` pointers; capturing closures fail to compile. This statically prevents hidden state mutations from invalidating cache guarantees. All ambient context is passed explicitly via the `Ctx` parameter.
 
-```rust,ignore
-// Valid: Non-capturing closures coerce safely to raw `fn` pointers.
+Non-capturing closures do not carry state and coerce safely to raw `fn` pointers:
+
+```rust
+use libpipeline::{Ctx, PipelineBuilder};
+use libpipelinedata::{ContentKey, EffectPoll, StageAnswer};
+
+let mut builder = PipelineBuilder::new();
+
 builder.stage_fn(
     "scale",
     /* Key Function: identifies the input */
     |input: &i32, ctx| Some(ctx.key([ContentKey::of(input)])),
     /* Compute / Poll Function: produces the output strictly from the input */
-    |input: &i32, _ctx| StageAnswer::computed(input * 2)
+    |input: &i32, _ctx| -> EffectPoll<StageAnswer<i32>, &'static str> {
+        StageAnswer::computed(input * 2)
+    }
 );
+```
 
+Capturing variables from the surrounding environment prevents coercion to a `fn` pointer, resulting in a compiler error:
+
+```rust,compile_fail
+use libpipeline::{Ctx, PipelineBuilder};
+use libpipelinedata::{ContentKey, EffectPoll, StageAnswer};
+
+let mut builder = PipelineBuilder::new();
 let ambient_multiplier = 3;
 
-// Invalid: Capturing closures fail to compile.
-// The compiler rejects this because it cannot coerce a closure that captures
-// `ambient_multiplier` into a raw `fn` pointer.
 builder.stage_fn(
     "scale_dynamic",
     |input: &i32, ctx| Some(ctx.key([ContentKey::of(input)])),
-    |input: &i32, _ctx| StageAnswer::computed(input * ambient_multiplier) // Compilation Error!
+    /* Fails to compile because it captures `ambient_multiplier` */
+    |input: &i32, _ctx| -> EffectPoll<StageAnswer<i32>, &'static str> {
+        StageAnswer::computed(input * ambient_multiplier)
+    }
 );
 ```
 
